@@ -2,7 +2,7 @@
 // Never includes secrets, raw report bodies or report ids.
 
 import { evaluateListingDocumentCheck, evaluateProbeCheck } from "./checks.js";
-import { AIRNODE_RECIPES, AIRNODE_SCOPE, EXPECTED_IMPLEMENTATIONS, LIMITS, NETWORKS, NETWORK_NAMES, THRESHOLDS } from "./config.js";
+import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, NETWORK_NAMES, THRESHOLDS } from "./config.js";
 import { formatDuration, formatGwei, formatUsdc } from "./format.js";
 import { describeShape } from "./listings.js";
 import { readAlerts, readChainState, readProbeStates, readReportState, recentMessages } from "./store.js";
@@ -129,8 +129,8 @@ export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES) {
             feeCapGwei: formatGwei(net.feeCapWei),
             feeCapUsagePercent,
             committerIsKeeper: same(c.committer, net.keeper),
-            coordinatorImplementationExpected: same(c.coordinatorImpl, EXPECTED_IMPLEMENTATIONS.coordinator),
-            registryImplementationExpected: same(c.registryImpl, EXPECTED_IMPLEMENTATIONS.registry),
+            coordinatorImplementationExpected: same(c.coordinatorImpl, net.implementations.coordinator),
+            registryImplementationExpected: same(c.registryImpl, net.implementations.registry),
             refundScanCursorBlock: c.logCursor,
           }
         : null,

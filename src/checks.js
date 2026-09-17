@@ -5,7 +5,7 @@
 // `event: true` marks one-shot notices (refunds, foreign submitters, dropped events): they are
 // reported once per occurrence and auto-resolve silently on the next run without new occurrences.
 
-import { EXPECTED_IMPLEMENTATIONS, LIMITS, THRESHOLDS } from "./config.js";
+import { LIMITS, THRESHOLDS } from "./config.js";
 import { formatDuration, formatGwei, formatUsdc, listWithMore, requestLink } from "./format.js";
 
 export const CHECK_NAMES = Object.freeze([
@@ -163,14 +163,14 @@ export function evaluateChainChecks(net, chain) {
       : alarm("registry committer is not the keeper", `committer() is ${chain.committer}, expected ${net.keeper}`);
   }
   if (chain.coordinatorImpl != null) {
-    result.coordinator_impl = lower(chain.coordinatorImpl) === lower(EXPECTED_IMPLEMENTATIONS.coordinator)
+    result.coordinator_impl = lower(chain.coordinatorImpl) === lower(net.implementations.coordinator)
       ? null
-      : alarm("coordinator implementation changed", `ERC-1967 slot is ${chain.coordinatorImpl}, expected ${EXPECTED_IMPLEMENTATIONS.coordinator}`);
+      : alarm("coordinator implementation changed", `ERC-1967 slot is ${chain.coordinatorImpl}, expected ${net.implementations.coordinator}`);
   }
   if (chain.registryImpl != null) {
-    result.registry_impl = lower(chain.registryImpl) === lower(EXPECTED_IMPLEMENTATIONS.registry)
+    result.registry_impl = lower(chain.registryImpl) === lower(net.implementations.registry)
       ? null
-      : alarm("registry implementation changed", `ERC-1967 slot is ${chain.registryImpl}, expected ${EXPECTED_IMPLEMENTATIONS.registry}`);
+      : alarm("registry implementation changed", `ERC-1967 slot is ${chain.registryImpl}, expected ${net.implementations.registry}`);
   }
   return result;
 }

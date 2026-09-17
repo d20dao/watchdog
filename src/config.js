@@ -21,12 +21,6 @@ export const TOPICS = Object.freeze({
   randomnessFulfilled: "0x9c82683ee7932041c254d206bcce4241d66a811d53ee7191799cc120777b2b87",
 });
 
-// Same implementations on both networks.
-export const EXPECTED_IMPLEMENTATIONS = Object.freeze({
-  coordinator: "0xD20da0c375cEfCdA65703699A4090237057e9b68",
-  registry: "0xD20Da0cf7Ddc6123f9A87c0C210F8ECB934CA7D5",
-});
-
 export const NETWORKS = Object.freeze({
   "arc-mainnet": Object.freeze({
     name: "arc-mainnet",
@@ -34,6 +28,11 @@ export const NETWORKS = Object.freeze({
     coordinator: "0xd20da057469C45928912d983F45790C41e290571",
     registry: "0xd20Da048C1A68fa3Bc0B5f5Bc454D1530062C82D",
     keeper: "0xA5496Bb35905Bfe0Bac7D23Ca18c008F5E6Eb13e",
+    // Expected ERC-1967 implementations; update after each reviewed upgrade.
+    implementations: Object.freeze({
+      coordinator: "0xD20da0c375cEfCdA65703699A4090237057e9b68",
+      registry: "0xD20Da0cf7Ddc6123f9A87c0C210F8ECB934CA7D5",
+    }),
     feeCapWei: 2000n * GWEI,
     // Blockdaemon accepts batches from Cloudflare egress; the public endpoint rate-limits them.
     rpcs: Object.freeze(["https://rpc.blockdaemon.mainnet.arc.io", "https://rpc.mainnet.arc.io"]),
@@ -46,6 +45,11 @@ export const NETWORKS = Object.freeze({
     coordinator: "0xd20DA0FF9087d053f0291524Eac12abA1ADBd945",
     registry: "0xD20Da00B47A7cD2211dC4683E306913b05903756",
     keeper: "0x61659d9A9A85dA07C36e7d1B35CF0d96CF199Cac",
+    // Registry upgraded to the variable-catalog implementation on 2026-09-17.
+    implementations: Object.freeze({
+      coordinator: "0xD20da0c375cEfCdA65703699A4090237057e9b68",
+      registry: "0xD20dA0311C56f92d841d5c74F15ec691e0cfB960",
+    }),
     feeCapWei: 100n * GWEI,
     rpcs: Object.freeze(["https://rpc.blockdaemon.testnet.arc.io", "https://rpc.testnet.arc.io"]),
     explorer: "https://arc-testnet.d20dao.org",
