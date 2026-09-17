@@ -91,6 +91,10 @@ export const LIMITS = Object.freeze({
   maxIdsInMessage: 10,
   statusCacheSeconds: 15,
   cronOverlapGuardMs: 55_000,
+  // The Durable Object re-arms its own alarm every minute, so checks continue even when no keeper reports
+  // and whether or not the account's Cron Trigger fires. Runs closer together than this are skipped.
+  checkIntervalMs: 60_000,
+  minRunSpacingMs: 45_000,
 });
 
 export const DURABLE_OBJECT_NAME = "watchdog";
