@@ -32,7 +32,7 @@ import {
   writeChainState,
   writeProbeState,
 } from "./store.js";
-import { groupMessages, notifierConfigured, sendTelegram } from "./telegram.js";
+import { chatIdFor, groupMessages, notifierConfigured, sendTelegram } from "./telegram.js";
 
 // The probe module carries the secp256k1 and keccak code; importing it lazily keeps it out of Worker startup.
 const loadProbeModule = () => import("./probe.js");
@@ -129,9 +129,18 @@ export async function runCron({
   let telegramSubrequests = 0;
   let deliveryError = null;
   if (deliverable) {
-    for (const group of groupMessages(pendingMessages(storage))) {
+    // Messages are grouped per destination chat, so a network with its own group never lands in another one.
+    const byChat = new Map();
+    for (const message of pendingMessages(storage)) {
+      const chatId = chatIdFor(env, message.network);
+      if (!byChat.has(chatId)) byChat.set(chatId, []);
+      byChat.get(chatId).push(message);
+    }
+    const groups = [];
+    for (const [chatId, messages] of byChat) for (const group of groupMessages(messages)) groups.push({ ...group, chatId });
+    for (const group of groups.slice(0, LIMITS.telegramMaxSendsPerRun)) {
       telegramSubrequests++;
-      const result = await sendTelegram(env, group.text, { fetch });
+      const result = await sendTelegram(env, group.text, { fetch, chatId: group.chatId });
       const at = Math.floor(clock() / 1000);
       storage.transactionSync(() => markMessages(storage, group.ids, at, result.ok));
       if (!result.ok) {

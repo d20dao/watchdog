@@ -377,7 +377,7 @@ export function enqueueMessage(storage, now, network, severity, text, deliverabl
 }
 
 export function pendingMessages(storage) {
-  return rows(storage, "SELECT id, created_at, text, attempts FROM messages WHERE status = 'pending' ORDER BY id");
+  return rows(storage, "SELECT id, created_at, network, text, attempts FROM messages WHERE status = 'pending' ORDER BY id");
 }
 
 export function markMessages(storage, ids, now, delivered) {

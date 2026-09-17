@@ -240,6 +240,22 @@ test("groupMessages respects size and send limits", () => {
   assert.equal(groupMessages([{ id: 1, text: "y".repeat(5000) }], 3800, 3)[0].text.length, 3800);
 });
 
+test("each network's messages go to its own chat when one is configured", async () => {
+  const { chatIdFor, sendTelegram } = await import("../src/telegram.js");
+  const env = { ...TELEGRAM, TELEGRAM_CHAT_ID: "-100default", TELEGRAM_CHAT_ID_ARC_TESTNET: "-100testnet" };
+  assert.equal(chatIdFor(env, "arc-testnet"), "-100testnet");
+  assert.equal(chatIdFor(env, "arc-mainnet"), "-100default", "a network without its own chat uses the default");
+  assert.equal(chatIdFor(env, "airnodehub"), "-100default");
+  assert.equal(chatIdFor(env, null), "-100default");
+  assert.equal(chatIdFor({ TELEGRAM_CHAT_ID: "  " }, "arc-testnet"), null, "blank chat ids do not count");
+
+  const sent = [];
+  const capture = async (url, init) => { sent.push(JSON.parse(init.body).chat_id); return { ok: true, status: 200 }; };
+  await sendTelegram(env, "testnet alert", { fetch: capture, chatId: chatIdFor(env, "arc-testnet") });
+  await sendTelegram(env, "mainnet alert", { fetch: capture, chatId: chatIdFor(env, "arc-mainnet") });
+  assert.deepEqual(sent, ["-100testnet", "-100default"]);
+});
+
 test("sendTelegram never exposes the token in its result", async () => {
   const { sendTelegram } = await import("../src/telegram.js");
   const failing = async (url) => {

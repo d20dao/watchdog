@@ -3,13 +3,21 @@
 import { LIMITS } from "./config.js";
 import { FetchTimeoutError, fetchText } from "./net.js";
 
+const chatValue = value => (typeof value === "string" && value.trim() !== "" ? value.trim() : null);
+
+/**
+ * The chat a network's messages go to: its own group when configured, otherwise the default chat.
+ * Network scopes map to secrets like TELEGRAM_CHAT_ID_ARC_TESTNET.
+ */
+export function chatIdFor(env, network) {
+  const specific = typeof network === "string" && network !== ""
+    ? chatValue(env["TELEGRAM_CHAT_ID_" + network.toUpperCase().replace(/[^A-Z0-9]+/g, "_")])
+    : null;
+  return specific ?? chatValue(env.TELEGRAM_CHAT_ID);
+}
+
 export function notifierConfigured(env) {
-  return (
-    typeof env.TELEGRAM_BOT_TOKEN === "string" &&
-    env.TELEGRAM_BOT_TOKEN.trim() !== "" &&
-    typeof env.TELEGRAM_CHAT_ID === "string" &&
-    env.TELEGRAM_CHAT_ID.trim() !== ""
-  );
+  return typeof env.TELEGRAM_BOT_TOKEN === "string" && env.TELEGRAM_BOT_TOKEN.trim() !== "" && chatIdFor(env, null) !== null;
 }
 
 /**
@@ -34,7 +42,8 @@ export function groupMessages(messages, maxChars = LIMITS.telegramMaxChars, maxG
 }
 
 /** Send one message. Resolves to {ok, error} and never throws. */
-export async function sendTelegram(env, text, { fetch, timeoutMs = LIMITS.telegramTimeoutMs }) {
+export async function sendTelegram(env, text, { fetch, timeoutMs = LIMITS.telegramTimeoutMs, chatId = null }) {
+  const chat = chatId ?? chatIdFor(env, null);
   let response;
   try {
     response = await fetchText(
@@ -43,7 +52,7 @@ export async function sendTelegram(env, text, { fetch, timeoutMs = LIMITS.telegr
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID.trim(), text, disable_web_page_preview: true }),
+        body: JSON.stringify({ chat_id: chat, text, disable_web_page_preview: true }),
       },
       timeoutMs,
       { readBody: false },
