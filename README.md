@@ -34,7 +34,7 @@ These run every minute for each network. Thresholds live in `src/config.js` (`TH
 | `pending`: age of the oldest pending request in chain time (latest block timestamp − (deadline − 60)) | ≥ 25 s | ≥ 45 s |
 | `refund`: new `RequestRefundedTo` logs since the last scanned block | — | "refund issued, investigate" with request ids (one-shot) |
 | `balance`: keeper wallet native USDC (18 decimals) | < 5 USDC | < 2 USDC |
-| `base_fee`: 2 × baseFee + 1 gwei against the fee cap (mainnet 2000 gwei, testnet 100 gwei) | > 25 % | > 50 % |
+| `base_fee`: 2 × baseFee + 1 gwei against the fee cap (mainnet 2000 gwei, testnet 100 gwei) | > 60 % | > 85 % |
 | `committer`: registry `committer()` ≠ keeper wallet | — | alarm |
 | `coordinator_impl`, `registry_impl`: ERC-1967 implementation slot ≠ expected | — | alarm |
 | `foreign_submitter`: `RandomnessFulfilled` whose submitter ≠ keeper | one-shot notice | — |

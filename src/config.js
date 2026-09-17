@@ -65,8 +65,9 @@ export const THRESHOLDS = Object.freeze({
   pendingAlarmSeconds: 45,
   balanceWarnWei: 5n * USDC,
   balanceAlarmWei: 2n * USDC,
-  feeWarnPercent: 25n,
-  feeAlarmPercent: 50n,
+  // Testnet runs at 41 % of its 100 gwei cap on a normal 20 gwei base fee, so warn only well above that.
+  feeWarnPercent: 60n,
+  feeAlarmPercent: 85n,
   feeHeadroomWei: 1n * GWEI, // checked value is 2 x baseFee + 1 gwei
   rpcFailureRuns: 3,
 });

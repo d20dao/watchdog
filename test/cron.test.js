@@ -101,7 +101,7 @@ test("several messages in one run are grouped into one Telegram send", async () 
   h.state.reads["arc-testnet"] = healthyRead(TESTNET, {
     balanceWei: 1n * 10n ** 18n,
     committer: "0x0000000000000000000000000000000000000001",
-    block: { number: 1000, timestamp: T0, baseFeeWei: 30n * 10n ** 9n },
+    block: { number: 1000, timestamp: T0, baseFeeWei: 43n * 10n ** 9n },
   });
   const summary = await h.run(0);
   assert.equal(summary.messagesQueued, 3);

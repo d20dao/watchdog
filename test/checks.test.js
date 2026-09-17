@@ -111,18 +111,19 @@ test("keeper balance (< 5 USDC warning, < 2 USDC alarm)", () => {
   assert.match(at(3434567890123456789n).detail, /holds 3\.434567 USDC$/);
 });
 
-test("2 x base fee + 1 gwei against the fee cap (> 25 % warning, > 50 % alarm)", () => {
+test("2 x base fee + 1 gwei against the fee cap (> 60 % warning, > 85 % alarm)", () => {
   const at = (net, baseGwei) =>
     evaluateChainChecks(net, healthyRead(net, { block: { number: 1, timestamp: NOW, baseFeeWei: baseGwei * GWEI } })).base_fee;
-  // Testnet cap 100 gwei: 12 gwei -> 25 gwei = exactly 25 % (not above).
-  assert.equal(severity(at(TESTNET, 12n)), "clear");
-  // Live value on both networks today: 20 gwei -> 41 gwei = 41 % of the testnet cap.
-  const live = at(TESTNET, 20n);
-  assert.equal(live.severity, "warning");
-  assert.equal(live.detail, "2 x base fee + 1 gwei = 41 gwei is 41% of the 100 gwei fee cap");
-  assert.equal(severity(at(TESTNET, 25n)), "alarm"); // 51 %
+  // Live value on both networks today: 20 gwei -> 41 gwei = 41 % of the testnet cap, not a warning.
+  assert.equal(severity(at(TESTNET, 20n)), "clear");
+  // Testnet cap 100 gwei: 30 gwei -> 61 gwei = 61 % warns; 42 gwei -> 85 gwei = exactly 85 % is not an alarm.
+  const warn = at(TESTNET, 30n);
+  assert.equal(warn.severity, "warning");
+  assert.equal(warn.detail, "2 x base fee + 1 gwei = 61 gwei is 61% of the 100 gwei fee cap");
+  assert.equal(severity(at(TESTNET, 42n)), "warning");
+  assert.equal(severity(at(TESTNET, 43n)), "alarm"); // 87 %
   assert.equal(severity(at(MAINNET, 20n)), "clear"); // 41 of 2000 gwei
-  assert.equal(severity(at(MAINNET, 500n)), "alarm"); // 1001 of 2000 gwei
+  assert.equal(severity(at(MAINNET, 900n)), "alarm"); // 1801 of 2000 gwei
 });
 
 test("committer and implementation slots", () => {
