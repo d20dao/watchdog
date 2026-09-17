@@ -1,0 +1,10 @@
+# Local development only. Copy to .dev.vars (git-ignored) and use throwaway values.
+# Production values are set with `npx wrangler secret put NAME`, never committed.
+
+# Leave the Telegram pair empty to evaluate and store alerts without sending them.
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# Bearer keys the keepers present on POST /v1/health/<network>.
+HEALTH_KEY_ARC_MAINNET=local-mainnet-test-key
+HEALTH_KEY_ARC_TESTNET=local-testnet-test-key

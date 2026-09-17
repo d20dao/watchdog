@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "d20dao-watchdog",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+  // Only reachable through the custom domain; no workers.dev or preview URLs.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "watchdog.d20dao.org", "custom_domain": true }],
+  "triggers": { "crons": ["* * * * *"] },
+  "durable_objects": {
+    "bindings": [{ "name": "WATCHDOG", "class_name": "Watchdog" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Watchdog"] }],
+  "observability": { "enabled": true }
+  // Secrets (set with `npx wrangler secret put NAME`, never in this file):
+  //   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, HEALTH_KEY_ARC_MAINNET, HEALTH_KEY_ARC_TESTNET
+}
