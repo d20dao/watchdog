@@ -45,10 +45,10 @@ export const NETWORKS = Object.freeze({
     coordinator: "0xd20DA0FF9087d053f0291524Eac12abA1ADBd945",
     registry: "0xD20Da00B47A7cD2211dC4683E306913b05903756",
     keeper: "0x61659d9A9A85dA07C36e7d1B35CF0d96CF199Cac",
-    // Registry upgraded to the variable-catalog implementation on 2026-09-17.
+    // Recipe registry and per-submitter keeper share, upgraded on 2026-09-18.
     implementations: Object.freeze({
-      coordinator: "0xD20da0c375cEfCdA65703699A4090237057e9b68",
-      registry: "0xD20dA0311C56f92d841d5c74F15ec691e0cfB960",
+      coordinator: "0xd20da0DADa4352A1a9722be43a2D85923443458c",
+      registry: "0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865",
     }),
     feeCapWei: 100n * GWEI,
     rpcs: Object.freeze(["https://rpc.blockdaemon.testnet.arc.io", "https://rpc.testnet.arc.io"]),
