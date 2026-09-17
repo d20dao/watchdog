@@ -140,10 +140,12 @@ test("committer and implementation slots", () => {
   assert.equal(wrong.coordinator_impl.severity, "alarm");
   assert.equal(severity(wrong.registry_impl), "clear", "checksum case is ignored");
 
-  // Implementations are per network: the testnet registry runs a newer implementation than mainnet.
-  const testnetOnMainnetImpl = evaluateChainChecks(TESTNET, healthyRead(TESTNET, { registryImpl: MAINNET.implementations.registry }));
-  assert.equal(testnetOnMainnetImpl.registry_impl.severity, "alarm");
-  assert.equal(severity(evaluateChainChecks(TESTNET, healthyRead(TESTNET)).registry_impl), "clear");
+  // Each network is compared against its own configured implementation, which may differ between networks.
+  for (const net of [MAINNET, TESTNET]) {
+    assert.equal(severity(evaluateChainChecks(net, healthyRead(net)).registry_impl), "clear");
+    const foreign = evaluateChainChecks(net, healthyRead(net, { registryImpl: "0x00000000000000000000000000000000000000dd" }));
+    assert.equal(foreign.registry_impl.severity, "alarm");
+  }
 });
 
 test("refund logs raise an alarm event with request ids", () => {
