@@ -31,8 +31,8 @@ export const NETWORKS = Object.freeze({
     backupKeepers: Object.freeze([]),
     // Expected ERC-1967 implementations; update after each reviewed upgrade.
     implementations: Object.freeze({
-      coordinator: "0xD20da0c375cEfCdA65703699A4090237057e9b68",
-      registry: "0xD20Da0cf7Ddc6123f9A87c0C210F8ECB934CA7D5",
+      coordinator: "0xd20da0DADa4352A1a9722be43a2D85923443458c",
+      registry: "0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865",
     }),
     feeCapWei: 2000n * GWEI,
     // Blockdaemon accepts batches from Cloudflare egress; the public endpoint rate-limits them.
