@@ -133,7 +133,7 @@ test("committer and implementation slots", () => {
     healthyRead(MAINNET, {
       committer: "0x0000000000000000000000000000000000000001",
       coordinatorImpl: "0x0000000000000000000000000000000000000002",
-      registryImpl: "0xD20Da0cf7Ddc6123f9A87c0C210F8ECB934CA7D5",
+      registryImpl: MAINNET.implementations.registry.toUpperCase().replace("0X", "0x"),
     }),
   );
   assert.equal(wrong.committer.severity, "alarm");
