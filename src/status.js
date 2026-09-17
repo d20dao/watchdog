@@ -1,15 +1,74 @@
 // Sanitized public read model: status JSON and a small server-rendered HTML page.
 // Never includes secrets, raw report bodies or report ids.
 
-import { EXPECTED_IMPLEMENTATIONS, NETWORKS, NETWORK_NAMES, THRESHOLDS } from "./config.js";
+import { evaluateListingDocumentCheck, evaluateProbeCheck } from "./checks.js";
+import { AIRNODE_RECIPES, AIRNODE_SCOPE, EXPECTED_IMPLEMENTATIONS, LIMITS, NETWORKS, NETWORK_NAMES, THRESHOLDS } from "./config.js";
 import { formatDuration, formatGwei, formatUsdc } from "./format.js";
-import { readAlerts, readChainState, readReportState, recentMessages } from "./store.js";
+import { describeShape } from "./listings.js";
+import { readAlerts, readChainState, readProbeStates, readReportState, recentMessages } from "./store.js";
 import { notifierConfigured } from "./telegram.js";
 
 const age = (now, t) => (t == null ? null : Math.max(0, now - t));
 const same = (a, b) => (a == null ? null : a.toLowerCase() === b.toLowerCase());
 
-export function buildStatus(storage, env, now) {
+const alertView = (now) => (a) => ({
+  check: a.check,
+  severity: a.severity,
+  title: a.title,
+  detail: a.detail,
+  since: a.since,
+  activeSeconds: age(now, a.since),
+  event: a.event,
+});
+
+/** Probe results per AirnodeHub recipe. Reasons are short texts built by the probe, never reply bodies. */
+function listingStatus(storage, now, recipes) {
+  const states = readProbeStates(storage);
+  return {
+    probeIntervalSeconds: LIMITS.probeIntervalSeconds,
+    listingDocumentIntervalSeconds: LIMITS.listingDocumentIntervalSeconds,
+    recipes: recipes.map((recipe) => {
+      const s = states.get(recipe.id) ?? null;
+      const probe = evaluateProbeCheck(recipe, s);
+      const doc = s?.document ?? null;
+      const docAlert = evaluateListingDocumentCheck(recipe, s);
+      return {
+        id: recipe.id,
+        name: recipe.name,
+        registryRecipe: recipe.recipe,
+        url: recipe.url,
+        operation: recipe.body.operation,
+        signer: recipe.signer,
+        expectedData: describeShape(recipe.shape),
+        status: s ? (probe ? probe.severity : "ok") : "not probed",
+        lastProbeAt: s?.probedAt ?? null,
+        lastProbeAgeSeconds: age(now, s?.probedAt),
+        latencyMs: s?.latencyMs ?? null,
+        lastOutcome: s?.outcome ?? null,
+        reason: s?.reason ?? null,
+        consecutiveFailures: s?.failures ?? 0,
+        verdict: s?.verdict ?? null,
+        verdictReason: s?.verdictReason ?? null,
+        lastOkAt: s?.lastOkAt ?? null,
+        signedLagSeconds: s?.outcome === "ok" ? s.signedLagSeconds ?? null : null,
+        nextProbeAt: s?.nextProbeAt ?? null,
+        listingDocument: doc
+          ? {
+              status: docAlert ? "alarm" : doc.verdict ? "ok" : "unknown",
+              checkedAt: doc.checkedAt,
+              checkedAgeSeconds: age(now, doc.checkedAt),
+              lastOutcome: doc.outcome,
+              reason: doc.reason,
+              nextCheckAt: doc.nextCheckAt,
+            }
+          : null,
+      };
+    }),
+    alerts: readAlerts(storage, AIRNODE_SCOPE).map(alertView(now)),
+  };
+}
+
+export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES) {
   const networks = {};
   for (const name of NETWORK_NAMES) {
     const net = NETWORKS[name];
@@ -75,15 +134,7 @@ export function buildStatus(storage, env, now) {
             refundScanCursorBlock: c.logCursor,
           }
         : null,
-      alerts: readAlerts(storage, name).map((a) => ({
-        check: a.check,
-        severity: a.severity,
-        title: a.title,
-        detail: a.detail,
-        since: a.since,
-        activeSeconds: age(now, a.since),
-        event: a.event,
-      })),
+      alerts: readAlerts(storage, name).map(alertView(now)),
     };
   }
   return {
@@ -91,6 +142,7 @@ export function buildStatus(storage, env, now) {
     generatedAt: now,
     notifier: notifierConfigured(env) ? "configured" : "not configured",
     networks,
+    airnodehub: listingStatus(storage, now, recipes),
     recentMessages: recentMessages(storage, 10).map((m) => ({
       at: m.created_at,
       network: m.network,
@@ -110,23 +162,27 @@ function row(label, value, tone = "") {
   return `<tr><th>${escapeHtml(label)}</th><td${tone ? ` class="${tone}"` : ""}>${escapeHtml(value)}</td></tr>`;
 }
 
-function networkSection(name, n) {
-  const r = n.report;
-  const c = n.chain;
-  const worst = n.alerts.some((a) => a.severity === "alarm") ? "alarm" : n.alerts.length ? "warning" : "ok";
+function sectionHeader(title, alerts) {
+  const worst = alerts.some((a) => a.severity === "alarm") ? "alarm" : alerts.length ? "warning" : "ok";
   const badge = { alarm: "ALARM", warning: "WARNING", ok: "OK" }[worst];
-  const parts = [`<section><h2>${escapeHtml(name)} <span class="badge ${worst}">${badge}</span></h2>`];
-
-  if (n.alerts.length) {
+  const parts = [`<section><h2>${escapeHtml(title)} <span class="badge ${worst}">${badge}</span></h2>`];
+  if (alerts.length) {
     parts.push("<ul class=\"alerts\">");
-    for (const a of n.alerts) {
+    for (const a of alerts) {
       parts.push(
-        `<li class="${a.severity}"><strong>${escapeHtml(a.severity.toUpperCase())}</strong> ${escapeHtml(a.title)}` +
+        `<li class="${escapeHtml(a.severity)}"><strong>${escapeHtml(a.severity.toUpperCase())}</strong> ${escapeHtml(a.title)}` +
           `<br><small>${escapeHtml(a.detail)} &middot; since ${escapeHtml(formatDuration(a.activeSeconds))}</small></li>`,
       );
     }
     parts.push("</ul>");
   }
+  return parts;
+}
+
+function networkSection(name, n) {
+  const r = n.report;
+  const c = n.chain;
+  const parts = sectionHeader(name, n.alerts);
 
   parts.push("<h3>Keeper reports</h3><table>");
   if (!r.everReported) {
@@ -160,8 +216,39 @@ function networkSection(name, n) {
   return parts.join("");
 }
 
+const PROBE_TONE = { ok: "good", warning: "warning", alarm: "bad" };
+
+function listingsSection(listings) {
+  const parts = sectionHeader("AirnodeHub listings", listings.alerts);
+  parts.push("<table>");
+  for (const r of listings.recipes) {
+    let summary = "not probed yet";
+    if (r.status !== "not probed") {
+      const label = r.status === "ok" ? "OK" : r.status.toUpperCase();
+      summary =
+        `<span class="${PROBE_TONE[r.status] ?? ""}">${escapeHtml(label)}</span> &middot; probed ${escapeHtml(ago(r.lastProbeAgeSeconds))}` +
+        (r.latencyMs == null ? "" : ` &middot; ${escapeHtml(r.latencyMs)} ms`);
+    }
+    const notes = [];
+    if (r.reason) notes.push(r.consecutiveFailures > 0 ? `${r.reason} (${r.consecutiveFailures} failed in a row)` : r.reason);
+    if (r.verdict && r.verdict !== "ok" && r.verdictReason && r.verdictReason !== r.reason) notes.push(r.verdictReason);
+    const d = r.listingDocument;
+    if (d) notes.push(`listing document ${d.status === "alarm" ? "MISMATCH" : d.status}, checked ${ago(d.checkedAgeSeconds)}${d.reason ? `: ${d.reason}` : ""}`);
+    parts.push(
+      `<tr><th>${escapeHtml(r.name)}<br><small>recipe ${escapeHtml(r.registryRecipe)} &middot; ${escapeHtml(r.operation)}</small></th>` +
+        `<td>${summary}${notes.map((note) => `<br><small>${escapeHtml(note)}</small>`).join("")}</td></tr>`,
+    );
+  }
+  parts.push(
+    `</table><p class="meta">Each listing is probed every ${escapeHtml(formatDuration(listings.probeIntervalSeconds))} and its listing document read every ${escapeHtml(formatDuration(listings.listingDocumentIntervalSeconds))}.</p></section>`,
+  );
+  return parts.join("");
+}
+
 export function renderHtml(status) {
-  const sections = Object.entries(status.networks).map(([name, n]) => networkSection(name, n)).join("");
+  const sections =
+    Object.entries(status.networks).map(([name, n]) => networkSection(name, n)).join("") +
+    (status.airnodehub ? listingsSection(status.airnodehub) : "");
   const messages = status.recentMessages.length
     ? `<section><h2>Recent notices</h2><ul class="notices">${status.recentMessages
         .map((m) => `<li><small>${escapeHtml(new Date(m.at * 1000).toISOString().replace("T", " ").slice(0, 19))} UTC &middot; ${escapeHtml(m.delivery)}</small><br>${escapeHtml(m.text)}</li>`)
@@ -193,7 +280,7 @@ th{font-weight:500;color:var(--muted);width:45%;padding-right:10px}
 .good{color:var(--ok)}.bad{color:var(--alarm)}
 ul{list-style:none;padding:0;margin:0}
 .alerts li,.notices li{padding:6px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
-.alerts small{color:var(--muted)}
+.alerts small,td small,th small{color:var(--muted)}
 .notices small{color:var(--muted)}
 .meta{color:var(--muted);font-size:.85rem;margin:0}
 a{color:inherit}

@@ -8,11 +8,48 @@ export class FetchTimeoutError extends Error {
   }
 }
 
+export class ResponseTooLargeError extends Error {
+  constructor() {
+    super("response too large");
+    this.name = "ResponseTooLargeError";
+  }
+}
+
+/** Read a response body as text, stopping as soon as it exceeds `maxBytes`. */
+async function readTextLimited(response, maxBytes) {
+  const declared = response.headers.get("content-length");
+  if (declared !== null && /^\d+$/.test(declared) && Number(declared) > maxBytes) {
+    try {
+      await response.body?.cancel();
+    } catch {}
+    throw new ResponseTooLargeError();
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {}
+      throw new ResponseTooLargeError();
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
 /**
  * POST/GET and return {status, ok, text}. `readBody: false` discards the body without reading it.
+ * With `maxBytes`, a longer body throws ResponseTooLargeError as soon as the limit is passed.
  * Throws FetchTimeoutError on timeout; other network errors are rethrown as-is.
  */
-export async function fetchText(fetchImpl, url, init, timeoutMs, { readBody = true } = {}) {
+export async function fetchText(fetchImpl, url, init, timeoutMs, { readBody = true, maxBytes } = {}) {
   const controller = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -27,7 +64,8 @@ export async function fetchText(fetchImpl, url, init, timeoutMs, { readBody = tr
       } catch {}
       return { status: response.status, ok: response.ok, text: null };
     }
-    return { status: response.status, ok: true, text: await response.text() };
+    const text = maxBytes === undefined ? await response.text() : await readTextLimited(response, maxBytes);
+    return { status: response.status, ok: true, text };
   } catch (err) {
     if (timedOut) throw new FetchTimeoutError();
     throw err;

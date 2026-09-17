@@ -7,7 +7,8 @@ This Worker runs on Cloudflare instead. It:
 
 1. receives each keeper's outbound health reports (`POST /v1/health/<network>`),
 2. reads both chains every minute,
-3. posts to the operator Telegram chat with its own bot token.
+3. probes the AirnodeHub listings the epoch registry depends on, once an hour each,
+4. posts to the operator Telegram chat with its own bot token.
 
 ```
 keeper (arc-mainnet) ──POST /v1/health/arc-mainnet──┐
@@ -15,12 +16,16 @@ keeper (arc-testnet) ──POST /v1/health/arc-testnet──┤
                                                     ▼
            Worker (validation, auth)  ──RPC──►  Durable Object "Watchdog" (SQLite)
            cron * * * * *            ──RPC──►    ├─ JSON-RPC batches to Arc (Blockdaemon, then public)
-           GET / and /status.json    ──RPC──►    ├─ threshold checks and alert lifecycle
+           GET / and /status.json    ──RPC──►    ├─ AirnodeHub listing probes (signed POST, OpenAPI GET)
+                                                 ├─ threshold checks and alert lifecycle
                                                  └─ Telegram sendMessage
 ```
 
 All state lives in one SQLite-backed Durable Object (the account token has no D1 or KV rights).
-There are no runtime dependencies: the few ABI encodings and decodings are written by hand in `src/abi.js`.
+The few ABI encodings and decodings are written by hand in `src/abi.js`. The only runtime dependencies are
+`@noble/curves` and `@noble/hashes` (pinned exact versions), used to verify AirnodeHub signatures. `src/cron.js`
+imports the module that uses them (`src/probe.js`) lazily, so their code is evaluated only inside the Durable
+Object and only once a probe is due, never in the Worker entry.
 
 ## Checks
 
@@ -54,9 +59,73 @@ Known scan limits:
 * `getPendingRequestIds` only sees the last 256 request ids and excludes expired requests, so a request that expired unserved shows up through `refund` (and the keeper's `expired` events) rather than `pending`.
 * Keeper report retries keep their original `observedAt`. `health_age` is measured on the keeper clock, so a delivery gap raises `heartbeat` only, not both.
 
+## AirnodeHub listing probes
+
+The epoch registry (`EpochEntropy`) accepts an AirnodeHub reply only if its canonical request hash, its signed data
+bytes and its signer match the recipe exactly; otherwise the epoch falls back to the next source. A listing that
+changes or disappears therefore fails silently on chain. The watchdog calls each recipe the way the keeper does
+and alerts before an epoch selects the broken source.
+
+Probed recipes (`AIRNODE_RECIPES` in `src/config.js`):
+
+| Recipe id (registry recipe) | Gateway, operation | Signer | Signed data |
+| --- | --- | --- | --- |
+| `hyperliquid-btc-day-volume` (0) | `airnode-hyperliquid.fly.dev`, `metaAndAssetCtxs` with a projection | `0x509F…665B` | `{"symbol":"BTC","value":"<decimal>"}` |
+| `drpc-ethereum-blockhash` (1) | `airnode-drpc.fly.dev`, `jsonRpc` `eth_call` Multicall3 `getLastBlockHash()` on `ethereum` | `0x511A…2137` | `{"id":null,"jsonrpc":"2.0","result":"0x<64 lowercase hex>"}` |
+| `tickerlayer-btcusd` (2) | `airnode-tickerlayer.fly.dev`, `lastTrade` crypto `BTCUSD` | `0x32f5…9f2c` | `{"symbol":"BTCUSD","price":<number>,"size":<number>,"timestamp":<integer>}` |
+| `nodary-eth-usd` (4) | `airnode-nodary.fly.dev`, `latestFeeds` `ETH/USD` | `0xE70f…E4c0` | `{"ETH/USD":{"value":<number>,"timestamp":<13-digit integer>,"category":"crypto"}}` |
+| `drpc-base-blockhash` (6) | `airnode-drpc.fly.dev`, as recipe 1 on `base` | `0x511A…2137` | as recipe 1 |
+
+Each probe POSTs the configured body to the gateway (15 s timeout, reply at most 16 KiB) and checks, in order:
+
+1. **Reply:** HTTP 200 with a JSON object carrying the signed envelope (`airnode`, `requestHash`, `timestamp`, `data`, `signature`). A timeout, network error, other HTTP status, invalid JSON, an oversized reply or an unsigned `{"error": ...}` counts as a *failed probe*.
+2. **Request hash:** `requestHash` = keccak256 of the AirnodeHub canonical request of the configured body. Every object, at any depth, becomes its `[key, value]` entries sorted by key, arrays keep their order, and a `responseProjection` is appended as a third element. The tests pin each canonical string to `EpochEntropy.recipeRequest`.
+3. **Signer:** `airnode` is the configured signer, and the EIP-191 personal-sign signer of keccak256(abi.encodePacked(bytes32 requestHash, uint256 timestamp, bytes data)) is the configured signer. The data bytes are `data` itself when it is a string, otherwise `JSON.stringify(data)`. Signatures follow OpenZeppelin `ECDSA.recover`: 65 bytes, v 27 or 28, low s.
+4. **Data shape:** the data bytes pass a port of `EpochEntropy._validate` for the recipe: 1 to 128 bytes, exact literals and key order, the same number grammar.
+5. **Signed timestamp:** at most 240 s before the probe (the registry's `MAX_ATTESTATION_AGE`) and at most 60 s after it.
+
+Once a day the watchdog also GETs each gateway's OpenAPI document (one request per gateway URL, covering all its
+recipes). It checks that `x-airnode.address` is the configured signer and that the operation is still offered, still
+accepts every parameter and the projection the recipe sends, and requires no parameter the recipe omits. A document
+that cannot be read or is in an unrecognized format raises nothing, because the POST probe covers reachability. The
+read is retried an hour later.
+
+Alerts use the scope `airnodehub` (messages read `[airnodehub] ALARM Hyperliquid BTC day volume request hash mismatch: ...`):
+
+| Check (key) | Warning | Alarm |
+| --- | --- | --- |
+| `probe:<id>` failed probes in a row (unreachable, HTTP error, unusable reply) | 2 | 4 |
+| `probe:<id>` request hash, signer, data shape or signed timestamp mismatch | — | immediately; stays active until a probe passes (a failed probe does not clear it) |
+| `listing:<id>` listing document signer mismatch, or operation missing | — | immediately; stays active until a document read shows it fixed |
+
+Reasons are short texts built by the watchdog, such as `http 503`, `gateway signed 0xd5ded974...2e3d, recipe expects
+0xabe6d1ad...abda` or `signature recovers 0x..., catalog expects 0x...`. Reply bodies are never stored, logged or
+sent.
+
+Schedule:
+
+* Recipe *i* of *n* is probed at second *i* × 3600 / *n* of every hour (five recipes: minutes 0, 12, 24, 36 and 48). After a probe that did not pass, the recipe is probed again 10 minutes later. An unreachable listing therefore warns within about 1 h 10 min and alarms within about 1 h 30 min, and a changed listing alarms within the hour.
+* Listing documents are read once a day, gateway *j* of *m* at second *j* × 86400 / *m*. They are read only in runs where no probe is due, so a slot that falls on a probe minute moves to the next run.
+* A recipe that was never probed (new deployment, new recipe) is due at once. A run starts at most 5 probe or document requests, with at most 3 open at a time; the rest wait for the next run.
+* The probes run concurrently with the chain reads, and their results are committed in the same transaction.
+
+Adding a recipe:
+
+1. Add an entry to `AIRNODE_RECIPES` in `src/config.js`: `id` (stable key for state and alerts), `name`, `recipe` (the registry recipe id), `url`, `body` (the request exactly as the keeper sends it), `signer` (the catalog's signer for this recipe) and `shape` (the data grammar of `EpochEntropy._validate` for the recipe; the part types are listed above the array).
+2. Record a real signed reply: POST the body to the gateway and add the line to a fixture in `test/fixtures/`. `test/probe.test.js` shows the pattern: recipes 3, 5 and 7 are configured in `EXTRA_RECIPES` and their real replies pass `evaluateResponse`.
+3. If the registry recipe is new, add its `recipeRequest` literal to `EPOCH_RECIPE_REQUESTS` in `test/helpers.js`, then run `npm test`. The configuration test checks that every configured body canonicalizes to that literal.
+
+The hourly phases of later entries shift when a recipe is inserted, which is harmless. Removing a recipe resolves its
+alerts and deletes its state on the next run.
+
+Known probe limits:
+
+* The signer and the recipe list come from `src/config.js`, not from the registry's on-chain `catalogAt(epoch)`. After `scheduleCatalog` changes the catalog, update the configuration too.
+* A gateway may answer the probe and still fail a keeper call seconds later. The probe shows that the listing and its signing format are intact; it does not measure availability between probes.
+
 ## Alert lifecycle
 
-Each (network, check) pair has one alert row in the Durable Object:
+Each (network, check) pair has one alert row in the Durable Object. AirnodeHub probes use `airnodehub` in place of a network:
 
 * **First activation:** one message, `[arc-mainnet] WARNING ...` or `[arc-mainnet] ALARM ...`.
 * **Warnings** never repeat.
@@ -111,11 +180,17 @@ For each network, this returns:
 * the last chain check time and figures: block, pending count, oldest pending age, balance in USDC, base fee and fee-cap usage, wiring checks, log cursor,
 * active alerts with severity and `since`.
 
+Under `airnodehub` it returns, for each recipe: `status` (`ok`, `warning`, `alarm` or `not probed`), `lastProbeAt`,
+`lastProbeAgeSeconds`, `latencyMs`, `lastOutcome` (`ok`, `failure`, `request_hash`, `signer`, `data_shape` or
+`timestamp`), `reason`, `consecutiveFailures`, the last conclusive `verdict` and `verdictReason`, `lastOkAt`,
+`signedLagSeconds`, `nextProbeAt`, the expected data and `listingDocument` (`status`, `checkedAt`, `lastOutcome`,
+`reason`). It also returns the active `airnodehub` alerts.
+
 It also returns `notifier` (`configured` or `not configured`) and the last 10 notices. It never includes secrets, raw reports or report ids. Responses are edge-cached for 15 s, and query strings are ignored.
 
 ### `GET /`
 
-The same information as a small server-rendered HTML page. It is readable on a phone, follows the system light or dark theme and refreshes every 60 s.
+The same information as a small server-rendered HTML page, with one row per AirnodeHub recipe (status, last probe, latency, reason and listing document). It is readable on a phone, follows the system light or dark theme and refreshes every 60 s.
 
 ## Secrets
 
@@ -169,7 +244,7 @@ npm test                                   # node --test, no network
 cp .dev.vars.example .dev.vars             # throwaway values only; git-ignored
 npx wrangler dev --test-scheduled
 curl "http://127.0.0.1:8787/__scheduled?cron=*+*+*+*+*"   # one live read of both networks
-curl http://127.0.0.1:8787/status.json
+curl http://127.0.0.1:8787/status.json            # airnodehub.recipes: the first run probes all five listings
 rm .dev.vars
 ```
 
@@ -184,6 +259,9 @@ Layout:
 | `src/cron.js` | one run: read chains, evaluate, commit, deliver |
 | `src/rpc.js`, `src/abi.js`, `src/net.js` | JSON-RPC batches with fallback, hand-rolled ABI, timed fetch |
 | `src/checks.js`, `src/alerts.js` | pure threshold evaluation and alert lifecycle |
+| `src/listings.js` | AirnodeHub canonical requests, data shapes, probe schedule and state, listing document check (pure, no dependencies) |
+| `src/probe.js` | AirnodeHub probe requests, request hash and signature recovery (`@noble/*`), loaded lazily by `src/cron.js` |
+| `test/fixtures/airnodehub-samples-2026-09-17.jsonl` | real signed gateway replies, two per catalog recipe |
 | `src/store.js` | SQLite schema and queries |
 | `src/status.js`, `src/telegram.js`, `src/format.js` | read model and HTML, Telegram delivery, formatting |
 
@@ -203,13 +281,13 @@ The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an 
 
 | Limit (free plan) | Usage |
 | --- | --- |
-| Worker CPU 10 ms per invocation | The Worker only routes: report validation plus hashing measured ~0.1–0.4 ms (up to ~1.7 ms on a cold isolate) for 0.5–61 KB reports. The cron handler just calls the Durable Object. |
-| Durable Object CPU (30 s per request) | A full run for both networks with replayed live RPC responses measured ~0.4 ms warm and ~1.6 ms cold. A worst-case 5,000-block scan returning 1,000 logs measured ~3.5–5 ms. |
-| Subrequests 50 per invocation | 2 batches per network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. |
+| Worker CPU 10 ms per invocation | The Worker only routes: report validation plus hashing measured ~0.1–0.4 ms (up to ~1.7 ms on a cold isolate) for 0.5–61 KB reports. The cron handler just calls the Durable Object. The signature code is never evaluated here. Loading the whole 204 KB bundle (parse plus top-level evaluation, Node 24) went from 3.3 ms to 5.9 ms with the probe; this is isolate startup, not per-request work. |
+| Durable Object CPU (30 s per request) | A full run for both networks with replayed live RPC responses measured ~0.4 ms warm and ~1.6 ms cold. A worst-case 5,000-block scan returning 1,000 logs measured ~3.5–5 ms. One AirnodeHub probe (reply parse, request hash, secp256k1 recovery, shape) measured 1.1–2 ms warm. The first probe after the object starts adds ~11 ms of module evaluation and ~7 ms of first verification. A run with all five probes due measured ~9 ms warm and ~39 ms cold; a run with none due adds ~0.06 ms. Parsing and checking the 60 KB Hyperliquid listing document takes ~0.1 ms. |
+| Subrequests 50 per invocation | 2 batches per network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. AirnodeHub adds ≤ 5 per run (5 at the first run, then 1 in each of 5 runs an hour, plus retries and 4 document reads a day), so ≤ 20 in total. |
 | DO requests 100,000/day | 2 networks × 2,880 reports + 1,440 cron runs ≈ 7,200/day, plus status views (edge-cached 15 s). |
-| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 5,760 ≈ 29,000. Chain state is 2 × 1,440 ≈ 2,900. Alerts and messages only change on transitions. Total ≈ 32,000/day. |
-| DO rows read 5,000,000/day | Point lookups plus a few rows per run; well under 100,000/day. |
-| DO duration 13,000 GB-s/day | Billed only while handling a request (RPC wait included): about 1 s × 1,440 runs + ~20 ms × 5,760 reports at 128 MB ≈ 200 GB-s/day. Timers are cleared so the object can hibernate. |
+| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 5,760 ≈ 29,000. Chain state is 2 × 1,440 ≈ 2,900. AirnodeHub probe state is 1 row per probe or document read, ≈ 130/day (more while a listing is retried every 10 min). Alerts and messages only change on transitions. Total ≈ 32,000/day. |
+| DO rows read 5,000,000/day | Point lookups plus a few rows per run; probe state and AirnodeHub alerts add about 11 per run (≈ 16,000/day). Well under 100,000/day. |
+| DO duration 13,000 GB-s/day | Billed only while handling a request (RPC wait included): about 1 s × 1,440 runs + ~20 ms × 5,760 reports at 128 MB ≈ 200 GB-s/day. AirnodeHub probes wait alongside the chain reads: 0.1–9 s each (fly.dev cold starts), at most 15 s, so ≤ 120 × 15 s × 0.128 GB ≈ 230 GB-s/day more in the worst case. Timers are cleared so the object can hibernate. |
 | DO storage 5 GB | 3 days of report ids (≈ 17,000 small rows) plus a bounded 100-row message log. |
 | Cron triggers (5 per account) | 1 |
 

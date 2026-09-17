@@ -51,6 +51,7 @@ function harness(env = TELEGRAM) {
       fetch,
       clock: () => state.clock * 1000,
       readChainImpl: async (net, cursor) => ({ ...state.reads[net.name], cursorSeen: cursor }),
+      recipes: [], // AirnodeHub probes are covered in probe.test.js
     });
   };
   return { storage, state, run };

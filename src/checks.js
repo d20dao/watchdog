@@ -183,3 +183,42 @@ export function evaluateRpcCheck(failures, lastError) {
     `${failures} consecutive runs failed${lastError ? ` (last error: ${lastError})` : ""}`,
   );
 }
+
+// ---------------------------------------------------------------------------------------------
+// AirnodeHub listing probes (scope AIRNODE_SCOPE). `state` is the stored probe state of a recipe or null.
+
+/** Alert check names of one recipe: its signed-reply probe and its listing document check. */
+export const probeCheckName = (recipe) => `probe:${recipe.id}`;
+export const listingCheckName = (recipe) => `listing:${recipe.id}`;
+
+const PROBE_MISMATCH_TITLES = Object.freeze({
+  request_hash: "request hash mismatch",
+  signer: "signer mismatch",
+  data_shape: "data shape mismatch",
+  timestamp: "signed timestamp out of range",
+});
+
+/**
+ * Mismatches (request hash, signer, data shape, signed timestamp) alarm at once and stay until a probe passes:
+ * a probe that fails in transit says nothing about whether a changed listing was fixed. Failed probes
+ * (unreachable, HTTP error, unsigned or unparsable reply) warn after 2 in a row and alarm after 4.
+ */
+export function evaluateProbeCheck(recipe, state) {
+  if (!state) return null;
+  if (state.verdict && state.verdict !== "ok") {
+    return alarm(`${recipe.name} ${PROBE_MISMATCH_TITLES[state.verdict] ?? "listing changed"}`, state.verdictReason ?? "");
+  }
+  const failures = state.failures ?? 0;
+  if (failures < THRESHOLDS.probeWarnFailures) return null;
+  const title = `${recipe.name} listing unreachable`;
+  const detail = `${failures} consecutive probes failed (last: ${state.reason ?? "unknown"})`;
+  return failures >= THRESHOLDS.probeAlarmFailures ? alarm(title, detail) : warning(title, detail);
+}
+
+/** The daily listing document check only alarms on a conclusive change; reading failures are left to the probe. */
+export function evaluateListingDocumentCheck(recipe, state) {
+  const doc = state?.document;
+  if (!doc || !doc.verdict || doc.verdict === "ok") return null;
+  const title = doc.verdict === "signer" ? "listing document signer mismatch" : "operation missing from listing document";
+  return alarm(`${recipe.name} ${title}`, doc.verdictReason ?? "");
+}

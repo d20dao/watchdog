@@ -80,6 +80,12 @@ const SCHEMA = [
      sent_at INTEGER
    )`,
   `CREATE INDEX IF NOT EXISTS messages_pending ON messages (id) WHERE status = 'pending'`,
+  // AirnodeHub probe state per recipe id, as JSON (see src/listings.js), so fields can be added without migrations.
+  `CREATE TABLE IF NOT EXISTS probe_state (
+     recipe_id TEXT PRIMARY KEY,
+     updated_at INTEGER NOT NULL,
+     state_json TEXT NOT NULL
+   ) WITHOUT ROWID`,
 ];
 
 export function migrate(storage) {
@@ -407,4 +413,31 @@ export function pruneMessages(storage) {
 
 export function recentMessages(storage, limit = 20) {
   return rows(storage, "SELECT created_at, network, severity, text, status FROM messages ORDER BY id DESC LIMIT ?", limit);
+}
+
+// ---------------------------------------------------------------------------------------------
+// AirnodeHub probe state
+
+/** Map of recipe id -> probe state object. Unreadable rows are skipped (the recipe is then due again). */
+export function readProbeStates(storage) {
+  const states = new Map();
+  for (const r of rows(storage, "SELECT recipe_id, state_json FROM probe_state")) {
+    const state = parseJson(r.state_json, null);
+    if (state && typeof state === "object") states.set(r.recipe_id, state);
+  }
+  return states;
+}
+
+export function writeProbeState(storage, recipeId, now, state) {
+  storage.sql.exec(
+    `INSERT INTO probe_state (recipe_id, updated_at, state_json) VALUES (?, ?, ?)
+     ON CONFLICT (recipe_id) DO UPDATE SET updated_at = excluded.updated_at, state_json = excluded.state_json`,
+    recipeId,
+    now,
+    JSON.stringify(state),
+  );
+}
+
+export function deleteProbeState(storage, recipeId) {
+  storage.sql.exec("DELETE FROM probe_state WHERE recipe_id = ?", recipeId);
 }

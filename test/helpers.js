@@ -1,5 +1,6 @@
 // Test helpers: an in-memory stand-in for Durable Object SQL storage and hand-built ABI fixtures.
 
+import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { NETWORKS } from "../src/config.js";
 import { migrate } from "../src/store.js";
@@ -149,5 +150,72 @@ export function healthyRead(net = TESTNET, overrides = {}) {
     logCursor: 1000,
     logSpan: 5000,
     ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// AirnodeHub fixtures
+
+/** EpochEntropy.recipeRequest(recipe) literals, copied from contracts/EpochEntropy.sol (d20-keeper-mainnet). */
+export const EPOCH_RECIPE_REQUESTS = Object.freeze([
+  '["metaAndAssetCtxs",[["dex",""]],[["symbol","/0/universe/0/name"],["value","/1/0/dayNtlVlm"]]]',
+  '["jsonRpc",[["method","eth_call"],["network","ethereum"],["params",[[["data","0x27e86d6e"],["to","0xcA11bde05977b3631167028862bE2a173976CA11"]],"latest"]]]]',
+  '["lastTrade",[["assetClass","crypto"],["symbol","BTCUSD"]]]',
+  '["lastTrade",[["assetClass","crypto"],["symbol","ETHUSD"]]]',
+  '["latestFeeds",[["name","ETH/USD"]]]',
+  '["allMids",[],[["mid","/SOL"]]]',
+  '["jsonRpc",[["method","eth_call"],["network","base"],["params",[[["data","0x27e86d6e"],["to","0xcA11bde05977b3631167028862bE2a173976CA11"]],"latest"]]]]',
+  '["latestFeeds",[["name","BTC/USD"]]]',
+]);
+
+/**
+ * Real signed gateway replies, two per catalog recipe, collected 2026-09-17:
+ * one JSON per line, {recipe, url, body, response: {airnode, requestHash, timestamp, data, signature}}.
+ */
+export function loadSamples() {
+  const text = readFileSync(new URL("./fixtures/airnodehub-samples-2026-09-17.jsonl", import.meta.url), "utf8");
+  return text.split(/\r?\n/).filter((line) => line.trim() !== "").map((line) => JSON.parse(line));
+}
+
+/**
+ * A listing OpenAPI document in the gateway format: x-airnode.address plus one POST / schema alternative per
+ * operation. `operations` = [{operation, parameters: [names], required?: [names], projection?: bool}].
+ */
+export function listingDocument(address, operations) {
+  return {
+    openapi: "3.1.0",
+    info: { title: "test listing", version: "0.1.0" },
+    paths: {
+      "/": {
+        get: { summary: "This document" },
+        post: {
+          requestBody: {
+            content: {
+              "application/json": {
+                schema: {
+                  oneOf: operations.map((op) => ({
+                    title: op.operation,
+                    type: "object",
+                    required: ["operation", "parameters"],
+                    additionalProperties: false,
+                    properties: {
+                      operation: { const: op.operation, description: "test operation" },
+                      parameters: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: op.required ?? [],
+                        properties: Object.fromEntries(op.parameters.map((name) => [name, { type: "string" }])),
+                      },
+                      ...(op.projection ? { responseProjection: { type: "object", additionalProperties: { type: "string" } } } : {}),
+                    },
+                  })),
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    "x-airnode": { address, version: "0.1.0" },
   };
 }

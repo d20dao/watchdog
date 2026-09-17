@@ -1,11 +1,22 @@
-// One watchdog run: read both chains (network I/O, no storage held), then evaluate and commit
-// every state change in one synchronous transaction, then deliver queued Telegram messages.
+// One watchdog run: read both chains and run any due AirnodeHub listing probes (network I/O, no storage held),
+// then evaluate and commit every state change in one synchronous transaction, then deliver queued Telegram messages.
 
 import { alertKey, transition } from "./alerts.js";
-import { CHECK_NAMES, evaluateChainChecks, evaluateReportChecks, evaluateRpcCheck } from "./checks.js";
-import { LIMITS, NETWORKS, NETWORK_NAMES } from "./config.js";
+import {
+  CHECK_NAMES,
+  evaluateChainChecks,
+  evaluateListingDocumentCheck,
+  evaluateProbeCheck,
+  evaluateReportChecks,
+  evaluateRpcCheck,
+  listingCheckName,
+  probeCheckName,
+} from "./checks.js";
+import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, NETWORK_NAMES } from "./config.js";
+import { applyDocumentResult, applyProbeResult, failedTaskResult, planProbeTasks } from "./listings.js";
 import { readChain } from "./rpc.js";
 import {
+  deleteProbeState,
   enqueueMessage,
   expireMessages,
   markDroppedAlerted,
@@ -15,27 +26,55 @@ import {
   pruneReports,
   readAlerts,
   readChainState,
+  readProbeStates,
   readReportState,
   saveAlert,
   writeChainState,
+  writeProbeState,
 } from "./store.js";
 import { groupMessages, notifierConfigured, sendTelegram } from "./telegram.js";
 
-export async function runCron({ storage, env, fetch, clock = () => Date.now(), readChainImpl = readChain }) {
+// The probe module carries the secp256k1 and keccak code; importing it lazily keeps it out of Worker startup.
+const loadProbeModule = () => import("./probe.js");
+
+/** Run planned probe tasks. Every task gets a result, even when the probe module cannot be loaded. */
+async function runProbes(tasks, { fetch, clock, loadProbes }) {
+  if (tasks.length === 0) return [];
+  try {
+    const { runProbeTasks } = await loadProbes();
+    return await runProbeTasks(tasks, { fetch, clock });
+  } catch {
+    return tasks.map((task) => failedTaskResult(task, "internal error"));
+  }
+}
+
+export async function runCron({
+  storage,
+  env,
+  fetch,
+  clock = () => Date.now(),
+  readChainImpl = readChain,
+  recipes = AIRNODE_RECIPES,
+  loadProbes = loadProbeModule,
+}) {
   const cursors = NETWORK_NAMES.map((name) => {
     const prev = readChainState(storage, name);
     return prev ? { logCursor: prev.logCursor, logSpan: prev.logSpan } : null;
   });
+  const tasks = planProbeTasks(recipes, readProbeStates(storage), Math.floor(clock() / 1000));
 
-  const reads = await Promise.all(
-    NETWORK_NAMES.map(async (name, i) => {
-      try {
-        return await readChainImpl(NETWORKS[name], cursors[i], { fetch });
-      } catch {
-        return { ok: false, complete: false, error: "internal error", errors: [], subrequests: 0 };
-      }
-    }),
-  );
+  const [reads, probeResults] = await Promise.all([
+    Promise.all(
+      NETWORK_NAMES.map(async (name, i) => {
+        try {
+          return await readChainImpl(NETWORKS[name], cursors[i], { fetch });
+        } catch {
+          return { ok: false, complete: false, error: "internal error", errors: [], subrequests: 0 };
+        }
+      }),
+    ),
+    runProbes(tasks, { fetch, clock, loadProbes }),
+  ]);
 
   // Reports may have arrived while the reads were in flight; everything below re-reads current state.
   const now = Math.floor(clock() / 1000);
@@ -78,10 +117,12 @@ export async function runCron({ storage, env, fetch, clock = () => Date.now(), r
         messages,
       };
     });
+    const airnodehub = commitProbes(storage, recipes, tasks, probeResults, now, deliverable);
+    enqueued += airnodehub.messages.length;
     pruneReports(storage, now - LIMITS.reportRetentionSeconds);
     expireMessages(storage, now);
     if (enqueued > 0) pruneMessages(storage);
-    return { networks, enqueued };
+    return { networks, airnodehub, enqueued };
   });
 
   let delivered = 0;
@@ -106,9 +147,61 @@ export async function runCron({ storage, env, fetch, clock = () => Date.now(), r
     at: now,
     notifier: deliverable ? "configured" : "not configured",
     networks: outcome.networks,
+    airnodehub: outcome.airnodehub,
     messagesQueued: outcome.enqueued,
     messagesDelivered: delivered,
     deliveryError,
-    subrequests: chainSubrequests + telegramSubrequests,
+    // Each probe task is exactly one fetch.
+    subrequests: chainSubrequests + tasks.length + telegramSubrequests,
+  };
+}
+
+/** Store probe results, evaluate the probe alerts and queue their messages. Runs inside the run's transaction. */
+function commitProbes(storage, recipes, tasks, results, now, deliverable) {
+  const states = readProbeStates(storage);
+  const changed = new Set();
+  const probes = [];
+  tasks.forEach((task, i) => {
+    const result = results[i];
+    if (task.kind === "probe") {
+      const recipe = task.recipes[0];
+      states.set(recipe.id, applyProbeResult(states.get(recipe.id) ?? null, result, now, task.phase));
+      changed.add(recipe.id);
+      probes.push({ recipe: recipe.id, outcome: result.outcome, reason: result.reason ?? null, latencyMs: result.latencyMs ?? null });
+    } else {
+      task.recipes.forEach((recipe, j) => {
+        states.set(recipe.id, applyDocumentResult(states.get(recipe.id) ?? null, result.results[j], result.latencyMs, now, task.phase));
+        changed.add(recipe.id);
+      });
+      probes.push({ listingDocument: task.url, outcomes: result.results.map((r) => r.outcome), latencyMs: result.latencyMs ?? null });
+    }
+  });
+  for (const id of changed) writeProbeState(storage, id, now, states.get(id));
+  const configured = new Set(recipes.map((recipe) => recipe.id));
+  for (const id of states.keys()) if (!configured.has(id)) deleteProbeState(storage, id);
+
+  const conditions = new Map();
+  for (const recipe of recipes) {
+    const state = states.get(recipe.id) ?? null;
+    conditions.set(probeCheckName(recipe), evaluateProbeCheck(recipe, state));
+    conditions.set(listingCheckName(recipe), evaluateListingDocumentCheck(recipe, state));
+  }
+  const existing = new Map(readAlerts(storage, AIRNODE_SCOPE).map((row) => [row.check, row]));
+  // A recipe removed from the configuration resolves its alerts.
+  for (const check of existing.keys()) if (!conditions.has(check)) conditions.set(check, null);
+
+  const messages = [];
+  for (const [check, condition] of conditions) {
+    const step = transition(existing.get(check) ?? null, condition, now, AIRNODE_SCOPE, check);
+    if (step.write) saveAlert(storage, alertKey(AIRNODE_SCOPE, check), step.row);
+    if (step.message) {
+      enqueueMessage(storage, now, AIRNODE_SCOPE, step.message.severity, step.message.text, deliverable);
+      messages.push(step.message.text);
+    }
+  }
+  return {
+    probes,
+    activeAlerts: [...conditions].filter(([, condition]) => condition).map(([check]) => check),
+    messages,
   };
 }
