@@ -138,6 +138,13 @@ test("log scan: cursor + 1 to head, capped at 5,000 blocks, refunds and foreign 
   assert.equal(behind.logs.refunds[0].paid, false);
   assert.deepEqual(behind.logs.foreignFulfillments.map((f) => f.requestId), [814n]);
 
+  // A follower keeper authorized as a backup committer is one of ours, not a foreign submitter.
+  const backup = TESTNET.backupKeepers[0];
+  const withBackup = await readChain(TESTNET, { logCursor: 80000, logSpan: 5000 }, {
+    fetch: mockRpc(TESTNET, { head: 100000, logs: [...logs, log(TOPICS.randomnessFulfilled, 817, backup, "0x" + "d4".repeat(32))] }).fetch,
+  });
+  assert.deepEqual(withBackup.logs.foreignFulfillments.map((f) => f.requestId), [814n]);
+
   const rpc2 = mockRpc(TESTNET, { head: 100000 });
   const near = await readChain(TESTNET, { logCursor: 99880, logSpan: 5000 }, { fetch: rpc2.fetch });
   const range = rpc2.calls[1].batch.find((c) => c.method === "eth_getLogs").params[0];

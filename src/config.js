@@ -28,6 +28,7 @@ export const NETWORKS = Object.freeze({
     coordinator: "0xd20da057469C45928912d983F45790C41e290571",
     registry: "0xd20Da048C1A68fa3Bc0B5f5Bc454D1530062C82D",
     keeper: "0xA5496Bb35905Bfe0Bac7D23Ca18c008F5E6Eb13e",
+    backupKeepers: Object.freeze([]),
     // Expected ERC-1967 implementations; update after each reviewed upgrade.
     implementations: Object.freeze({
       coordinator: "0xD20da0c375cEfCdA65703699A4090237057e9b68",
@@ -45,6 +46,8 @@ export const NETWORKS = Object.freeze({
     coordinator: "0xd20DA0FF9087d053f0291524Eac12abA1ADBd945",
     registry: "0xD20Da00B47A7cD2211dC4683E306913b05903756",
     keeper: "0x61659d9A9A85dA07C36e7d1B35CF0d96CF199Cac",
+    // Follower keepers authorized as backup committers: their fulfillments are ours, not a foreign submitter.
+    backupKeepers: Object.freeze(["0xbb2fdE97a5F4855bEf872C71fbb80Be3170127Ee"]),
     // Recipe registry and per-submitter keeper share, upgraded on 2026-09-18.
     implementations: Object.freeze({
       coordinator: "0xd20da0DADa4352A1a9722be43a2D85923443458c",

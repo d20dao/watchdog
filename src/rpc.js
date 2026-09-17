@@ -289,6 +289,11 @@ export async function readChain(net, cursor, { fetch, timeoutMs } = {}) {
   return finish();
 }
 
+/** Whether a fulfillment came from one of this network's own keeper wallets. */
+function ourSubmitter(submitter, net) {
+  return sameAddress(submitter, net.keeper) || (net.backupKeepers ?? []).some((wallet) => sameAddress(submitter, wallet));
+}
+
 function decodeLogs(result, net) {
   if (!Array.isArray(result)) throw new AbiError("logs not an array");
   const refunds = [];
@@ -299,7 +304,7 @@ function decodeLogs(result, net) {
     const decoded = decodeCoordinatorLog(log);
     if (!decoded) continue;
     if (decoded.kind === "refund") refunds.push(decoded);
-    else if (!sameAddress(decoded.submitter, net.keeper)) foreignFulfillments.push(decoded);
+    else if (!ourSubmitter(decoded.submitter, net)) foreignFulfillments.push(decoded);
   }
   return { refunds, foreignFulfillments };
 }
