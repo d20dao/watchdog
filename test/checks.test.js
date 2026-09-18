@@ -118,19 +118,20 @@ test("keeper balance (< 5 USDC warning, < 2 USDC alarm)", () => {
   assert.match(at(3434567890123456789n).detail, /holds 3\.434567 USDC$/);
 });
 
-test("backup keeper balances use the keeper thresholds, one check per wallet", () => {
+test("backup keeper balances (< 2 USDC warning, < 1 USDC alarm), one check per wallet", () => {
   const backup = MAINNET.backupKeepers[0];
   const key = backupBalanceCheckName(backup);
   assert.equal(key, "backup_balance:0x75af60e2165e8e6d2f6cfd5d9ddda83446044685");
   const at = (wei) => evaluateChainChecks(MAINNET, healthyRead(MAINNET, { backupBalances: [{ address: backup, balanceWei: wei }] }));
-  assert.equal(severity(at(5n * USDC)[key]), "clear");
-  assert.equal(severity(at(5n * USDC - 1n)[key]), "warning");
-  assert.equal(severity(at(2n * USDC)[key]), "warning");
-  assert.equal(severity(at(2n * USDC - 1n)[key]), "alarm");
+  assert.equal(severity(at(2n * USDC)[key]), "clear");
+  assert.equal(severity(at(45n * 10n ** 17n)[key]), "clear", "the mainnet backup's 4.5 USDC is enough");
+  assert.equal(severity(at(2n * USDC - 1n)[key]), "warning");
+  assert.equal(severity(at(1n * USDC)[key]), "warning");
+  assert.equal(severity(at(1n * USDC - 1n)[key]), "alarm");
   assert.equal(severity(at(0n)[key]), "alarm");
-  const low = at(3434567890123456789n)[key];
+  const low = at(1434567890123456789n)[key];
   assert.equal(low.title, "backup keeper 0x75Af…4685 balance low");
-  assert.equal(low.detail, "0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685 holds 3.434567 USDC");
+  assert.equal(low.detail, "0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685 holds 1.434567 USDC");
   assert.equal(at(1n)[key].event, undefined, "a standing condition, not a one-shot notice");
 
   // The keeper's own check is separate: a low backup leaves it clear, and the other way round.
@@ -151,7 +152,7 @@ test("several backup keepers: each wallet has its own check, matched case-insens
   const b = "0x00000000000000000000000000000000000000bB";
   const net = { ...TESTNET, backupKeepers: [a, b] };
   const c = evaluateChainChecks(net, healthyRead(net, {
-    backupBalances: [{ address: a.toLowerCase(), balanceWei: 4n * USDC }, { address: b, balanceWei: 9n * USDC }],
+    backupBalances: [{ address: a.toLowerCase(), balanceWei: 15n * 10n ** 17n }, { address: b, balanceWei: 9n * USDC }],
   }));
   assert.equal(c[backupBalanceCheckName(a)].severity, "warning");
   assert.equal(c[backupBalanceCheckName(a)].title, "backup keeper 0x0000…00Aa balance low");

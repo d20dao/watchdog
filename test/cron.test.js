@@ -178,11 +178,11 @@ test("backup and keeper balance alerts are raised and resolved independently", a
     (h.state.reads["arc-mainnet"] = healthyRead(MAINNET, { balanceWei: keeper, backupBalances: [{ address: BACKUP, balanceWei: backup }] }));
   const texts = () => h.state.telegram.flatMap((m) => m.text.split("\n\n"));
 
-  balances(1n * USDC, 3n * USDC);
+  balances(1n * USDC, 15n * 10n ** 17n);
   const first = await h.run(0);
   assert.deepEqual(texts(), [
     `[arc-mainnet] ALARM keeper balance low: keeper ${MAINNET.keeper} holds 1 USDC`,
-    "[arc-mainnet] WARNING backup keeper 0x75Af…4685 balance low: 0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685 holds 3 USDC",
+    "[arc-mainnet] WARNING backup keeper 0x75Af…4685 balance low: 0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685 holds 1.5 USDC",
   ]);
   assert.deepEqual(first.networks["arc-mainnet"].activeAlerts, ["balance", BACKUP_CHECK]);
   const keys = h.storage.sql.exec("SELECT alert_key FROM alerts ORDER BY alert_key").toArray().map((r) => r.alert_key);
@@ -195,14 +195,14 @@ test("backup and keeper balance alerts are raised and resolved independently", a
   assert.deepEqual(readAlerts(h.storage, "arc-mainnet").map((a) => a.check), ["balance"]);
 
   // Backup drained again: it alarms on its own; the keeper alarm is not repeated inside its 30 minutes.
-  balances(1n * USDC, 15n * 10n ** 17n);
+  balances(1n * USDC, 5n * 10n ** 17n);
   const third = await h.run(10);
   assert.deepEqual(third.networks["arc-mainnet"].messages, [
-    "[arc-mainnet] ALARM backup keeper 0x75Af…4685 balance low: 0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685 holds 1.5 USDC",
+    "[arc-mainnet] ALARM backup keeper 0x75Af…4685 balance low: 0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685 holds 0.5 USDC",
   ]);
 
   // Keeper refilled, backup still low: only the keeper resolves.
-  balances(50n * USDC, 15n * 10n ** 17n);
+  balances(50n * USDC, 5n * 10n ** 17n);
   const fourth = await h.run(12);
   assert.deepEqual(fourth.networks["arc-mainnet"].messages, ["[arc-mainnet] RESOLVED keeper balance low after 12 min"]);
   assert.deepEqual(fourth.networks["arc-mainnet"].activeAlerts, [BACKUP_CHECK]);
@@ -212,7 +212,7 @@ test("backup and keeper balance alerts are raised and resolved independently", a
   const fifth = await h.run(45);
   assert.deepEqual(fifth.networks["arc-mainnet"].messages, []);
   assert.deepEqual(fifth.networks["arc-mainnet"].activeAlerts, [BACKUP_CHECK]);
-  assert.equal(readChainState(h.storage, "arc-mainnet").backupBalances[BACKUP.toLowerCase()], (15n * 10n ** 17n).toString(), "last known balance kept");
+  assert.equal(readChainState(h.storage, "arc-mainnet").backupBalances[BACKUP.toLowerCase()], (5n * 10n ** 17n).toString(), "last known balance kept");
 });
 
 test("a backup wallet removed from the configuration resolves its alert and leaves the status", async () => {

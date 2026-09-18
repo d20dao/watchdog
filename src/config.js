@@ -73,6 +73,10 @@ export const THRESHOLDS = Object.freeze({
   pendingAlarmSeconds: 45,
   balanceWarnWei: 5n * USDC,
   balanceAlarmWei: 2n * USDC,
+  // A backup keeper spends only while it covers for the primary (about 0.0065 USDC per served request at 20 gwei),
+  // so it needs less runway than the primary before anyone has to act.
+  backupBalanceWarnWei: 2n * USDC,
+  backupBalanceAlarmWei: 1n * USDC,
   // Testnet runs at 41 % of its 100 gwei cap on a normal 20 gwei base fee, so warn only well above that.
   feeWarnPercent: 60n,
   feeAlarmPercent: 85n,

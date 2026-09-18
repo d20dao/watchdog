@@ -39,11 +39,11 @@ These run every minute for each network. Thresholds live in `src/config.js` (`TH
 | `pending`: age of the oldest pending request in chain time (latest block timestamp − (deadline − 60)) | ≥ 25 s | ≥ 45 s |
 | `refund`: new `RequestRefundedTo` logs since the last scanned block | — | "refund issued, investigate" with request ids (one-shot) |
 | `balance`: keeper wallet native USDC (18 decimals) | < 5 USDC | < 2 USDC |
-| `backup_balance:<address>`: native USDC of each backup keeper wallet (`backupKeepers`), one alert per wallet. The thresholds match the keeper's because a backup pays the same gas once it takes over | < 5 USDC | < 2 USDC |
+| `backup_balance:<address>`: native USDC of each backup keeper wallet (`backupKeepers`), one alert per wallet. Lower than the keeper's: a backup spends only while it covers for the primary | < 2 USDC | < 1 USDC |
 | `base_fee`: 2 × baseFee + 1 gwei against the fee cap (mainnet 2000 gwei, testnet 100 gwei) | > 60 % | > 85 % |
 | `committer`: registry `committer()` ≠ keeper wallet | — | alarm |
 | `coordinator_impl`, `registry_impl`: ERC-1967 implementation slot ≠ expected | — | alarm |
-| `foreign_submitter`: `RandomnessFulfilled` whose submitter ≠ keeper | one-shot notice | — |
+| `foreign_submitter`: `RandomnessFulfilled` whose submitter is neither the keeper nor a configured backup keeper | one-shot notice | — |
 | `rpc`: watchdog chain read failed or was partial for ≥ 3 consecutive runs | "watchdog cannot read chain" | — |
 | `dropped_events`: keeper `droppedTotal` increased (the receiver contract asks receivers to alert on dropped counts) | one-shot notice | — |
 

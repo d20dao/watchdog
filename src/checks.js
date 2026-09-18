@@ -37,13 +37,8 @@ const warning = (title, detail, extra = {}) => ({ severity: "warning", title, de
 const alarm = (title, detail, extra = {}) => ({ severity: "alarm", title, detail, ...extra });
 const lower = (a) => (typeof a === "string" ? a.toLowerCase() : a);
 
-// Backups share the keeper's thresholds: after a takeover a backup pays the same gas at the same rate.
-function balanceCondition(balanceWei, title, detail) {
-  return balanceWei < THRESHOLDS.balanceAlarmWei
-    ? alarm(title, detail)
-    : balanceWei < THRESHOLDS.balanceWarnWei
-      ? warning(title, detail)
-      : null;
+function balanceCondition(balanceWei, title, detail, alarmWei = THRESHOLDS.balanceAlarmWei, warnWei = THRESHOLDS.balanceWarnWei) {
+  return balanceWei < alarmWei ? alarm(title, detail) : balanceWei < warnWei ? warning(title, detail) : null;
 }
 
 /** Checks driven by the keeper's own reports. `report` is the stored report state or null. */
@@ -168,6 +163,8 @@ export function evaluateChainChecks(net, chain) {
       balanceWei,
       `backup keeper ${shortAddress(wallet)} balance low`,
       `${wallet} holds ${formatUsdc(balanceWei)} USDC`,
+      THRESHOLDS.backupBalanceAlarmWei,
+      THRESHOLDS.backupBalanceWarnWei,
     );
   }
 
