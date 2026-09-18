@@ -6,7 +6,7 @@
 // reported once per occurrence and auto-resolve silently on the next run without new occurrences.
 
 import { LIMITS, THRESHOLDS } from "./config.js";
-import { formatDuration, formatGwei, formatUsdc, listWithMore, requestLink } from "./format.js";
+import { formatDuration, formatGwei, formatUsdc, listWithMore, requestLink, shortAddress } from "./format.js";
 
 export const CHECK_NAMES = Object.freeze([
   "heartbeat",
@@ -24,9 +24,27 @@ export const CHECK_NAMES = Object.freeze([
   "rpc",
 ]);
 
+/** Balance check of one backup keeper wallet: one alert per address, so each wallet resolves on its own. */
+export const backupBalanceCheckName = (address) => `backup_balance:${address.toLowerCase()}`;
+
+/** Every check of a network: the fixed checks, with one balance check per backup keeper after the keeper's own. */
+export function networkCheckNames(net) {
+  const backups = (net.backupKeepers ?? []).map(backupBalanceCheckName);
+  return CHECK_NAMES.flatMap((check) => (check === "balance" ? [check, ...backups] : [check]));
+}
+
 const warning = (title, detail, extra = {}) => ({ severity: "warning", title, detail, ...extra });
 const alarm = (title, detail, extra = {}) => ({ severity: "alarm", title, detail, ...extra });
 const lower = (a) => (typeof a === "string" ? a.toLowerCase() : a);
+
+// Backups share the keeper's thresholds: after a takeover a backup pays the same gas at the same rate.
+function balanceCondition(balanceWei, title, detail) {
+  return balanceWei < THRESHOLDS.balanceAlarmWei
+    ? alarm(title, detail)
+    : balanceWei < THRESHOLDS.balanceWarnWei
+      ? warning(title, detail)
+      : null;
+}
 
 /** Checks driven by the keeper's own reports. `report` is the stored report state or null. */
 export function evaluateReportChecks(net, report, nowSec) {
@@ -83,6 +101,7 @@ export function evaluateReportChecks(net, report, nowSec) {
 
 /** Checks driven by the chain read. `chain` is a readChain() result; unknown figures stay undefined. */
 export function evaluateChainChecks(net, chain) {
+  const backups = net.backupKeepers ?? [];
   const result = {
     pending: undefined,
     refund: undefined,
@@ -93,6 +112,7 @@ export function evaluateChainChecks(net, chain) {
     registry_impl: undefined,
     foreign_submitter: undefined,
   };
+  for (const wallet of backups) result[backupBalanceCheckName(wallet)] = undefined;
   if (!chain || !chain.ok) return result;
   const T = THRESHOLDS;
 
@@ -138,12 +158,17 @@ export function evaluateChainChecks(net, chain) {
   }
 
   if (chain.balanceWei != null) {
-    const detail = `keeper ${net.keeper} holds ${formatUsdc(chain.balanceWei)} USDC`;
-    result.balance = chain.balanceWei < T.balanceAlarmWei
-      ? alarm("keeper balance low", detail)
-      : chain.balanceWei < T.balanceWarnWei
-        ? warning("keeper balance low", detail)
-        : null;
+    result.balance = balanceCondition(chain.balanceWei, "keeper balance low", `keeper ${net.keeper} holds ${formatUsdc(chain.balanceWei)} USDC`);
+  }
+  const backupBalances = new Map((chain.backupBalances ?? []).map((b) => [lower(b.address), b.balanceWei]));
+  for (const wallet of backups) {
+    const balanceWei = backupBalances.get(lower(wallet));
+    if (balanceWei == null) continue;
+    result[backupBalanceCheckName(wallet)] = balanceCondition(
+      balanceWei,
+      `backup keeper ${shortAddress(wallet)} balance low`,
+      `${wallet} holds ${formatUsdc(balanceWei)} USDC`,
+    );
   }
 
   if (chain.block?.baseFeeWei != null) {

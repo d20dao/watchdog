@@ -34,6 +34,9 @@ export const formatUsdc = (wei) => formatUnits(wei, WEI_PER_USDC, 6);
 /** Wei to a gwei string truncated to 3 decimals. */
 export const formatGwei = (wei) => formatUnits(wei, WEI_PER_GWEI, 3);
 
+/** "0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685" -> "0x75Af…4685". */
+export const shortAddress = (address) => `${address.slice(0, 6)}…${address.slice(-4)}`;
+
 export function requestLink(net, requestId) {
   return `${net.explorer}/request/${net.coordinator}/${requestId}`;
 }

@@ -2,8 +2,8 @@
 // Never includes secrets, raw report bodies or report ids.
 
 import { evaluateListingDocumentCheck, evaluateProbeCheck } from "./checks.js";
-import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, NETWORK_NAMES, THRESHOLDS } from "./config.js";
-import { formatDuration, formatGwei, formatUsdc } from "./format.js";
+import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, THRESHOLDS } from "./config.js";
+import { formatDuration, formatGwei, formatUsdc, shortAddress } from "./format.js";
 import { describeShape } from "./listings.js";
 import { readAlerts, readChainState, readProbeStates, readReportState, recentMessages } from "./store.js";
 import { notifierConfigured } from "./telegram.js";
@@ -68,10 +68,11 @@ function listingStatus(storage, now, recipes) {
   };
 }
 
-export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES) {
+export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets = NETWORKS) {
   const networks = {};
-  for (const name of NETWORK_NAMES) {
-    const net = NETWORKS[name];
+  for (const name of Object.keys(nets)) {
+    const net = nets[name];
+    const backups = net.backupKeepers ?? [];
     const r = readReportState(storage, name);
     const c = readChainState(storage, name);
     let feeCapUsagePercent = null;
@@ -84,6 +85,7 @@ export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES) {
       coordinator: net.coordinator,
       registry: net.registry,
       keeper: net.keeper,
+      backupKeepers: [...backups],
       explorer: net.explorer,
       report: r
         ? {
@@ -125,6 +127,10 @@ export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES) {
             oldestPendingId: c.oldestPendingId,
             oldestPendingAgeSeconds: c.oldestPendingAge,
             keeperBalanceUsdc: c.balanceWei == null ? null : formatUsdc(BigInt(c.balanceWei)),
+            backupKeeperBalances: backups.map((address) => {
+              const wei = c.backupBalances[address.toLowerCase()];
+              return { address, balanceUsdc: wei == null ? null : formatUsdc(BigInt(wei)) };
+            }),
             baseFeeGwei: c.baseFeeWei == null ? null : formatGwei(BigInt(c.baseFeeWei)),
             feeCapGwei: formatGwei(net.feeCapWei),
             feeCapUsagePercent,
@@ -207,6 +213,9 @@ function networkSection(name, n) {
     parts.push(row("Pending requests", c.pendingCount ?? "unknown"));
     parts.push(row("Oldest pending", c.oldestPendingAgeSeconds == null ? "none" : `#${c.oldestPendingId}, ${formatDuration(c.oldestPendingAgeSeconds)}`));
     parts.push(row("Keeper balance", c.keeperBalanceUsdc == null ? "unknown" : `${c.keeperBalanceUsdc} USDC`));
+    for (const b of c.backupKeeperBalances ?? []) {
+      parts.push(row(`Backup keeper ${shortAddress(b.address)} balance`, b.balanceUsdc == null ? "unknown" : `${b.balanceUsdc} USDC`));
+    }
     parts.push(row("Base fee", c.baseFeeGwei == null ? "unknown" : `${c.baseFeeGwei} gwei (${c.feeCapUsagePercent}% of ${c.feeCapGwei} gwei cap)`));
     const wiring = [c.committerIsKeeper, c.coordinatorImplementationExpected, c.registryImplementationExpected];
     parts.push(row("Committer and implementations", wiring.includes(null) ? "unknown" : wiring.every(Boolean) ? "as expected" : "MISMATCH", wiring.includes(false) ? "bad" : ""));

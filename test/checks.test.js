@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { evaluateChainChecks, evaluateReportChecks, evaluateRpcCheck } from "../src/checks.js";
+import {
+  CHECK_NAMES,
+  backupBalanceCheckName,
+  evaluateChainChecks,
+  evaluateReportChecks,
+  evaluateRpcCheck,
+  networkCheckNames,
+} from "../src/checks.js";
 import { MAINNET, TESTNET, healthyRead } from "./helpers.js";
 
 const NOW = 1789420300;
@@ -109,6 +116,63 @@ test("keeper balance (< 5 USDC warning, < 2 USDC alarm)", () => {
   assert.equal(severity(at(2n * USDC)), "warning");
   assert.equal(severity(at(2n * USDC - 1n)), "alarm");
   assert.match(at(3434567890123456789n).detail, /holds 3\.434567 USDC$/);
+});
+
+test("backup keeper balances use the keeper thresholds, one check per wallet", () => {
+  const backup = MAINNET.backupKeepers[0];
+  const key = backupBalanceCheckName(backup);
+  assert.equal(key, "backup_balance:0x75af60e2165e8e6d2f6cfd5d9ddda83446044685");
+  const at = (wei) => evaluateChainChecks(MAINNET, healthyRead(MAINNET, { backupBalances: [{ address: backup, balanceWei: wei }] }));
+  assert.equal(severity(at(5n * USDC)[key]), "clear");
+  assert.equal(severity(at(5n * USDC - 1n)[key]), "warning");
+  assert.equal(severity(at(2n * USDC)[key]), "warning");
+  assert.equal(severity(at(2n * USDC - 1n)[key]), "alarm");
+  assert.equal(severity(at(0n)[key]), "alarm");
+  const low = at(3434567890123456789n)[key];
+  assert.equal(low.title, "backup keeper 0x75Af…4685 balance low");
+  assert.equal(low.detail, "0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685 holds 3.434567 USDC");
+  assert.equal(at(1n)[key].event, undefined, "a standing condition, not a one-shot notice");
+
+  // The keeper's own check is separate: a low backup leaves it clear, and the other way round.
+  assert.equal(severity(at(1n).balance), "clear");
+  const keeperLow = evaluateChainChecks(MAINNET, healthyRead(MAINNET, { balanceWei: 1n }));
+  assert.equal(severity(keeperLow.balance), "alarm");
+  assert.equal(severity(keeperLow[key]), "clear");
+
+  // Unknown balance or failed read: unknown, so an existing alert is left alone.
+  assert.equal(severity(at(null)[key]), "unknown");
+  assert.equal(severity(evaluateChainChecks(MAINNET, healthyRead(MAINNET, { backupBalances: null }))[key]), "unknown");
+  assert.equal(severity(evaluateChainChecks(MAINNET, { ok: false })[key]), "unknown");
+  assert.ok(key in evaluateChainChecks(MAINNET, { ok: false }));
+});
+
+test("several backup keepers: each wallet has its own check, matched case-insensitively", () => {
+  const a = "0x00000000000000000000000000000000000000Aa";
+  const b = "0x00000000000000000000000000000000000000bB";
+  const net = { ...TESTNET, backupKeepers: [a, b] };
+  const c = evaluateChainChecks(net, healthyRead(net, {
+    backupBalances: [{ address: a.toLowerCase(), balanceWei: 4n * USDC }, { address: b, balanceWei: 9n * USDC }],
+  }));
+  assert.equal(c[backupBalanceCheckName(a)].severity, "warning");
+  assert.equal(c[backupBalanceCheckName(a)].title, "backup keeper 0x0000…00Aa balance low");
+  assert.equal(severity(c[backupBalanceCheckName(b)]), "clear");
+  assert.deepEqual(networkCheckNames(net).slice(6, 9), ["balance", backupBalanceCheckName(a), backupBalanceCheckName(b)]);
+});
+
+test("check names per network: backup checks follow the keeper balance; none without backups", () => {
+  assert.deepEqual(networkCheckNames(MAINNET), [
+    ...CHECK_NAMES.slice(0, CHECK_NAMES.indexOf("balance") + 1),
+    "backup_balance:0x75af60e2165e8e6d2f6cfd5d9ddda83446044685",
+    ...CHECK_NAMES.slice(CHECK_NAMES.indexOf("balance") + 1),
+  ]);
+  assert.ok(networkCheckNames(TESTNET).includes("backup_balance:0xbb2fde97a5f4855bef872c71fbb80be3170127ee"));
+  const { backupKeepers, ...unset } = TESTNET;
+  for (const net of [{ ...TESTNET, backupKeepers: [] }, unset]) {
+    assert.deepEqual(networkCheckNames(net), [...CHECK_NAMES]);
+    const checks = evaluateChainChecks(net, healthyRead(net, { balanceWei: 1n }));
+    assert.ok(!Object.keys(checks).some((check) => check.startsWith("backup_balance:")));
+    assert.equal(checks.balance.severity, "alarm");
+  }
 });
 
 test("2 x base fee + 1 gwei against the fee cap (> 60 % warning, > 85 % alarm)", () => {

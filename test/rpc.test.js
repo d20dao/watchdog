@@ -19,6 +19,8 @@ function mockRpc(net, options = {}) {
     logs: [],
     committer: net.keeper,
     balance: 35n * 10n ** 18n,
+    balances: {}, // lowercase address -> balance; others get `balance`
+    balanceErrors: [], // lowercase addresses whose eth_getBalance answers with an error
     failing: {},
     itemErrors: {},
     ...options,
@@ -35,8 +37,11 @@ function mockRpc(net, options = {}) {
           return "0x" + o.chainId.toString(16);
         case "eth_getBlockByNumber":
           return { number: "0x" + o.head.toString(16), timestamp: "0x" + o.timestamp.toString(16), baseFeePerGas: "0x" + o.baseFee.toString(16) };
-        case "eth_getBalance":
-          return "0x" + o.balance.toString(16);
+        case "eth_getBalance": {
+          const who = params[0].toLowerCase();
+          if (o.balanceErrors.includes(who)) return { jsonrpc: "2.0", id, error: { code: -32000, message: "boom" } };
+          return "0x" + (o.balances[who] ?? o.balance).toString(16);
+        }
         case "eth_getStorageAt":
           assert.equal(params[1], IMPLEMENTATION_SLOT);
           return params[0] === net.coordinator ? "0x" + addressWord("0xd20da0c375cefcda65703699a4090237057e9b68") : "0x" + addressWord("0xd20da0cf7ddc6123f9a87c0c210f8ecb934ca7d5");
@@ -81,12 +86,54 @@ test("round A reads head, figures and wiring from the primary endpoint in one ba
   assert.equal(read.logs, null);
   assert.equal(read.logCursor, 62576776);
   assert.equal(rpc.calls.length, 2);
-  assert.equal(rpc.calls[0].batch.length, 7);
+  // Seven fixed calls plus the backup keeper balance, all in the same batch.
+  assert.equal(rpc.calls[0].batch.length, 8);
+  assert.deepEqual(rpc.calls[0].batch[7].params, [MAINNET.backupKeepers[0], "latest"]);
+  assert.deepEqual(read.backupBalances, [{ address: MAINNET.backupKeepers[0], balanceWei: 35n * 10n ** 18n }]);
   assert.equal(read.subrequests, 2);
   // Pending scan window: max(1, next - 256) with limit 256, pinned to the head block.
   const [pendingCall] = rpc.calls[1].batch;
   assert.equal(pendingCall.params[0].data, "0xfdfe72e6" + word(1) + word(256));
   assert.equal(pendingCall.params[1], "0x3bad888");
+});
+
+test("round A reads every backup keeper balance in the same batch, each on its own", async () => {
+  const second = "0x00000000000000000000000000000000000000B2";
+  const net = { ...MAINNET, backupKeepers: [MAINNET.backupKeepers[0], second, "0x00000000000000000000000000000000000000b3"] };
+  const rpc = mockRpc(net, {
+    balances: { [MAINNET.keeper.toLowerCase()]: 40n * 10n ** 18n, [MAINNET.backupKeepers[0].toLowerCase()]: 12n * 10n ** 18n, [second.toLowerCase()]: 0n },
+    balanceErrors: ["0x00000000000000000000000000000000000000b3"],
+  });
+  const read = await readChain(net, { logCursor: 62576776, logSpan: 5000 }, { fetch: rpc.fetch });
+  assert.equal(read.complete, true, "a failed balance item leaves the read complete");
+  assert.equal(rpc.calls[0].batch.length, 10);
+  assert.deepEqual(
+    rpc.calls[0].batch.filter((c) => c.method === "eth_getBalance").map((c) => c.params),
+    [MAINNET.keeper, ...net.backupKeepers].map((wallet) => [wallet, "latest"]),
+  );
+  assert.equal(read.subrequests, 2, "no extra round trip");
+  assert.equal(read.balanceWei, 40n * 10n ** 18n);
+  assert.deepEqual(read.backupBalances, [
+    { address: MAINNET.backupKeepers[0], balanceWei: 12n * 10n ** 18n },
+    { address: second, balanceWei: 0n },
+    { address: "0x00000000000000000000000000000000000000b3", balanceWei: null },
+  ]);
+  assert.deepEqual(read.errors, ["backup balance 0x00000000000000000000000000000000000000b3: rpc error -32000"]);
+});
+
+test("a network without backup keepers reads only the keeper balance", async () => {
+  const { backupKeepers, ...unset } = TESTNET;
+  for (const net of [{ ...TESTNET, backupKeepers: [] }, unset]) {
+    const rpc = mockRpc(net);
+    const read = await readChain(net, null, { fetch: rpc.fetch });
+    assert.equal(read.ok, true);
+    assert.equal(rpc.calls[0].batch.length, 7);
+    assert.deepEqual(read.backupBalances, []);
+    assert.equal(read.balanceWei, 35n * 10n ** 18n);
+  }
+  // Round A failed: backup balances are unknown, not empty.
+  const down = mockRpc(TESTNET, { chainId: 1n });
+  assert.equal((await readChain(TESTNET, null, { fetch: down.fetch })).backupBalances, null);
 });
 
 test("pending window and oldest age from the smallest three ids", async () => {

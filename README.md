@@ -39,6 +39,7 @@ These run every minute for each network. Thresholds live in `src/config.js` (`TH
 | `pending`: age of the oldest pending request in chain time (latest block timestamp − (deadline − 60)) | ≥ 25 s | ≥ 45 s |
 | `refund`: new `RequestRefundedTo` logs since the last scanned block | — | "refund issued, investigate" with request ids (one-shot) |
 | `balance`: keeper wallet native USDC (18 decimals) | < 5 USDC | < 2 USDC |
+| `backup_balance:<address>`: native USDC of each backup keeper wallet (`backupKeepers`), one alert per wallet. The thresholds match the keeper's because a backup pays the same gas once it takes over | < 5 USDC | < 2 USDC |
 | `base_fee`: 2 × baseFee + 1 gwei against the fee cap (mainnet 2000 gwei, testnet 100 gwei) | > 60 % | > 85 % |
 | `committer`: registry `committer()` ≠ keeper wallet | — | alarm |
 | `coordinator_impl`, `registry_impl`: ERC-1967 implementation slot ≠ expected | — | alarm |
@@ -48,7 +49,7 @@ These run every minute for each network. Thresholds live in `src/config.js` (`TH
 
 Chain reading, per network per run:
 
-* **Round A** (one batch, `latest`): `eth_chainId`, head block (number, timestamp, `baseFeePerGas`), `nextRequestId()`, `committer()`, both implementation slots and the keeper balance.
+* **Round A** (one batch, `latest`): `eth_chainId`, head block (number, timestamp, `baseFeePerGas`), `nextRequestId()`, `committer()`, both implementation slots, the keeper balance and the balance of each backup keeper wallet.
 * **Round B** (one batch, pinned to the head block): `getPendingRequestIds(max(1, next − 256), 256)` and one `eth_getLogs` for both event topics, from the stored cursor + 1 to the head. Each scan covers at most 5,000 blocks (about 42 min at Arc's 0.5 s blocks), and a backlog catches up over later runs. On the first run the cursor starts at the head, with no backfill. If the log query fails, the cursor stays where it is and the next span is halved (never below 250 blocks).
 * **Round C** (one batch, only when something is pending): `getRequest` for up to the 3 smallest pending ids.
 
@@ -125,7 +126,9 @@ Known probe limits:
 
 ## Alert lifecycle
 
-Each (network, check) pair has one alert row in the Durable Object. AirnodeHub probes use `airnodehub` in place of a network:
+Each (network, check) pair has one alert row in the Durable Object. Each backup keeper wallet has its own check, so it
+resolves independently of the keeper and of other backups. A wallet removed from `backupKeepers` resolves its alert on the
+next run. AirnodeHub probes use `airnodehub` in place of a network:
 
 * **First activation:** one message, `[arc-mainnet] WARNING ...` or `[arc-mainnet] ALARM ...`.
 * **Warnings** never repeat.
@@ -177,7 +180,8 @@ This endpoint implements the receiver contract in `d20-keeper-mainnet/docs/keepe
 For each network, this returns:
 
 * report ages, `healthy`, faults, `nodeId`, dropped and failed-event counts,
-* the last chain check time and figures: block, pending count, oldest pending age, balance in USDC, base fee and fee-cap usage, wiring checks, log cursor,
+* the configured `backupKeepers`,
+* the last chain check time and figures: block, pending count, oldest pending age, keeper balance in USDC (`keeperBalanceUsdc`) and each backup keeper's balance (`backupKeeperBalances`: `[{address, balanceUsdc}]`, `null` until read), base fee and fee-cap usage, wiring checks, log cursor,
 * active alerts with severity and `since`.
 
 Under `airnodehub` it returns, for each recipe: `status` (`ok`, `warning`, `alarm` or `not probed`), `lastProbeAt`,
@@ -275,6 +279,8 @@ npx wrangler deploy
 
 The first deploy creates the `Watchdog` SQLite Durable Object class (migration `v1`), the custom domain `watchdog.d20dao.org` and the `* * * * *` cron trigger. `workers_dev` and preview URLs are disabled.
 
+Schema changes are applied in place when the object starts (`migrate` in `src/store.js`). Missing tables are created, and columns added since the first deploy are added when missing (for example `chain_state.backup_balances_json`). Stored rows are kept, and no new migration tag is needed.
+
 The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an `exports` field for Durable Object classes. The two are mutually exclusive, and moving a deployed Worker to `exports` cannot be reverted.
 
 ## Free-plan budget
@@ -283,7 +289,7 @@ The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an 
 | --- | --- |
 | Worker CPU 10 ms per invocation | The Worker only routes: report validation plus hashing measured ~0.1–0.4 ms (up to ~1.7 ms on a cold isolate) for 0.5–61 KB reports. The cron handler just calls the Durable Object. The signature code is never evaluated here. Loading the whole 204 KB bundle (parse plus top-level evaluation, Node 24) went from 3.3 ms to 5.9 ms with the probe; this is isolate startup, not per-request work. |
 | Durable Object CPU (30 s per request) | A full run for both networks with replayed live RPC responses measured ~0.4 ms warm and ~1.6 ms cold. A worst-case 5,000-block scan returning 1,000 logs measured ~3.5–5 ms. One AirnodeHub probe (reply parse, request hash, secp256k1 recovery, shape) measured 1.1–2 ms warm. The first probe after the object starts adds ~11 ms of module evaluation and ~7 ms of first verification. A run with all five probes due measured ~9 ms warm and ~39 ms cold; a run with none due adds ~0.06 ms. Parsing and checking the 60 KB Hyperliquid listing document takes ~0.1 ms. |
-| Subrequests 50 per invocation | 2 batches per network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. AirnodeHub adds ≤ 5 per run (5 at the first run, then 1 in each of 5 runs an hour, plus retries and 4 document reads a day), so ≤ 20 in total. |
+| Subrequests 50 per invocation | 2 batches per network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper balances are extra calls inside the round A batch, so they add no fetches. AirnodeHub adds ≤ 5 per run (5 at the first run, then 1 in each of 5 runs an hour, plus retries and 4 document reads a day), so ≤ 20 in total. |
 | DO requests 100,000/day | 2 networks × 2,880 reports + 1,440 cron runs ≈ 7,200/day, plus status views (edge-cached 15 s). |
 | DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 5,760 ≈ 29,000. Chain state is 2 × 1,440 ≈ 2,900. AirnodeHub probe state is 1 row per probe or document read, ≈ 130/day (more while a listing is retried every 10 min). Alerts and messages only change on transitions. Total ≈ 32,000/day. |
 | DO rows read 5,000,000/day | Point lookups plus a few rows per run; probe state and AirnodeHub alerts add about 11 per run (≈ 16,000/day). Well under 100,000/day. |

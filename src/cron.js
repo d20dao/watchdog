@@ -3,16 +3,16 @@
 
 import { alertKey, transition } from "./alerts.js";
 import {
-  CHECK_NAMES,
   evaluateChainChecks,
   evaluateListingDocumentCheck,
   evaluateProbeCheck,
   evaluateReportChecks,
   evaluateRpcCheck,
   listingCheckName,
+  networkCheckNames,
   probeCheckName,
 } from "./checks.js";
-import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, NETWORK_NAMES } from "./config.js";
+import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS } from "./config.js";
 import { applyDocumentResult, applyProbeResult, failedTaskResult, planProbeTasks } from "./listings.js";
 import { readChain } from "./rpc.js";
 import {
@@ -54,10 +54,12 @@ export async function runCron({
   fetch,
   clock = () => Date.now(),
   readChainImpl = readChain,
+  networks: nets = NETWORKS,
   recipes = AIRNODE_RECIPES,
   loadProbes = loadProbeModule,
 }) {
-  const cursors = NETWORK_NAMES.map((name) => {
+  const names = Object.keys(nets);
+  const cursors = names.map((name) => {
     const prev = readChainState(storage, name);
     return prev ? { logCursor: prev.logCursor, logSpan: prev.logSpan } : null;
   });
@@ -65,9 +67,9 @@ export async function runCron({
 
   const [reads, probeResults] = await Promise.all([
     Promise.all(
-      NETWORK_NAMES.map(async (name, i) => {
+      names.map(async (name, i) => {
         try {
-          return await readChainImpl(NETWORKS[name], cursors[i], { fetch });
+          return await readChainImpl(nets[name], cursors[i], { fetch });
         } catch {
           return { ok: false, complete: false, error: "internal error", errors: [], subrequests: 0 };
         }
@@ -82,8 +84,8 @@ export async function runCron({
   const outcome = storage.transactionSync(() => {
     const networks = {};
     let enqueued = 0;
-    NETWORK_NAMES.forEach((name, i) => {
-      const net = NETWORKS[name];
+    names.forEach((name, i) => {
+      const net = nets[name];
       const read = reads[i];
       const failures = writeChainState(storage, name, now, read, readChainState(storage, name));
       const report = readReportState(storage, name);
@@ -93,8 +95,16 @@ export async function runCron({
         rpc: evaluateRpcCheck(failures, read.error),
       };
       const existing = new Map(readAlerts(storage, name).map((row) => [row.check, row]));
+      const checks = networkCheckNames(net);
+      // A check no longer configured (a backup keeper wallet removed from the configuration) resolves its alert.
+      for (const check of existing.keys()) {
+        if (!checks.includes(check)) {
+          checks.push(check);
+          conditions[check] = null;
+        }
+      }
       const messages = [];
-      for (const check of CHECK_NAMES) {
+      for (const check of checks) {
         const step = transition(existing.get(check) ?? null, conditions[check], now, name, check);
         if (step.write) saveAlert(storage, alertKey(name, check), step.row);
         if (step.message) {
@@ -113,7 +123,7 @@ export async function runCron({
         pending: read.pending ? read.pending.count : null,
         oldestPendingAge: read.pending?.oldest?.ageSeconds ?? null,
         logs: read.logs ? { from: read.logs.fromBlock, to: read.logs.toBlock, refunds: read.logs.refunds.length, foreign: read.logs.foreignFulfillments.length } : null,
-        activeAlerts: [...CHECK_NAMES].filter((check) => conditions[check] || (conditions[check] === undefined && existing.has(check))),
+        activeAlerts: checks.filter((check) => conditions[check] || (conditions[check] === undefined && existing.has(check))),
         messages,
       };
     });

@@ -145,6 +145,7 @@ export function healthyRead(net = TESTNET, overrides = {}) {
     coordinatorImpl: net.implementations.coordinator.toLowerCase(),
     registryImpl: net.implementations.registry.toLowerCase(),
     balanceWei: 50n * 10n ** 18n,
+    backupBalances: (net.backupKeepers ?? []).map((address) => ({ address, balanceWei: 50n * 10n ** 18n })),
     pending: { count: 0, ids: [], oldest: null },
     logs: { fromBlock: 990, toBlock: 1000, refunds: [], foreignFulfillments: [] },
     logCursor: 1000,

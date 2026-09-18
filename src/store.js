@@ -55,7 +55,8 @@ const SCHEMA = [
      coordinator_impl TEXT,
      registry_impl TEXT,
      log_cursor INTEGER,
-     log_span INTEGER
+     log_span INTEGER,
+     backup_balances_json TEXT
    ) WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS alerts (
      alert_key TEXT PRIMARY KEY,
@@ -88,8 +89,19 @@ const SCHEMA = [
    ) WITHOUT ROWID`,
 ];
 
+// Columns added after the first deployment. CREATE TABLE IF NOT EXISTS leaves an existing table as it is, so
+// each is added in place when missing. Only nullable columns without defaults, so existing rows read as null.
+const ADDED_COLUMNS = [
+  // Backup keeper balances as JSON {lowercase address: wei string}.
+  ["chain_state", "backup_balances_json", "TEXT"],
+];
+
 export function migrate(storage) {
   for (const statement of SCHEMA) storage.sql.exec(statement);
+  for (const [table, column, type] of ADDED_COLUMNS) {
+    const present = rows(storage, `PRAGMA table_info(${table})`).some((c) => c.name === column);
+    if (!present) storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
 }
 
 const rows = (storage, query, ...bindings) => storage.sql.exec(query, ...bindings).toArray();
@@ -270,7 +282,24 @@ export function readChainState(storage, network) {
     registryImpl: r.registry_impl,
     logCursor: r.log_cursor,
     logSpan: r.log_span,
+    backupBalances: parseJson(r.backup_balances_json, {}),
   };
+}
+
+/**
+ * Backup balances to store: this read's known balances, else the previous value per wallet. Wallets missing from
+ * the read (removed from the configuration) are dropped; a failed read keeps everything.
+ */
+function mergeBackupBalances(read, previous) {
+  const prev = previous?.backupBalances ?? {};
+  if (!read.ok || !Array.isArray(read.backupBalances)) return prev;
+  const merged = {};
+  for (const { address, balanceWei } of read.backupBalances) {
+    const key = address.toLowerCase();
+    const value = balanceWei == null ? prev[key] : balanceWei.toString();
+    if (value != null) merged[key] = value;
+  }
+  return merged;
 }
 
 /** Persist a readChain() result. Unknown figures keep their previous stored values. */
@@ -283,8 +312,8 @@ export function writeChainState(storage, network, now, read, previous) {
   storage.sql.exec(
     `INSERT INTO chain_state (network, checked_at, ok, complete, error, rpc, consecutive_failures, last_success_at,
        block_number, block_timestamp, base_fee_wei, balance_wei, next_request_id, pending_count, oldest_pending_id,
-       oldest_pending_age, committer, coordinator_impl, registry_impl, log_cursor, log_span)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       oldest_pending_age, committer, coordinator_impl, registry_impl, log_cursor, log_span, backup_balances_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (network) DO UPDATE SET checked_at = excluded.checked_at, ok = excluded.ok, complete = excluded.complete,
        error = excluded.error, rpc = excluded.rpc, consecutive_failures = excluded.consecutive_failures,
        last_success_at = excluded.last_success_at, block_number = excluded.block_number,
@@ -293,7 +322,7 @@ export function writeChainState(storage, network, now, read, previous) {
        pending_count = excluded.pending_count, oldest_pending_id = excluded.oldest_pending_id,
        oldest_pending_age = excluded.oldest_pending_age, committer = excluded.committer,
        coordinator_impl = excluded.coordinator_impl, registry_impl = excluded.registry_impl,
-       log_cursor = excluded.log_cursor, log_span = excluded.log_span`,
+       log_cursor = excluded.log_cursor, log_span = excluded.log_span, backup_balances_json = excluded.backup_balances_json`,
     network,
     now,
     read.ok ? 1 : 0,
@@ -315,6 +344,7 @@ export function writeChainState(storage, network, now, read, previous) {
     keep(read.registryImpl, previous?.registryImpl),
     read.ok ? read.logCursor : previous?.logCursor ?? null,
     read.ok ? read.logSpan : previous?.logSpan ?? null,
+    JSON.stringify(mergeBackupBalances(read, previous)),
   );
   return failures;
 }

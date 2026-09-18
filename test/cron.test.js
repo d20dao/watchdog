@@ -2,11 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { runCron } from "../src/cron.js";
 import { buildStatus, renderHtml } from "../src/status.js";
-import { ingestReport, readAlerts, readChainState, readReportState, recentMessages } from "../src/store.js";
+import { ingestReport, migrate, readAlerts, readChainState, readReportState, recentMessages } from "../src/store.js";
 import { groupMessages } from "../src/telegram.js";
 import { MAINNET, TESTNET, healthyRead, memoryStorage } from "./helpers.js";
 
 const T0 = 1789420000;
+const USDC = 10n ** 18n;
+const BACKUP = MAINNET.backupKeepers[0];
+const BACKUP_CHECK = "backup_balance:0x75af60e2165e8e6d2f6cfd5d9ddda83446044685";
 const TELEGRAM = { TELEGRAM_BOT_TOKEN: "123456:throwaway-token", TELEGRAM_CHAT_ID: "-1001234567890" };
 
 function record(network, overrides = {}) {
@@ -37,6 +40,7 @@ function harness(env = TELEGRAM) {
     reads: { "arc-mainnet": healthyRead(MAINNET), "arc-testnet": healthyRead(TESTNET) },
     telegram: [],
     telegramStatus: 200,
+    networks: undefined, // the real configuration unless a test sets its own
   };
   const fetch = async (url, init) => {
     assert.ok(url.startsWith("https://api.telegram.org/bot"), "only Telegram is fetched directly");
@@ -51,6 +55,7 @@ function harness(env = TELEGRAM) {
       fetch,
       clock: () => state.clock * 1000,
       readChainImpl: async (net, cursor) => ({ ...state.reads[net.name], cursorSeen: cursor }),
+      networks: state.networks,
       recipes: [], // AirnodeHub probes are covered in probe.test.js
     });
   };
@@ -165,6 +170,128 @@ test("RPC failures: chain alerts stay untouched, warning after 3 consecutive fai
   const texts = h.state.telegram.map((m) => m.text).join("\n");
   assert.match(texts, /RESOLVED keeper balance low after 4 min/);
   assert.match(texts, /RESOLVED watchdog cannot read chain after 1 min/);
+});
+
+test("backup and keeper balance alerts are raised and resolved independently", async () => {
+  const h = harness();
+  const balances = (keeper, backup) =>
+    (h.state.reads["arc-mainnet"] = healthyRead(MAINNET, { balanceWei: keeper, backupBalances: [{ address: BACKUP, balanceWei: backup }] }));
+  const texts = () => h.state.telegram.flatMap((m) => m.text.split("\n\n"));
+
+  balances(1n * USDC, 3n * USDC);
+  const first = await h.run(0);
+  assert.deepEqual(texts(), [
+    `[arc-mainnet] ALARM keeper balance low: keeper ${MAINNET.keeper} holds 1 USDC`,
+    "[arc-mainnet] WARNING backup keeper 0x75Af…4685 balance low: 0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685 holds 3 USDC",
+  ]);
+  assert.deepEqual(first.networks["arc-mainnet"].activeAlerts, ["balance", BACKUP_CHECK]);
+  const keys = h.storage.sql.exec("SELECT alert_key FROM alerts ORDER BY alert_key").toArray().map((r) => r.alert_key);
+  assert.deepEqual(keys, ["arc-mainnet:backup_balance:0x75af60e2165e8e6d2f6cfd5d9ddda83446044685", "arc-mainnet:balance"]);
+
+  // Backup refilled, keeper still low: only the backup resolves.
+  balances(1n * USDC, 20n * USDC);
+  const second = await h.run(5);
+  assert.deepEqual(second.networks["arc-mainnet"].messages, ["[arc-mainnet] RESOLVED backup keeper 0x75Af…4685 balance low after 5 min"]);
+  assert.deepEqual(readAlerts(h.storage, "arc-mainnet").map((a) => a.check), ["balance"]);
+
+  // Backup drained again: it alarms on its own; the keeper alarm is not repeated inside its 30 minutes.
+  balances(1n * USDC, 15n * 10n ** 17n);
+  const third = await h.run(10);
+  assert.deepEqual(third.networks["arc-mainnet"].messages, [
+    "[arc-mainnet] ALARM backup keeper 0x75Af…4685 balance low: 0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685 holds 1.5 USDC",
+  ]);
+
+  // Keeper refilled, backup still low: only the keeper resolves.
+  balances(50n * USDC, 15n * 10n ** 17n);
+  const fourth = await h.run(12);
+  assert.deepEqual(fourth.networks["arc-mainnet"].messages, ["[arc-mainnet] RESOLVED keeper balance low after 12 min"]);
+  assert.deepEqual(fourth.networks["arc-mainnet"].activeAlerts, [BACKUP_CHECK]);
+
+  // Backup balance unknown this run: its alert is kept as it is, neither resolved nor repeated.
+  h.state.reads["arc-mainnet"] = healthyRead(MAINNET, { backupBalances: [{ address: BACKUP, balanceWei: null }] });
+  const fifth = await h.run(45);
+  assert.deepEqual(fifth.networks["arc-mainnet"].messages, []);
+  assert.deepEqual(fifth.networks["arc-mainnet"].activeAlerts, [BACKUP_CHECK]);
+  assert.equal(readChainState(h.storage, "arc-mainnet").backupBalances[BACKUP.toLowerCase()], (15n * 10n ** 17n).toString(), "last known balance kept");
+});
+
+test("a backup wallet removed from the configuration resolves its alert and leaves the status", async () => {
+  const h = harness();
+  h.state.reads["arc-mainnet"] = healthyRead(MAINNET, { backupBalances: [{ address: BACKUP, balanceWei: 1n }] });
+  await h.run(0);
+  assert.equal(readAlerts(h.storage, "arc-mainnet")[0].check, BACKUP_CHECK);
+
+  const withoutBackup = { ...MAINNET, backupKeepers: [] };
+  h.state.networks = { "arc-mainnet": withoutBackup, "arc-testnet": TESTNET };
+  h.state.reads["arc-mainnet"] = healthyRead(withoutBackup);
+  const summary = await h.run(3);
+  assert.deepEqual(summary.networks["arc-mainnet"].messages, ["[arc-mainnet] RESOLVED backup keeper 0x75Af…4685 balance low after 3 min"]);
+  assert.equal(readAlerts(h.storage, "arc-mainnet").length, 0);
+  assert.deepEqual(readChainState(h.storage, "arc-mainnet").backupBalances, {});
+});
+
+test("status JSON and HTML show backup keeper balances next to the keeper's", async () => {
+  const h = harness();
+  h.state.reads["arc-mainnet"] = healthyRead(MAINNET, { balanceWei: 7n * USDC, backupBalances: [{ address: BACKUP, balanceWei: 125n * 10n ** 17n }] });
+  await h.run(0);
+  const status = buildStatus(h.storage, TELEGRAM, T0 + 5);
+  const m = status.networks["arc-mainnet"];
+  assert.deepEqual(m.backupKeepers, [BACKUP]);
+  assert.equal(m.chain.keeperBalanceUsdc, "7");
+  assert.deepEqual(m.chain.backupKeeperBalances, [{ address: BACKUP, balanceUsdc: "12.5" }]);
+  assert.deepEqual(status.networks["arc-testnet"].chain.backupKeeperBalances, [{ address: TESTNET.backupKeepers[0], balanceUsdc: "50" }]);
+  const html = renderHtml(status);
+  assert.ok(html.includes("<tr><th>Keeper balance</th><td>7 USDC</td></tr><tr><th>Backup keeper 0x75Af…4685 balance</th><td>12.5 USDC</td></tr>"));
+  assert.ok(html.includes("<tr><th>Backup keeper 0xbb2f…27Ee balance</th><td>50 USDC</td></tr>"));
+
+  // A failed read keeps the last known balance; a wallet never read shows as unknown.
+  h.state.reads["arc-mainnet"] = { ok: false, complete: false, error: "http 429", errors: [], subrequests: 2 };
+  await h.run(1);
+  assert.deepEqual(buildStatus(h.storage, TELEGRAM, T0 + 65).networks["arc-mainnet"].chain.backupKeeperBalances, [{ address: BACKUP, balanceUsdc: "12.5" }]);
+  const added = "0x00000000000000000000000000000000000000c4";
+  const later = buildStatus(h.storage, TELEGRAM, T0 + 65, [], { "arc-mainnet": { ...MAINNET, backupKeepers: [BACKUP, added] } });
+  assert.deepEqual(later.networks["arc-mainnet"].chain.backupKeeperBalances, [
+    { address: BACKUP, balanceUsdc: "12.5" },
+    { address: added, balanceUsdc: null },
+  ]);
+  assert.ok(renderHtml(later).includes("<tr><th>Backup keeper 0x0000…00c4 balance</th><td>unknown</td></tr>"));
+});
+
+test("a network without backup keepers: no backup checks, empty status lists, no HTML rows", async () => {
+  const h = harness();
+  const bare = { ...TESTNET, backupKeepers: [] };
+  h.state.networks = { "arc-testnet": bare };
+  h.state.reads["arc-testnet"] = healthyRead(bare, { balanceWei: 1n });
+  const summary = await h.run(0);
+  assert.deepEqual(summary.networks["arc-testnet"].activeAlerts, ["balance"]);
+  assert.deepEqual(readChainState(h.storage, "arc-testnet").backupBalances, {});
+  const status = buildStatus(h.storage, TELEGRAM, T0 + 5, [], h.state.networks);
+  assert.deepEqual(Object.keys(status.networks), ["arc-testnet"]);
+  assert.deepEqual(status.networks["arc-testnet"].backupKeepers, []);
+  assert.deepEqual(status.networks["arc-testnet"].chain.backupKeeperBalances, []);
+  assert.ok(!renderHtml(status).includes("Backup keeper"));
+});
+
+test("migrate adds the backup balance column to an existing chain_state table in place", () => {
+  const storage = memoryStorage();
+  // The chain_state table as first deployed, with a stored row.
+  storage.db.exec("DROP TABLE chain_state");
+  storage.db.exec(`CREATE TABLE chain_state (
+     network TEXT PRIMARY KEY, checked_at INTEGER NOT NULL, ok INTEGER NOT NULL, complete INTEGER NOT NULL, error TEXT,
+     rpc TEXT, consecutive_failures INTEGER NOT NULL, last_success_at INTEGER, block_number INTEGER,
+     block_timestamp INTEGER, base_fee_wei TEXT, balance_wei TEXT, next_request_id TEXT, pending_count INTEGER,
+     oldest_pending_id TEXT, oldest_pending_age INTEGER, committer TEXT, coordinator_impl TEXT, registry_impl TEXT,
+     log_cursor INTEGER, log_span INTEGER
+   ) WITHOUT ROWID`);
+  storage.db.exec("INSERT INTO chain_state (network, checked_at, ok, complete, consecutive_failures, balance_wei, log_cursor) VALUES ('arc-mainnet', 1, 1, 1, 0, '7', 42)");
+  migrate(storage);
+  migrate(storage); // idempotent
+  const columns = storage.db.prepare("PRAGMA table_info(chain_state)").all().map((c) => c.name);
+  assert.equal(columns.filter((name) => name === "backup_balances_json").length, 1);
+  const kept = readChainState(storage, "arc-mainnet");
+  assert.equal(kept.balanceWei, "7");
+  assert.equal(kept.logCursor, 42);
+  assert.deepEqual(kept.backupBalances, {});
 });
 
 test("refund events alarm once per occurrence and auto-resolve silently", async () => {
