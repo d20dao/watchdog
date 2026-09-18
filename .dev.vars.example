@@ -8,3 +8,7 @@ TELEGRAM_CHAT_ID=
 # Bearer keys the keepers present on POST /v1/health/<network>.
 HEALTH_KEY_ARC_MAINNET=local-mainnet-test-key
 HEALTH_KEY_ARC_TESTNET=local-testnet-test-key
+
+# Bearer keys the backup keepers present on POST /v1/health/<network>/backup.
+HEALTH_KEY_ARC_MAINNET_BACKUP=local-mainnet-backup-test-key
+HEALTH_KEY_ARC_TESTNET_BACKUP=local-testnet-backup-test-key

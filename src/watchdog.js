@@ -4,7 +4,7 @@ import { DurableObject } from "cloudflare:workers";
 import { LIMITS } from "./config.js";
 import { runCron } from "./cron.js";
 import { buildStatus } from "./status.js";
-import { ingestReport, migrate } from "./store.js";
+import { BACKUP_STREAM, ingestReport, migrate } from "./store.js";
 
 export class Watchdog extends DurableObject {
   constructor(ctx, env) {
@@ -23,6 +23,14 @@ export class Watchdog extends DurableObject {
   /** Durably store a validated report summary. The RPC reply is held until the write commits. */
   async ingestReport(record) {
     const outcome = ingestReport(this.storage, record);
+    await this.ctx.storage.sync();
+    await this.ensureAlarm();
+    return outcome;
+  }
+
+  /** The same for a backup keeper's report, stored in its own stream. */
+  async ingestBackupReport(record) {
+    const outcome = ingestReport(this.storage, record, BACKUP_STREAM);
     await this.ctx.storage.sync();
     await this.ensureAlarm();
     return outcome;

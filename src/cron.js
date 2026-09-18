@@ -3,6 +3,7 @@
 
 import { alertKey, transition } from "./alerts.js";
 import {
+  evaluateBackupReportChecks,
   evaluateChainChecks,
   evaluateListingDocumentCheck,
   evaluateProbeCheck,
@@ -25,6 +26,7 @@ import {
   pruneMessages,
   pruneReports,
   readAlerts,
+  readBackupReportState,
   readChainState,
   readProbeStates,
   readReportState,
@@ -91,6 +93,7 @@ export async function runCron({
       const report = readReportState(storage, name);
       const conditions = {
         ...evaluateReportChecks(net, report, now),
+        ...evaluateBackupReportChecks(net, readBackupReportState(storage, name), now),
         ...evaluateChainChecks(net, read),
         rpc: evaluateRpcCheck(failures, read.error),
       };

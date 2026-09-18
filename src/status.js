@@ -5,11 +5,38 @@ import { evaluateListingDocumentCheck, evaluateProbeCheck } from "./checks.js";
 import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, THRESHOLDS } from "./config.js";
 import { formatDuration, formatGwei, formatUsdc, shortAddress } from "./format.js";
 import { describeShape } from "./listings.js";
-import { readAlerts, readChainState, readProbeStates, readReportState, recentMessages } from "./store.js";
+import { readAlerts, readBackupReportState, readChainState, readProbeStates, readReportState, recentMessages } from "./store.js";
 import { notifierConfigured } from "./telegram.js";
 
 const age = (now, t) => (t == null ? null : Math.max(0, now - t));
 const same = (a, b) => (a == null ? null : a.toLowerCase() === b.toLowerCase());
+
+/** One report stream's stored state as published: the same fields for the keeper and its backup. */
+function reportView(r, now) {
+  if (!r) return { everReported: false };
+  return {
+    everReported: true,
+    lastReceivedAt: r.lastReceivedAt,
+    lastReceivedAgeSeconds: age(now, r.lastReceivedAt),
+    reportObservedAt: r.reportObservedAt,
+    reportObservedAgeSeconds: age(now, r.reportObservedAt),
+    healthObservedAt: r.healthObservedAt,
+    healthObservedAgeSeconds: age(now, r.healthObservedAt),
+    healthObservationLagSeconds: r.healthObservedAt == null ? null : Math.max(0, r.reportObservedAt - r.healthObservedAt),
+    observed: r.healthObservedAt != null,
+    healthy: r.healthy,
+    sendEnabled: r.sendEnabled,
+    faults: r.faults,
+    unhealthySince: r.unhealthySince,
+    nodeId: r.nodeId,
+    droppedTotal: r.droppedTotal,
+    failedEventsLastReport: r.failedLast,
+    failedEventsTotal: r.failedTotals,
+    reportsStored: r.reportsStored,
+    duplicateDeliveries: r.duplicatesSeen,
+    conflictingDeliveries: r.conflictsSeen,
+  };
+}
 
 const alertView = (now) => (a) => ({
   check: a.check,
@@ -74,6 +101,7 @@ export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets =
     const net = nets[name];
     const backups = net.backupKeepers ?? [];
     const r = readReportState(storage, name);
+    const b = readBackupReportState(storage, name);
     const c = readChainState(storage, name);
     let feeCapUsagePercent = null;
     if (c?.baseFeeWei != null) {
@@ -87,30 +115,9 @@ export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets =
       keeper: net.keeper,
       backupKeepers: [...backups],
       explorer: net.explorer,
-      report: r
-        ? {
-            everReported: true,
-            lastReceivedAt: r.lastReceivedAt,
-            lastReceivedAgeSeconds: age(now, r.lastReceivedAt),
-            reportObservedAt: r.reportObservedAt,
-            reportObservedAgeSeconds: age(now, r.reportObservedAt),
-            healthObservedAt: r.healthObservedAt,
-            healthObservedAgeSeconds: age(now, r.healthObservedAt),
-            healthObservationLagSeconds: r.healthObservedAt == null ? null : Math.max(0, r.reportObservedAt - r.healthObservedAt),
-            observed: r.healthObservedAt != null,
-            healthy: r.healthy,
-            sendEnabled: r.sendEnabled,
-            faults: r.faults,
-            unhealthySince: r.unhealthySince,
-            nodeId: r.nodeId,
-            droppedTotal: r.droppedTotal,
-            failedEventsLastReport: r.failedLast,
-            failedEventsTotal: r.failedTotals,
-            reportsStored: r.reportsStored,
-            duplicateDeliveries: r.duplicatesSeen,
-            conflictingDeliveries: r.conflictsSeen,
-          }
-        : { everReported: false },
+      report: reportView(r, now),
+      // The backup keeper's own report stream (POST /v1/health/<network>/backup), plus the role it reports.
+      backupReport: b ? { ...reportView(b, now), role: b.role } : reportView(null, now),
       chain: c
         ? {
             checkedAt: c.checkedAt,
@@ -241,7 +248,6 @@ function networkSection(name, n) {
   }
 
   const chain = [];
-  let backups = "";
   if (!c) {
     chain.push(row("Checked", "not yet"));
   } else {
@@ -251,15 +257,6 @@ function networkSection(name, n) {
       row("Committer and implementations", wiring.includes(null) ? "unknown" : wiring.every(Boolean) ? "as expected" : "MISMATCH", wiring.includes(false) ? "alarm" : ""),
       row("RPC", c.rpc ?? "none"),
     );
-    const wallets = c.backupKeeperBalances ?? [];
-    if (wallets.length) {
-      backups =
-        `<h3>Backup keepers</h3><table class="kv wallets">` +
-        wallets
-          .map((b) => `<tr><th scope="row">${escapeHtml(shortAddress(b.address))}</th><td>${escapeHtml(b.balanceUsdc == null ? "unknown" : `${b.balanceUsdc} USDC`)}</td></tr>`)
-          .join("") +
-        `</table>`;
-    }
   }
 
   return (
@@ -267,9 +264,37 @@ function networkSection(name, n) {
     sectionHead(name, n.alerts, { link: `<a href="${escapeHtml(n.explorer)}">Explorer</a>` }) +
     `<dl class="stats">${stats.join("")}</dl>` +
     `<div class="cols"><div><h3>Keeper reports</h3><table class="kv">${reports.join("")}</table></div>` +
-    `<div><h3>Chain</h3><table class="kv">${chain.join("")}</table>${backups}</div></div>` +
+    `<div><h3>Chain</h3><table class="kv">${chain.join("")}</table>${backupKeepers(n)}</div></div>` +
     `</section>`
   );
+}
+
+/** Backup keeper wallet balances, then the backup's own health reports. Empty for a network without backups. */
+function backupKeepers(n) {
+  const wallets = n.chain?.backupKeeperBalances ?? [];
+  const parts = [];
+  if (wallets.length) {
+    parts.push(
+      `<table class="kv wallets">` +
+        wallets
+          .map((b) => `<tr><th scope="row">${escapeHtml(shortAddress(b.address))}</th><td>${escapeHtml(b.balanceUsdc == null ? "unknown" : `${b.balanceUsdc} USDC`)}</td></tr>`)
+          .join("") +
+        `</table>`,
+    );
+  }
+  if ((n.backupKeepers ?? []).length) {
+    const b = n.backupReport ?? { everReported: false };
+    const rows = !b.everReported
+      ? [row("Health", "Not reporting", "muted")]
+      : [
+          row("Health", b.healthy ? "Healthy" : "Unhealthy", b.healthy ? "ok" : "alarm"),
+          row("Last report", ago(b.lastReceivedAgeSeconds)),
+          row("Faults", b.faults.length ? b.faults.join(", ") : "none"),
+          row("Role", b.role ?? "unknown", b.role == null || b.role === "follower" ? "" : "alarm"),
+        ];
+    parts.push(`<table class="kv">${rows.join("")}</table>`);
+  }
+  return parts.length ? `<h3>Backup keepers</h3>${parts.join("")}` : "";
 }
 
 function listingRow(r) {

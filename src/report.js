@@ -118,6 +118,8 @@ export function validateReport(body, net, idempotencyKey) {
   // Bootstrap shape: observedAt and sendEnabled are absent until the keeper's first observation.
   need(health.observedAt === undefined || isCount(health.observedAt), "health.observedAt");
   need(health.sendEnabled === undefined || typeof health.sendEnabled === "boolean", "health.sendEnabled");
+  // "primary" or "follower"; absent in the bootstrap shape and from keepers that predate followers.
+  need(health.role == null || (typeof health.role === "string" && CODE.test(health.role)), "health.role");
 
   need(isObject(body.summary), "summary");
   for (const group of EVENT_GROUPS) need(isCount(body.summary[group]), `summary.${group}`);
@@ -154,6 +156,7 @@ export function validateReport(body, net, idempotencyKey) {
     healthObservedAt: health.observedAt ?? null,
     sendEnabled: health.sendEnabled ?? null,
     faults: [...health.faults],
+    role: health.role ?? null,
     droppedTotal: body.droppedTotal,
     droppedCount: body.droppedCount,
     failedCounts,
@@ -169,18 +172,25 @@ function json(status, payload, extra = {}) {
 }
 
 /**
- * Handle POST /v1/health/<network>. `ingest(record)` must durably store the record and resolve to
- * "stored" | "duplicate" | "conflict"; 2xx is only returned after it resolves.
+ * Handle POST /v1/health/<network> (and /backup). `ingest(record)` must durably store the record and resolve to
+ * "stored" | "duplicate" | "conflict"; 2xx is only returned after it resolves. `keySecret` names the secret that
+ * authenticates this stream: the network's primary key unless given.
  */
-export async function handleHealthPost(request, env, net, { ingest, now = () => Date.now(), subtle = crypto.subtle }) {
+export async function handleHealthPost(
+  request,
+  env,
+  net,
+  { ingest, now = () => Date.now(), subtle = crypto.subtle, keySecret = net.healthKeySecret, stream = "primary" },
+) {
   if (request.method !== "POST") return json(405, { error: "method not allowed" }, { allow: "POST" });
-  const secret = env[net.healthKeySecret];
+  const secret = typeof keySecret === "string" ? env[keySecret] : undefined;
   if (typeof secret !== "string" || secret.trim() === "") return json(503, { error: "receiver not configured" });
 
   const token = parseBearer(request.headers.get("authorization"));
   if (!token || !(await tokenMatches(token, secret, subtle))) {
     // Logged only (Workers Logs), never stored: unauthenticated traffic must not consume Durable Object quota.
-    console.warn(JSON.stringify({ healthAuthFailure: net.name, bearer: token ? "mismatch" : "missing" }));
+    const route = stream === "primary" ? net.name : `${net.name}/${stream}`;
+    console.warn(JSON.stringify({ healthAuthFailure: route, bearer: token ? "mismatch" : "missing" }));
     return json(401, { error: "unauthorized" }, { "www-authenticate": 'Bearer realm="d20dao-watchdog"' });
   }
 

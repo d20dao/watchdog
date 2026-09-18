@@ -32,7 +32,8 @@ const SCHEMA = [
      unhealthy_since INTEGER,
      reports_stored INTEGER NOT NULL,
      duplicates_seen INTEGER NOT NULL,
-     conflicts_seen INTEGER NOT NULL
+     conflicts_seen INTEGER NOT NULL,
+     role TEXT
    ) WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS chain_state (
      network TEXT PRIMARY KEY,
@@ -87,6 +88,38 @@ const SCHEMA = [
      updated_at INTEGER NOT NULL,
      state_json TEXT NOT NULL
    ) WITHOUT ROWID`,
+  // Backup (follower) keeper reports: the same shape as the primary's tables, kept apart so the two streams never
+  // share report ids, duplicate and conflict counts, or health state.
+  `CREATE TABLE IF NOT EXISTS backup_reports (
+     report_id TEXT PRIMARY KEY,
+     network TEXT NOT NULL,
+     body_sha256 TEXT NOT NULL,
+     received_at INTEGER NOT NULL,
+     observed_at INTEGER NOT NULL,
+     failed_json TEXT
+   ) WITHOUT ROWID`,
+  `CREATE INDEX IF NOT EXISTS backup_reports_by_received_at ON backup_reports (received_at)`,
+  `CREATE TABLE IF NOT EXISTS backup_report_state (
+     network TEXT PRIMARY KEY,
+     first_received_at INTEGER NOT NULL,
+     last_received_at INTEGER NOT NULL,
+     last_report_id TEXT NOT NULL,
+     report_observed_at INTEGER NOT NULL,
+     health_observed_at INTEGER,
+     healthy INTEGER NOT NULL,
+     send_enabled INTEGER,
+     faults_json TEXT NOT NULL,
+     node_id TEXT NOT NULL,
+     dropped_total INTEGER NOT NULL,
+     dropped_alerted_total INTEGER NOT NULL,
+     failed_last_json TEXT NOT NULL,
+     failed_totals_json TEXT NOT NULL,
+     unhealthy_since INTEGER,
+     reports_stored INTEGER NOT NULL,
+     duplicates_seen INTEGER NOT NULL,
+     conflicts_seen INTEGER NOT NULL,
+     role TEXT
+   ) WITHOUT ROWID`,
 ];
 
 // Columns added after the first deployment. CREATE TABLE IF NOT EXISTS leaves an existing table as it is, so
@@ -94,7 +127,13 @@ const SCHEMA = [
 const ADDED_COLUMNS = [
   // Backup keeper balances as JSON {lowercase address: wei string}.
   ["chain_state", "backup_balances_json", "TEXT"],
+  // health.role of the latest report ("primary" or "follower"); null until a report carries it.
+  ["report_state", "role", "TEXT"],
 ];
+
+/** Report streams: each keeps its own report ids and state. Table names are fixed here, never taken from input. */
+export const PRIMARY_STREAM = Object.freeze({ reports: "reports", state: "report_state" });
+export const BACKUP_STREAM = Object.freeze({ reports: "backup_reports", state: "backup_report_state" });
 
 export function migrate(storage) {
   for (const statement of SCHEMA) storage.sql.exec(statement);
@@ -120,31 +159,32 @@ function parseJson(text, fallback) {
 // Reports
 
 /**
- * Store a validated report summary. Returns "stored", "duplicate" (same id and bytes) or
- * "conflict" (same id, different bytes). Runs in one transaction.
+ * Store a validated report summary in `stream` (the primary's by default). Returns "stored", "duplicate" (same id
+ * and bytes) or "conflict" (same id, different bytes). Runs in one transaction.
  */
-export function ingestReport(storage, rec) {
+export function ingestReport(storage, rec, stream = PRIMARY_STREAM) {
+  const { reports, state: table } = stream;
   return storage.transactionSync(() => {
-    const existing = first(storage, "SELECT body_sha256 FROM reports WHERE report_id = ?", rec.reportId);
-    const state = first(storage, "SELECT * FROM report_state WHERE network = ?", rec.network);
+    const existing = first(storage, `SELECT body_sha256 FROM ${reports} WHERE report_id = ?`, rec.reportId);
+    const state = first(storage, `SELECT * FROM ${table} WHERE network = ?`, rec.network);
     if (existing) {
       const duplicate = existing.body_sha256 === rec.bodySha256;
       if (state && duplicate) {
         // A retry proves the keeper is alive; it never re-applies the report's activity.
         storage.sql.exec(
-          "UPDATE report_state SET last_received_at = MAX(last_received_at, ?), duplicates_seen = duplicates_seen + 1 WHERE network = ?",
+          `UPDATE ${table} SET last_received_at = MAX(last_received_at, ?), duplicates_seen = duplicates_seen + 1 WHERE network = ?`,
           rec.receivedAt,
           rec.network,
         );
       } else if (state) {
-        storage.sql.exec("UPDATE report_state SET conflicts_seen = conflicts_seen + 1 WHERE network = ?", rec.network);
+        storage.sql.exec(`UPDATE ${table} SET conflicts_seen = conflicts_seen + 1 WHERE network = ?`, rec.network);
       }
       return duplicate ? "duplicate" : "conflict";
     }
 
     const failedJson = Object.keys(rec.failedCounts).length > 0 ? JSON.stringify(rec.failedCounts) : null;
     storage.sql.exec(
-      "INSERT INTO reports (report_id, network, body_sha256, received_at, observed_at, failed_json) VALUES (?, ?, ?, ?, ?, ?)",
+      `INSERT INTO ${reports} (report_id, network, body_sha256, received_at, observed_at, failed_json) VALUES (?, ?, ?, ?, ?, ?)`,
       rec.reportId,
       rec.network,
       rec.bodySha256,
@@ -155,10 +195,10 @@ export function ingestReport(storage, rec) {
 
     if (!state) {
       storage.sql.exec(
-        `INSERT INTO report_state (network, first_received_at, last_received_at, last_report_id, report_observed_at,
+        `INSERT INTO ${table} (network, first_received_at, last_received_at, last_report_id, report_observed_at,
            health_observed_at, healthy, send_enabled, faults_json, node_id, dropped_total, dropped_alerted_total,
-           failed_last_json, failed_totals_json, unhealthy_since, reports_stored, duplicates_seen, conflicts_seen)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0)`,
+           failed_last_json, failed_totals_json, unhealthy_since, reports_stored, duplicates_seen, conflicts_seen, role)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?)`,
         rec.network,
         rec.receivedAt,
         rec.receivedAt,
@@ -174,6 +214,7 @@ export function ingestReport(storage, rec) {
         JSON.stringify(rec.failedCounts),
         JSON.stringify(rec.failedCounts),
         rec.healthy ? null : rec.observedAt,
+        rec.role ?? null,
       );
       return "stored";
     }
@@ -185,9 +226,9 @@ export function ingestReport(storage, rec) {
     if (rec.observedAt >= state.report_observed_at) {
       const unhealthySince = rec.healthy ? null : (state.healthy ? rec.observedAt : state.unhealthy_since ?? rec.observedAt);
       storage.sql.exec(
-        `UPDATE report_state SET last_received_at = ?, last_report_id = ?, report_observed_at = ?, health_observed_at = ?,
+        `UPDATE ${table} SET last_received_at = ?, last_report_id = ?, report_observed_at = ?, health_observed_at = ?,
            healthy = ?, send_enabled = ?, faults_json = ?, node_id = ?, dropped_total = MAX(dropped_total, ?),
-           failed_last_json = ?, failed_totals_json = ?, unhealthy_since = ?, reports_stored = reports_stored + 1
+           failed_last_json = ?, failed_totals_json = ?, unhealthy_since = ?, role = ?, reports_stored = reports_stored + 1
          WHERE network = ?`,
         lastReceivedAt,
         rec.reportId,
@@ -201,12 +242,13 @@ export function ingestReport(storage, rec) {
         JSON.stringify(rec.failedCounts),
         JSON.stringify(totals),
         unhealthySince,
+        rec.role ?? null,
         rec.network,
       );
     } else {
       // Older than the stored observation (out-of-order retry): count activity, keep newer health.
       storage.sql.exec(
-        `UPDATE report_state SET last_received_at = ?, dropped_total = MAX(dropped_total, ?), failed_totals_json = ?,
+        `UPDATE ${table} SET last_received_at = ?, dropped_total = MAX(dropped_total, ?), failed_totals_json = ?,
            reports_stored = reports_stored + 1 WHERE network = ?`,
         lastReceivedAt,
         rec.droppedTotal,
@@ -219,11 +261,11 @@ export function ingestReport(storage, rec) {
 }
 
 export function pruneReports(storage, cutoff) {
-  storage.sql.exec("DELETE FROM reports WHERE received_at < ?", cutoff);
+  for (const { reports } of [PRIMARY_STREAM, BACKUP_STREAM]) storage.sql.exec(`DELETE FROM ${reports} WHERE received_at < ?`, cutoff);
 }
 
-export function readReportState(storage, network) {
-  const r = first(storage, "SELECT * FROM report_state WHERE network = ?", network);
+export function readReportState(storage, network, stream = PRIMARY_STREAM) {
+  const r = first(storage, `SELECT * FROM ${stream.state} WHERE network = ?`, network);
   if (!r) return null;
   return {
     firstReceivedAt: r.first_received_at,
@@ -243,8 +285,11 @@ export function readReportState(storage, network) {
     reportsStored: r.reports_stored,
     duplicatesSeen: r.duplicates_seen,
     conflictsSeen: r.conflicts_seen,
+    role: r.role ?? null,
   };
 }
+
+export const readBackupReportState = (storage, network) => readReportState(storage, network, BACKUP_STREAM);
 
 export function markDroppedAlerted(storage, network, total) {
   storage.sql.exec(

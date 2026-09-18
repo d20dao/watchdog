@@ -40,6 +40,7 @@ export const NETWORKS = Object.freeze({
     rpcs: Object.freeze(["https://rpc.blockdaemon.mainnet.arc.io", "https://rpc.mainnet.arc.io"]),
     explorer: "https://arc.d20dao.org",
     healthKeySecret: "HEALTH_KEY_ARC_MAINNET",
+    backupHealthKeySecret: "HEALTH_KEY_ARC_MAINNET_BACKUP",
   }),
   "arc-testnet": Object.freeze({
     name: "arc-testnet",
@@ -58,6 +59,7 @@ export const NETWORKS = Object.freeze({
     rpcs: Object.freeze(["https://rpc.blockdaemon.testnet.arc.io", "https://rpc.testnet.arc.io"]),
     explorer: "https://arc-testnet.d20dao.org",
     healthKeySecret: "HEALTH_KEY_ARC_TESTNET",
+    backupHealthKeySecret: "HEALTH_KEY_ARC_TESTNET_BACKUP",
   }),
 });
 

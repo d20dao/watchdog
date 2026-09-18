@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   CHECK_NAMES,
   backupBalanceCheckName,
+  evaluateBackupReportChecks,
   evaluateChainChecks,
   evaluateReportChecks,
   evaluateRpcCheck,
@@ -90,6 +91,54 @@ test("dropped audit events raise a one-shot notice on increase", () => {
   assert.equal(severity(evaluateReportChecks(TESTNET, reportState({ droppedTotal: 7, droppedAlertedTotal: 7 }), NOW).dropped_events), "clear");
 });
 
+test("backup reports: not configured until the first one; nothing to watch without backup keepers", () => {
+  const clear = { backup_heartbeat: null, backup_unhealthy: null, backup_role: null };
+  assert.deepEqual(evaluateBackupReportChecks(TESTNET, null, NOW), clear);
+  const stale = reportState({ lastReceivedAt: NOW - 3600, healthy: false, faults: ["tick_failed"], role: "primary" });
+  assert.deepEqual(evaluateBackupReportChecks({ ...TESTNET, backupKeepers: [] }, stale, NOW), clear);
+  const { backupKeepers, ...unset } = TESTNET;
+  assert.deepEqual(evaluateBackupReportChecks(unset, stale, NOW), clear);
+  // The keeper's own report checks never look at the backup.
+  assert.deepEqual(Object.keys(evaluateReportChecks(TESTNET, reportState(), NOW)), ["heartbeat", "health_age", "unhealthy", "dropped_events"]);
+});
+
+test("backup heartbeat uses the keeper's thresholds (150 s warning, 240 s alarm)", () => {
+  const at = (silence) => evaluateBackupReportChecks(TESTNET, reportState({ lastReceivedAt: NOW - silence, role: "follower" }), NOW).backup_heartbeat;
+  assert.equal(severity(at(149)), "clear");
+  assert.equal(severity(at(150)), "warning");
+  assert.equal(severity(at(239)), "warning");
+  assert.equal(severity(at(240)), "alarm");
+  assert.equal(at(302).title, "backup keeper heartbeat missing");
+  assert.equal(at(302).detail, "last report 5m 2s ago");
+});
+
+test("backup unhealthy: warning immediately, alarm after 5 minutes continuously", () => {
+  const at = (duration) =>
+    evaluateBackupReportChecks(
+      MAINNET,
+      reportState({ healthy: false, faults: ["preparation_stalled"], role: "follower", reportObservedAt: NOW - 5, unhealthySince: NOW - 5 - duration }),
+      NOW,
+    ).backup_unhealthy;
+  assert.equal(at(0).severity, "warning");
+  assert.equal(at(0).title, "backup keeper unhealthy");
+  assert.equal(at(0).detail, "faults: preparation_stalled");
+  assert.equal(at(299).severity, "warning");
+  assert.equal(at(300).severity, "alarm");
+  assert.equal(at(4 * 3600).detail, "faults: preparation_stalled (for 4h)");
+  assert.equal(severity(evaluateBackupReportChecks(MAINNET, reportState({ role: "follower" }), NOW).backup_unhealthy), "clear");
+});
+
+test("backup role: primary on the backup route alarms; follower or no role yet is clear", () => {
+  const at = (role) => evaluateBackupReportChecks(TESTNET, reportState({ role }), NOW).backup_role;
+  assert.equal(severity(at("follower")), "clear");
+  assert.equal(severity(at(null)), "clear");
+  const wrong = at("primary");
+  assert.equal(wrong.severity, "alarm");
+  assert.equal(wrong.title, "backup keeper not a follower");
+  assert.equal(wrong.detail, "reports role primary");
+  assert.equal(wrong.event, undefined, "a standing condition until a follower report arrives");
+});
+
 test("chain checks are unknown when the read failed", () => {
   const r = evaluateChainChecks(TESTNET, { ok: false });
   assert.ok(Object.values(r).every((c) => c === undefined));
@@ -165,6 +214,12 @@ test("check names per network: backup checks follow the keeper balance; none wit
     ...CHECK_NAMES.slice(0, CHECK_NAMES.indexOf("balance") + 1),
     "backup_balance:0x75af60e2165e8e6d2f6cfd5d9ddda83446044685",
     ...CHECK_NAMES.slice(CHECK_NAMES.indexOf("balance") + 1),
+  ]);
+  assert.deepEqual(networkCheckNames(MAINNET).slice(7, 11), [
+    "backup_balance:0x75af60e2165e8e6d2f6cfd5d9ddda83446044685",
+    "backup_heartbeat",
+    "backup_unhealthy",
+    "backup_role",
   ]);
   assert.ok(networkCheckNames(TESTNET).includes("backup_balance:0xbb2fde97a5f4855bef872c71fbb80be3170127ee"));
   const { backupKeepers, ...unset } = TESTNET;

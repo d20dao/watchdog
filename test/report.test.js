@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { handleHealthPost, parseBearer, readBodyLimited, tokenMatches, validateReport } from "../src/report.js";
-import { ingestReport, readReportState } from "../src/store.js";
+import { BACKUP_STREAM, PRIMARY_STREAM, ingestReport, readBackupReportState, readReportState } from "../src/store.js";
 import { MAINNET, TESTNET, bootstrapReport, memoryStorage, sampleReport } from "./helpers.js";
 
 const KEY = "throwaway-testnet-key";
@@ -227,4 +227,73 @@ test("POST: storage failure returns 503, never 2xx", async () => {
     },
   });
   assert.equal(res.status, 503);
+});
+
+test("validateReport reads health.role; absent in the bootstrap shape", () => {
+  const follower = sampleReport({ health: { observedAt: 1789420000, healthy: true, sendEnabled: true, faults: [], role: "follower", primaryAlive: true } });
+  assert.equal(validateReport(follower, TESTNET, follower.reportId).role, "follower");
+  const primary = sampleReport({ health: { observedAt: 1789420000, healthy: true, sendEnabled: true, faults: [], role: "primary", primaryAlive: null } });
+  assert.equal(validateReport(primary, TESTNET, primary.reportId).role, "primary");
+  assert.equal(validateReport(bootstrapReport(), TESTNET, bootstrapReport().reportId).role, null);
+  for (const role of [1, "<b>", ""]) {
+    const bad = sampleReport({ health: { healthy: true, faults: [], role } });
+    assert.throws(() => validateReport(bad, TESTNET, bad.reportId), /health.role/);
+  }
+});
+
+const BACKUP_KEY = "throwaway-testnet-backup-key";
+const BACKUP_ENV = { ...ENV, HEALTH_KEY_ARC_TESTNET_BACKUP: BACKUP_KEY };
+
+/** Harness posting to both streams of one storage: the primary's key and ingest, or the backup's. */
+function streams(env = BACKUP_ENV) {
+  const storage = memoryStorage();
+  const send = (request, backup) =>
+    handleHealthPost(request, env, TESTNET, {
+      ingest: async (rec) => ingestReport(storage, rec, backup ? BACKUP_STREAM : PRIMARY_STREAM),
+      now: () => 1789420010_000,
+      keySecret: backup ? TESTNET.backupHealthKeySecret : TESTNET.healthKeySecret,
+      stream: backup ? "backup" : "primary",
+    });
+  return { storage, primary: (request) => send(request, false), backup: (request) => send(request, true) };
+}
+
+test("backup stream: accepted only with its own key", async () => {
+  const s = streams();
+  const report = sampleReport({ health: { observedAt: 1789420000, healthy: true, sendEnabled: true, faults: [], role: "follower" } });
+  assert.equal((await s.backup(post(report, { key: null }))).status, 401);
+  assert.equal((await s.backup(post(report, { key: KEY }))).status, 401, "the primary's key is not valid for the backup");
+  assert.equal((await s.backup(post(report, { key: "throwaway-testnet-backup-kez" }))).status, 401);
+  assert.equal((await s.primary(post(report, { key: BACKUP_KEY }))).status, 401, "the backup's key is not valid for the primary");
+  assert.equal(readBackupReportState(s.storage, "arc-testnet"), null);
+
+  const ok = await s.backup(post(report, { key: BACKUP_KEY }));
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { ok: true, duplicate: false });
+  const state = readBackupReportState(s.storage, "arc-testnet");
+  assert.equal(state.role, "follower");
+  assert.equal(state.healthy, true);
+  assert.equal(readReportState(s.storage, "arc-testnet"), null, "the primary's state is untouched");
+
+  // Backup secret not set: refuse, as for the primary.
+  const unset = streams(ENV);
+  assert.equal((await unset.backup(post(report, { key: BACKUP_KEY }))).status, 503);
+});
+
+test("backup stream: its report ids, duplicates and conflicts never count against the primary", async () => {
+  const s = streams();
+  const report = sampleReport();
+  assert.equal((await s.primary(post(report))).status, 200);
+  // The same report id and bytes on the backup route is a first delivery there, not a duplicate or conflict.
+  const first = await s.backup(post(report, { key: BACKUP_KEY }));
+  assert.equal(first.status, 200);
+  assert.deepEqual(await first.json(), { ok: true, duplicate: false });
+  // Different bytes under that id conflict only within the backup stream.
+  const conflicting = { ...report, droppedTotal: 3 };
+  assert.equal((await s.backup(post(conflicting, { key: BACKUP_KEY }))).status, 409);
+  assert.deepEqual(await (await s.backup(post(report, { key: BACKUP_KEY }))).json(), { ok: true, duplicate: true });
+
+  const primary = readReportState(s.storage, "arc-testnet");
+  const backup = readBackupReportState(s.storage, "arc-testnet");
+  assert.deepEqual([primary.reportsStored, primary.duplicatesSeen, primary.conflictsSeen], [1, 0, 0]);
+  assert.deepEqual([backup.reportsStored, backup.duplicatesSeen, backup.conflictsSeen], [1, 1, 1]);
 });

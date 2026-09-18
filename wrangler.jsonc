@@ -14,5 +14,6 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Watchdog"] }],
   "observability": { "enabled": true }
   // Secrets (set with `npx wrangler secret put NAME`, never in this file):
-  //   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, HEALTH_KEY_ARC_MAINNET, HEALTH_KEY_ARC_TESTNET
+  //   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, HEALTH_KEY_ARC_MAINNET, HEALTH_KEY_ARC_TESTNET,
+  //   HEALTH_KEY_ARC_MAINNET_BACKUP, HEALTH_KEY_ARC_TESTNET_BACKUP
 }

@@ -5,15 +5,17 @@ An external watchdog for the D20DAO VRF keepers, running on Cloudflare Workers (
 Every alert the keepers raise today comes from inside the keeper process, so a dead host alerts nobody.
 This Worker runs on Cloudflare instead. It:
 
-1. receives each keeper's outbound health reports (`POST /v1/health/<network>`),
+1. receives each keeper's outbound health reports (`POST /v1/health/<network>`), and its backup's (`POST /v1/health/<network>/backup`),
 2. reads both chains every minute,
 3. probes the AirnodeHub listings the epoch registry depends on, once an hour each,
 4. posts to the operator Telegram chat with its own bot token.
 
 ```
-keeper (arc-mainnet) ──POST /v1/health/arc-mainnet──┐
-keeper (arc-testnet) ──POST /v1/health/arc-testnet──┤
-                                                    ▼
+keeper (arc-mainnet) ──POST /v1/health/arc-mainnet─────────┐
+backup (arc-mainnet) ──POST /v1/health/arc-mainnet/backup──┤
+keeper (arc-testnet) ──POST /v1/health/arc-testnet─────────┤
+backup (arc-testnet) ──POST /v1/health/arc-testnet/backup──┤
+                                                           ▼
            Worker (validation, auth)  ──RPC──►  Durable Object "Watchdog" (SQLite)
            cron * * * * *            ──RPC──►    ├─ JSON-RPC batches to Arc (Blockdaemon, then public)
            GET / and /status.json    ──RPC──►    ├─ AirnodeHub listing probes (signed POST, OpenAPI GET)
@@ -40,12 +42,17 @@ These run every minute for each network. Thresholds live in `src/config.js` (`TH
 | `refund`: new `RequestRefundedTo` logs since the last scanned block | — | "refund issued, investigate" with request ids (one-shot) |
 | `balance`: keeper wallet native USDC (18 decimals) | < 5 USDC | < 2 USDC |
 | `backup_balance:<address>`: native USDC of each backup keeper wallet (`backupKeepers`), one alert per wallet. Lower than the keeper's: a backup spends only while it covers for the primary | < 2 USDC | < 1 USDC |
+| `backup_heartbeat`: time since the backup's last report (once it has reported) | ≥ 150 s | ≥ 240 s |
+| `backup_unhealthy`: backup's latest report has `healthy: false` (lists the fault codes) | immediately | continuously for ≥ 5 min |
+| `backup_role`: backup's latest report has a `health.role` other than `follower` | — | alarm |
 | `base_fee`: 2 × baseFee + 1 gwei against the fee cap (mainnet 2000 gwei, testnet 100 gwei) | > 60 % | > 85 % |
 | `committer`: registry `committer()` ≠ keeper wallet | — | alarm |
 | `coordinator_impl`, `registry_impl`: ERC-1967 implementation slot ≠ expected | — | alarm |
 | `foreign_submitter`: `RandomnessFulfilled` whose submitter is neither the keeper nor a configured backup keeper | one-shot notice | — |
 | `rpc`: watchdog chain read failed or was partial for ≥ 3 consecutive runs | "watchdog cannot read chain" | — |
 | `dropped_events`: keeper `droppedTotal` increased (the receiver contract asks receivers to alert on dropped counts) | one-shot notice | — |
+
+Backup checks apply only to networks with `backupKeepers`. A backup that has never reported raises nothing and shows as not reporting.
 
 Chain reading, per network per run:
 
@@ -128,7 +135,7 @@ Known probe limits:
 
 Each (network, check) pair has one alert row in the Durable Object. Each backup keeper wallet has its own check, so it
 resolves independently of the keeper and of other backups. A wallet removed from `backupKeepers` resolves its alert on the
-next run. AirnodeHub probes use `airnodehub` in place of a network:
+next run; an empty `backupKeepers` also resolves the backup health alerts. AirnodeHub probes use `airnodehub` in place of a network:
 
 * **First activation:** one message, `[arc-mainnet] WARNING ...` or `[arc-mainnet] ALARM ...`.
 * **Warnings** never repeat.
@@ -161,7 +168,7 @@ This endpoint implements the receiver contract in `d20-keeper-mainnet/docs/keepe
 * `reportId` and the SHA-256 of the exact body are stored in one transaction with the per-network state. The 2xx reply is sent only after that write commits.
 * Same id with the same bytes returns 200 again and counts as a heartbeat, without re-applying activity. Same id with different bytes returns 409.
 * Report ids older than 3 days are pruned.
-* Kept per network: last `receivedAt`, report `observedAt`, `health.observedAt`, `healthy`, `sendEnabled`, faults, `nodeId`, `droppedTotal`, and the per-kind counts of `events.failed` (latest report and running total).
+* Kept per network: last `receivedAt`, report `observedAt`, `health.observedAt`, `healthy`, `sendEnabled`, faults, `health.role`, `nodeId`, `droppedTotal`, and the per-kind counts of `events.failed` (latest report and running total).
 
 | Status | Meaning |
 | --- | --- |
@@ -175,11 +182,20 @@ This endpoint implements the receiver contract in `d20-keeper-mainnet/docs/keepe
 | 422 | `chainId` or `coordinator` does not belong to this network |
 | 503 | receiver key not configured, or storage unavailable |
 
+### `POST /v1/health/<network>/backup` (`arc-mainnet`, `arc-testnet`)
+
+The backup (follower) keeper's reports. Same envelope, checks and replies as above, with its own key and storage:
+
+* **Auth:** `HEALTH_KEY_ARC_MAINNET_BACKUP` or `HEALTH_KEY_ARC_TESTNET_BACKUP`. The primary's key is refused here, and this key on the primary route.
+* **Storage:** separate tables (`backup_reports`, `backup_report_state`). Report ids, duplicates and conflicts are counted per stream, so backup reports never touch the keeper's state or alerts.
+* **Role:** `health.role` of the latest report is kept for `backup_role`.
+
 ### `GET /status.json`
 
 For each network, this returns:
 
 * report ages, `healthy`, faults, `nodeId`, dropped and failed-event counts,
+* the same for the backup under `backupReport`, plus its `role` (`{"everReported": false}` until it reports),
 * the configured `backupKeepers`,
 * the last chain check time and figures: block, pending count, oldest pending age, keeper balance in USDC (`keeperBalanceUsdc`) and each backup keeper's balance (`backupKeeperBalances`: `[{address, balanceUsdc}]`, `null` until read), base fee and fee-cap usage, wiring checks, log cursor,
 * active alerts with severity and `since`.
@@ -194,7 +210,7 @@ It also returns `notifier` (`configured` or `not configured`) and the last 10 no
 
 ### `GET /`
 
-The same information as a small server-rendered HTML page, with one row per AirnodeHub recipe (status, last probe, latency, reason and listing document). It uses the d20dao.org dark theme with inline CSS and the inline logo only, is readable on a phone and refreshes every 60 s.
+The same information as a small server-rendered HTML page, with backup keeper health under the backup balances and one row per AirnodeHub recipe (status, last probe, latency, reason and listing document). It uses the d20dao.org dark theme with inline CSS and the inline logo only, is readable on a phone and refreshes every 60 s.
 
 ## Secrets
 
@@ -205,6 +221,8 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
 npx wrangler secret put HEALTH_KEY_ARC_MAINNET
 npx wrangler secret put HEALTH_KEY_ARC_TESTNET
+npx wrangler secret put HEALTH_KEY_ARC_MAINNET_BACKUP
+npx wrangler secret put HEALTH_KEY_ARC_TESTNET_BACKUP
 ```
 
 Generate each health key as a long random value, for example:
@@ -227,9 +245,16 @@ HEALTH_API_KEY=<same value as HEALTH_KEY_ARC_MAINNET>
 # arc-testnet keeper
 HEALTH_API_URL=https://watchdog.d20dao.org/v1/health/arc-testnet
 HEALTH_API_KEY=<same value as HEALTH_KEY_ARC_TESTNET>
+
+# backup (follower) keepers
+HEALTH_API_URL=https://watchdog.d20dao.org/v1/health/arc-mainnet/backup
+HEALTH_API_KEY=<same value as HEALTH_KEY_ARC_MAINNET_BACKUP>
+
+HEALTH_API_URL=https://watchdog.d20dao.org/v1/health/arc-testnet/backup
+HEALTH_API_KEY=<same value as HEALTH_KEY_ARC_TESTNET_BACKUP>
 ```
 
-Then restart the keeper. It posts every 30 s by default (`HEALTH_INTERVAL_SECONDS`). Within a minute, `/status.json` should show `everReported: true` for that network.
+Then restart the keeper. It posts every 30 s by default (`HEALTH_INTERVAL_SECONDS`). Within a minute, `/status.json` should show `everReported: true` for that network (`backupReport` for a backup).
 
 The keeper's HTTP client sends no `User-Agent` header. If the `d20dao.org` zone runs Browser Integrity Check, Bot Fight Mode or a WAF rule that challenges such requests, the keeper's POSTs are blocked before they reach the Worker, and the result is a permanent `heartbeat` alarm. After deploying, test without a User-Agent:
 
@@ -279,7 +304,7 @@ npx wrangler deploy
 
 The first deploy creates the `Watchdog` SQLite Durable Object class (migration `v1`), the custom domain `watchdog.d20dao.org` and the `* * * * *` cron trigger. `workers_dev` and preview URLs are disabled.
 
-Schema changes are applied in place when the object starts (`migrate` in `src/store.js`). Missing tables are created, and columns added since the first deploy are added when missing (for example `chain_state.backup_balances_json`). Stored rows are kept, and no new migration tag is needed.
+Schema changes are applied in place when the object starts (`migrate` in `src/store.js`). Missing tables are created, and columns added since the first deploy are added when missing (for example `chain_state.backup_balances_json` and `report_state.role`). Stored rows are kept, and no new migration tag is needed.
 
 The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an `exports` field for Durable Object classes. The two are mutually exclusive, and moving a deployed Worker to `exports` cannot be reverted.
 
@@ -290,11 +315,11 @@ The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an 
 | Worker CPU 10 ms per invocation | The Worker only routes: report validation plus hashing measured ~0.1–0.4 ms (up to ~1.7 ms on a cold isolate) for 0.5–61 KB reports. The cron handler just calls the Durable Object. The signature code is never evaluated here. Loading the whole 204 KB bundle (parse plus top-level evaluation, Node 24) went from 3.3 ms to 5.9 ms with the probe; this is isolate startup, not per-request work. |
 | Durable Object CPU (30 s per request) | A full run for both networks with replayed live RPC responses measured ~0.4 ms warm and ~1.6 ms cold. A worst-case 5,000-block scan returning 1,000 logs measured ~3.5–5 ms. One AirnodeHub probe (reply parse, request hash, secp256k1 recovery, shape) measured 1.1–2 ms warm. The first probe after the object starts adds ~11 ms of module evaluation and ~7 ms of first verification. A run with all five probes due measured ~9 ms warm and ~39 ms cold; a run with none due adds ~0.06 ms. Parsing and checking the 60 KB Hyperliquid listing document takes ~0.1 ms. |
 | Subrequests 50 per invocation | 2 batches per network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper balances are extra calls inside the round A batch, so they add no fetches. AirnodeHub adds ≤ 5 per run (5 at the first run, then 1 in each of 5 runs an hour, plus retries and 4 document reads a day), so ≤ 20 in total. |
-| DO requests 100,000/day | 2 networks × 2,880 reports + 1,440 cron runs ≈ 7,200/day, plus status views (edge-cached 15 s). |
-| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 5,760 ≈ 29,000. Chain state is 2 × 1,440 ≈ 2,900. AirnodeHub probe state is 1 row per probe or document read, ≈ 130/day (more while a listing is retried every 10 min). Alerts and messages only change on transitions. Total ≈ 32,000/day. |
+| DO requests 100,000/day | 2 networks × 2 keepers (primary and backup) × 2,880 reports + 1,440 cron runs ≈ 13,000/day, plus status views (edge-cached 15 s). |
+| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. AirnodeHub probe state is 1 row per probe or document read, ≈ 130/day (more while a listing is retried every 10 min). Alerts and messages only change on transitions. Total ≈ 61,000/day. |
 | DO rows read 5,000,000/day | Point lookups plus a few rows per run; probe state and AirnodeHub alerts add about 11 per run (≈ 16,000/day). Well under 100,000/day. |
-| DO duration 13,000 GB-s/day | Billed only while handling a request (RPC wait included): about 1 s × 1,440 runs + ~20 ms × 5,760 reports at 128 MB ≈ 200 GB-s/day. AirnodeHub probes wait alongside the chain reads: 0.1–9 s each (fly.dev cold starts), at most 15 s, so ≤ 120 × 15 s × 0.128 GB ≈ 230 GB-s/day more in the worst case. Timers are cleared so the object can hibernate. |
-| DO storage 5 GB | 3 days of report ids (≈ 17,000 small rows) plus a bounded 100-row message log. |
+| DO duration 13,000 GB-s/day | Billed only while handling a request (RPC wait included): about 1 s × 1,440 runs + ~20 ms × 11,520 reports at 128 MB ≈ 220 GB-s/day. AirnodeHub probes wait alongside the chain reads: 0.1–9 s each (fly.dev cold starts), at most 15 s, so ≤ 120 × 15 s × 0.128 GB ≈ 230 GB-s/day more in the worst case. Timers are cleared so the object can hibernate. |
+| DO storage 5 GB | 3 days of report ids (≈ 35,000 small rows, primary and backup) plus a bounded 100-row message log. |
 | Cron triggers (5 per account) | 1 |
 
 The status page is public and unauthenticated. Each uncached view is one DO request, so heavy scraping from many locations could use up the daily DO request quota. If that happens, add a zone rate-limiting rule for `watchdog.d20dao.org/`.

@@ -17,19 +17,23 @@ function text(status, body, extra = {}) {
 }
 
 /**
- * @param deps.stub   Durable Object stub exposing ingestReport(record) and getStatus()
+ * @param deps.stub   Durable Object stub exposing ingestReport(record), ingestBackupReport(record) and getStatus()
  * @param deps.cache  optional Cache (caches.default) for the public read endpoints
  */
 export async function handleFetch(request, env, ctx, deps) {
   const url = new URL(request.url);
-  const health = /^\/v1\/health\/([^/]+)$/.exec(url.pathname);
+  const health = /^\/v1\/health\/([^/]+)(\/backup)?$/.exec(url.pathname);
   if (health) {
     const net = Object.hasOwn(NETWORKS, health[1]) ? NETWORKS[health[1]] : null;
-    if (!net) return text(404, "unknown network\n");
+    const backup = health[2] !== undefined;
+    if (!net || (backup && !net.backupHealthKeySecret)) return text(404, "unknown network\n");
+    // The backup (follower) stream has its own key and storage, so it can never touch the primary's state.
     return handleHealthPost(request, env, net, {
-      ingest: (record) => deps.stub().ingestReport(record),
+      ingest: backup ? (record) => deps.stub().ingestBackupReport(record) : (record) => deps.stub().ingestReport(record),
       now: deps.now,
       subtle: deps.subtle,
+      keySecret: backup ? net.backupHealthKeySecret : net.healthKeySecret,
+      stream: backup ? "backup" : "primary",
     });
   }
 

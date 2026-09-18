@@ -16,6 +16,10 @@ export const CHECK_NAMES = Object.freeze([
   "pending",
   "refund",
   "balance",
+  // Backup (follower) keeper reports, a stream of their own: see evaluateBackupReportChecks.
+  "backup_heartbeat",
+  "backup_unhealthy",
+  "backup_role",
   "base_fee",
   "committer",
   "coordinator_impl",
@@ -41,6 +45,27 @@ function balanceCondition(balanceWei, title, detail, alarmWei = THRESHOLDS.balan
   return balanceWei < alarmWei ? alarm(title, detail) : balanceWei < warnWei ? warning(title, detail) : null;
 }
 
+/** Time since the last report was received (a duplicate delivery counts). */
+function heartbeatCondition(report, nowSec, title) {
+  const silence = nowSec - report.lastReceivedAt;
+  const detail = `last report ${formatDuration(silence)} ago`;
+  return silence >= THRESHOLDS.heartbeatAlarmSeconds
+    ? alarm(title, detail)
+    : silence >= THRESHOLDS.heartbeatWarnSeconds
+      ? warning(title, detail)
+      : null;
+}
+
+/** `healthy: false` in the latest report: warning at once, alarm once the streak lasts 5 minutes of keeper time. */
+function unhealthyCondition(report, title) {
+  if (report.healthy) return null;
+  const since = report.unhealthySince ?? report.reportObservedAt;
+  const duration = Math.max(0, report.reportObservedAt - since);
+  const faults = report.faults.length > 0 ? report.faults.join(", ") : "no fault codes";
+  const detail = duration >= 60 ? `faults: ${faults} (for ${formatDuration(duration)})` : `faults: ${faults}`;
+  return duration >= THRESHOLDS.unhealthyAlarmSeconds ? alarm(title, detail) : warning(title, detail);
+}
+
 /** Checks driven by the keeper's own reports. `report` is the stored report state or null. */
 export function evaluateReportChecks(net, report, nowSec) {
   const T = THRESHOLDS;
@@ -50,13 +75,7 @@ export function evaluateReportChecks(net, report, nowSec) {
   }
   const result = {};
 
-  const silence = nowSec - report.lastReceivedAt;
-  const heartbeatDetail = `last report ${formatDuration(silence)} ago`;
-  result.heartbeat = silence >= T.heartbeatAlarmSeconds
-    ? alarm("heartbeat missing", heartbeatDetail)
-    : silence >= T.heartbeatWarnSeconds
-      ? warning("heartbeat missing", heartbeatDetail)
-      : null;
+  result.heartbeat = heartbeatCondition(report, nowSec, "heartbeat missing");
 
   // Staleness of the keeper's health observation when it built its latest report, measured on the
   // keeper clock. Delivery gaps are the heartbeat check's job, so retained retries do not double-alert.
@@ -72,17 +91,7 @@ export function evaluateReportChecks(net, report, nowSec) {
         : null;
   }
 
-  if (report.healthy) {
-    result.unhealthy = null;
-  } else {
-    const since = report.unhealthySince ?? report.reportObservedAt;
-    const duration = Math.max(0, report.reportObservedAt - since);
-    const faults = report.faults.length > 0 ? report.faults.join(", ") : "no fault codes";
-    const detail = duration >= 60 ? `faults: ${faults} (for ${formatDuration(duration)})` : `faults: ${faults}`;
-    result.unhealthy = duration >= T.unhealthyAlarmSeconds
-      ? alarm("keeper unhealthy", detail)
-      : warning("keeper unhealthy", detail);
-  }
+  result.unhealthy = unhealthyCondition(report, "keeper unhealthy");
 
   result.dropped_events = report.droppedTotal > report.droppedAlertedTotal
     ? warning(
@@ -92,6 +101,25 @@ export function evaluateReportChecks(net, report, nowSec) {
       )
     : null;
   return result;
+}
+
+/**
+ * Checks driven by the backup keeper's reports (POST /v1/health/<network>/backup). `backup` is the stored backup
+ * report state or null. A backup that never reported is not configured, and a network without `backupKeepers`
+ * has no backup to watch: both clear, so removing the wallet from the configuration resolves these alerts too.
+ */
+export function evaluateBackupReportChecks(net, backup, nowSec) {
+  if (!backup || (net.backupKeepers ?? []).length === 0) {
+    return { backup_heartbeat: null, backup_unhealthy: null, backup_role: null };
+  }
+  return {
+    backup_heartbeat: heartbeatCondition(backup, nowSec, "backup keeper heartbeat missing"),
+    backup_unhealthy: unhealthyCondition(backup, "backup keeper unhealthy"),
+    // No role in the bootstrap shape: nothing to compare yet.
+    backup_role: backup.role == null || backup.role === "follower"
+      ? null
+      : alarm("backup keeper not a follower", `reports role ${backup.role}`),
+  };
 }
 
 /** Checks driven by the chain read. `chain` is a readChain() result; unknown figures stay undefined. */

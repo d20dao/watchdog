@@ -2,7 +2,16 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { runCron } from "../src/cron.js";
 import { buildStatus, renderHtml } from "../src/status.js";
-import { ingestReport, migrate, readAlerts, readChainState, readReportState, recentMessages } from "../src/store.js";
+import {
+  BACKUP_STREAM,
+  ingestReport,
+  migrate,
+  readAlerts,
+  readBackupReportState,
+  readChainState,
+  readReportState,
+  recentMessages,
+} from "../src/store.js";
 import { groupMessages } from "../src/telegram.js";
 import { MAINNET, TESTNET, healthyRead, memoryStorage, pageText } from "./helpers.js";
 
@@ -295,6 +304,169 @@ test("migrate adds the backup balance column to an existing chain_state table in
   assert.equal(kept.balanceWei, "7");
   assert.equal(kept.logCursor, 42);
   assert.deepEqual(kept.backupBalances, {});
+});
+
+/** Store a report on the backup (follower) stream, observed and received at `at`. */
+const backupReport = (h, network, at, overrides = {}) =>
+  ingestReport(h.storage, record(network, { receivedAt: at, observedAt: at, healthObservedAt: at, role: "follower", ...overrides }), BACKUP_STREAM);
+const keeperReport = (h, network, at, overrides = {}) =>
+  ingestReport(h.storage, record(network, { receivedAt: at, observedAt: at, healthObservedAt: at, ...overrides }));
+
+test("backup keeper heartbeat: warning, alarm and resolution, independent of the keeper's", async () => {
+  const env = { ...TELEGRAM, TELEGRAM_CHAT_ID_ARC_TESTNET: "-100testnet" };
+  const h = harness(env);
+  const texts = () => h.state.telegram.flatMap((m) => m.text.split("\n\n"));
+  keeperReport(h, "arc-testnet", T0);
+  backupReport(h, "arc-testnet", T0);
+  await h.run(1);
+  // The keeper keeps reporting; its backup goes silent.
+  for (const minute of [2, 3, 4]) {
+    keeperReport(h, "arc-testnet", T0 + minute * 60);
+    await h.run(minute);
+  }
+  backupReport(h, "arc-testnet", T0 + 5 * 60);
+  keeperReport(h, "arc-testnet", T0 + 5 * 60);
+  await h.run(5);
+  // Now the keeper goes silent while its backup reports: the backup's reports never stand in for the keeper's.
+  for (const minute of [6, 7, 8]) {
+    backupReport(h, "arc-testnet", T0 + minute * 60);
+    await h.run(minute);
+  }
+  assert.deepEqual(texts(), [
+    "[arc-testnet] WARNING backup keeper heartbeat missing: last report 3m ago",
+    "[arc-testnet] ALARM backup keeper heartbeat missing: last report 4m ago",
+    "[arc-testnet] RESOLVED backup keeper heartbeat missing after 2 min",
+    "[arc-testnet] WARNING heartbeat missing: last report 3m ago",
+  ]);
+  assert.ok(h.state.telegram.every((m) => m.chat_id === "-100testnet"), "routed to the network's own chat");
+  assert.deepEqual(readAlerts(h.storage, "arc-testnet").map((a) => a.check), ["heartbeat"]);
+  assert.deepEqual(readAlerts(h.storage, "arc-mainnet"), [], "the other network never reported a backup: nothing raised");
+});
+
+test("backup unhealthy and wrong role alarm on their own; the keeper's state and alerts are untouched", async () => {
+  const h = harness();
+  // Today's incident: a follower stuck on preparation_stalled while the primary is healthy.
+  for (let i = 0; i <= 12; i++) {
+    const at = T0 + i * 30;
+    keeperReport(h, "arc-testnet", at);
+    backupReport(h, "arc-testnet", at, { healthy: false, faults: ["preparation_stalled"] });
+    if (i % 2 === 0) await h.run(i / 2);
+  }
+  assert.deepEqual(h.state.telegram.map((m) => m.text), [
+    "[arc-testnet] WARNING backup keeper unhealthy: faults: preparation_stalled",
+    "[arc-testnet] ALARM backup keeper unhealthy: faults: preparation_stalled (for 5m)",
+  ]);
+  const keeper = readReportState(h.storage, "arc-testnet");
+  assert.equal(keeper.healthy, true);
+  assert.equal(keeper.unhealthySince, null);
+  assert.deepEqual(keeper.faults, []);
+  assert.deepEqual([keeper.duplicatesSeen, keeper.conflictsSeen], [0, 0]);
+  assert.equal(readBackupReportState(h.storage, "arc-testnet").unhealthySince, T0);
+
+  // A report on the backup route that says primary.
+  backupReport(h, "arc-testnet", T0 + 7 * 60, { role: "primary" });
+  keeperReport(h, "arc-testnet", T0 + 7 * 60);
+  const wrong = await h.run(7);
+  assert.deepEqual(wrong.networks["arc-testnet"].messages, [
+    "[arc-testnet] RESOLVED backup keeper unhealthy after 7 min",
+    "[arc-testnet] ALARM backup keeper not a follower: reports role primary",
+  ]);
+  assert.deepEqual(wrong.networks["arc-testnet"].activeAlerts, ["backup_role"]);
+
+  backupReport(h, "arc-testnet", T0 + 8 * 60);
+  keeperReport(h, "arc-testnet", T0 + 8 * 60);
+  const fixed = await h.run(8);
+  assert.deepEqual(fixed.networks["arc-testnet"].messages, ["[arc-testnet] RESOLVED backup keeper not a follower after 1 min"]);
+  assert.equal(readAlerts(h.storage, "arc-testnet").length, 0);
+});
+
+test("backup health alerts resolve when the network's backup keepers are removed from the configuration", async () => {
+  const h = harness();
+  backupReport(h, "arc-mainnet", T0, { healthy: false, faults: ["tick_failed"] });
+  await h.run(10);
+  assert.deepEqual(readAlerts(h.storage, "arc-mainnet").map((a) => a.check).sort(), ["backup_heartbeat", "backup_unhealthy"]);
+  const withoutBackup = { ...MAINNET, backupKeepers: [] };
+  h.state.networks = { "arc-mainnet": withoutBackup, "arc-testnet": TESTNET };
+  h.state.reads["arc-mainnet"] = healthyRead(withoutBackup);
+  const summary = await h.run(11);
+  assert.deepEqual(summary.networks["arc-mainnet"].messages, [
+    "[arc-mainnet] RESOLVED backup keeper heartbeat missing after 1 min",
+    "[arc-mainnet] RESOLVED backup keeper unhealthy after 1 min",
+  ]);
+});
+
+test("status JSON and HTML show backup keeper health next to its balance", async () => {
+  const h = harness();
+  h.state.reads["arc-mainnet"] = healthyRead(MAINNET, { backupBalances: [{ address: BACKUP, balanceWei: 125n * 10n ** 17n }] });
+  await h.run(0);
+  let status = buildStatus(h.storage, TELEGRAM, T0 + 5);
+  assert.deepEqual(status.networks["arc-mainnet"].backupReport, { everReported: false });
+  assert.deepEqual(status.networks["arc-testnet"].backupReport, { everReported: false });
+  let text = pageText(renderHtml(status));
+  assert.ok(text.includes("Backup keepers 0x75Af…4685 12.5 USDC Health Not reporting"));
+  assert.ok(text.includes("Backup keepers 0xbb2f…27Ee 50 USDC Health Not reporting"));
+  assert.equal(status.networks["arc-testnet"].alerts.length, 0, "not reporting raises nothing");
+
+  keeperReport(h, "arc-testnet", T0 - 20);
+  backupReport(h, "arc-testnet", T0 - 20, { healthy: false, faults: ["preparation_stalled"], reportId: "backup-report-1" });
+  await h.run(0);
+  status = buildStatus(h.storage, TELEGRAM, T0 + 5);
+  const t = status.networks["arc-testnet"];
+  // The same published fields as the keeper's report, plus its role.
+  assert.deepEqual(Object.keys(t.backupReport), [...Object.keys(t.report), "role"]);
+  assert.equal(t.backupReport.lastReceivedAgeSeconds, 25);
+  assert.equal(t.backupReport.healthy, false);
+  assert.deepEqual(t.backupReport.faults, ["preparation_stalled"]);
+  assert.equal(t.backupReport.role, "follower");
+  assert.equal(t.backupReport.conflictingDeliveries, 0);
+  assert.equal(t.report.healthy, true);
+  assert.ok(!JSON.stringify(status).includes("backup-report-1"), "no report ids");
+  assert.deepEqual(t.alerts.map((a) => a.check), ["backup_unhealthy"]);
+  text = pageText(renderHtml(status));
+  assert.ok(text.includes("Keeper Healthy"));
+  assert.ok(text.includes("Backup keepers 0xbb2f…27Ee 50 USDC Health Unhealthy Last report 25s ago Faults preparation_stalled Role follower"));
+  assert.ok(text.includes("WARNING backup keeper unhealthy faults: preparation_stalled"));
+
+  backupReport(h, "arc-testnet", T0, { role: "primary" });
+  const html = renderHtml(buildStatus(h.storage, TELEGRAM, T0 + 5));
+  assert.ok(html.includes(`<th scope="row">Role</th><td class="alarm">primary</td>`));
+  assert.ok(html.includes(`<th scope="row">Health</th><td class="ok">Healthy</td>`));
+});
+
+test("migrate adds the role column and the backup tables to an existing database in place", () => {
+  const storage = memoryStorage();
+  // The report tables as deployed before backup reporting, with a stored row.
+  for (const table of ["report_state", "backup_report_state", "backup_reports"]) storage.db.exec(`DROP TABLE ${table}`);
+  storage.db.exec(`CREATE TABLE report_state (
+     network TEXT PRIMARY KEY, first_received_at INTEGER NOT NULL, last_received_at INTEGER NOT NULL,
+     last_report_id TEXT NOT NULL, report_observed_at INTEGER NOT NULL, health_observed_at INTEGER,
+     healthy INTEGER NOT NULL, send_enabled INTEGER, faults_json TEXT NOT NULL, node_id TEXT NOT NULL,
+     dropped_total INTEGER NOT NULL, dropped_alerted_total INTEGER NOT NULL, failed_last_json TEXT NOT NULL,
+     failed_totals_json TEXT NOT NULL, unhealthy_since INTEGER, reports_stored INTEGER NOT NULL,
+     duplicates_seen INTEGER NOT NULL, conflicts_seen INTEGER NOT NULL
+   ) WITHOUT ROWID`);
+  storage.db.exec(`INSERT INTO report_state VALUES ('arc-mainnet', 1, 2, 'r', 2, 2, 1, 1, '[]', '0xab', 0, 0, '{}', '{}', NULL, 9, 1, 0)`);
+  migrate(storage);
+  migrate(storage); // idempotent
+  const columns = storage.db.prepare("PRAGMA table_info(report_state)").all().map((c) => c.name);
+  assert.equal(columns.filter((name) => name === "role").length, 1);
+  const kept = readReportState(storage, "arc-mainnet");
+  assert.deepEqual([kept.lastReceivedAt, kept.reportsStored, kept.duplicatesSeen, kept.role], [2, 9, 1, null]);
+  const objects = storage.db.prepare("SELECT name FROM sqlite_master WHERE name LIKE 'backup_report%' ORDER BY name").all().map((r) => r.name);
+  assert.deepEqual(objects, ["backup_report_state", "backup_reports", "backup_reports_by_received_at"]);
+  assert.equal(readBackupReportState(storage, "arc-mainnet"), null);
+  assert.equal(ingestReport(storage, record("arc-mainnet", { role: "follower" }), BACKUP_STREAM), "stored");
+  assert.equal(readBackupReportState(storage, "arc-mainnet").role, "follower");
+  assert.equal(readReportState(storage, "arc-mainnet").reportsStored, 9);
+});
+
+test("backup report ids are pruned after 3 days, like the keeper's", async () => {
+  const h = harness();
+  backupReport(h, "arc-mainnet", T0 - 3 * 86400 - 1, { reportId: "old" });
+  backupReport(h, "arc-mainnet", T0 - 60, { reportId: "new" });
+  await h.run(0);
+  const ids = h.storage.sql.exec("SELECT report_id FROM backup_reports ORDER BY report_id").toArray().map((r) => r.report_id);
+  assert.deepEqual(ids, ["new"]);
 });
 
 test("refund events alarm once per occurrence and auto-resolve silently", async () => {
