@@ -18,7 +18,7 @@ import {
 } from "../src/probe.js";
 import { buildStatus, renderHtml } from "../src/status.js";
 import { readAlerts, readProbeStates } from "../src/store.js";
-import { MAINNET, TESTNET, healthyRead, listingDocument, loadSamples, memoryStorage } from "./helpers.js";
+import { MAINNET, TESTNET, healthyRead, listingDocument, loadSamples, memoryStorage, pageText } from "./helpers.js";
 
 const SAMPLES = loadSamples();
 const byId = Object.fromEntries(AIRNODE_RECIPES.map((recipe) => [recipe.id, recipe]));
@@ -483,15 +483,21 @@ test("status JSON and HTML show each recipe's last probe, latency, status and re
   assert.ok(!JSON.stringify(status).includes("SECRET"));
 
   const html = renderHtml(status);
-  assert.match(html, /AirnodeHub listings <span class="badge warning">WARNING<\/span>/);
-  assert.match(html, /<th>Alpha feed<br><small>recipe 4 &middot; latestFeeds<\/small><\/th><td><span class="warning">WARNING<\/span> &middot; probed 30s ago &middot; 0 ms<br><small>http 503 \(2 failed in a row\)<\/small>/);
-  assert.match(html, /<th>Beta trade<br><small>recipe 2 &middot; lastTrade<\/small><\/th><td><span class="good">OK<\/span> &middot; probed /);
+  const text = pageText(html);
+  assert.ok(text.includes("AirnodeHub listings WARNING"));
+  assert.ok(text.includes("Alpha feed recipe 4 · latestFeeds WARNING 30s ago 0 ms"));
+  assert.ok(text.includes("http 503 (2 failed in a row)"));
+  assert.ok(text.includes("Beta trade recipe 2 · lastTrade OK"));
+  // Severity reaches the page as its tone, not only as a word.
+  assert.match(html, /class="[^"]*\bwarning\b[^"]*">WARNING<\/span>/);
+  assert.match(html, /class="[^"]*\bok\b[^"]*">OK<\/span>/);
 
   // Never probed: shown as such; names are escaped.
   const fresh = buildStatus(memoryStorage(), {}, T0, [{ ...ALPHA, name: "<b>x</b>" }]);
   assert.equal(fresh.airnodehub.recipes[0].status, "not probed");
   const freshHtml = renderHtml(fresh);
   assert.ok(freshHtml.includes("&lt;b&gt;x&lt;/b&gt;") && freshHtml.includes("not probed yet"));
+  assert.ok(!freshHtml.includes("<b>x</b>"));
   assert.equal(buildStatus(memoryStorage(), {}, T0).airnodehub.recipes.length, AIRNODE_RECIPES.length);
 });
 

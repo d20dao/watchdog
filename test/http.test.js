@@ -69,8 +69,17 @@ test("status endpoints: JSON, HTML, short edge cache, headers", async () => {
 
   const html = await call(new Request("https://watchdog.d20dao.org/"));
   assert.match(html.headers.get("content-type"), /^text\/html/);
-  assert.match(html.headers.get("content-security-policy"), /default-src 'none'/);
-  assert.match(await html.text(), /D20DAO keeper watchdog/);
+  assert.equal(
+    html.headers.get("content-security-policy"),
+    "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  );
+  const page = await html.text();
+  assert.match(page, /D20DAO keeper watchdog/);
+  // Self-contained: inline CSS and SVG only, nothing fetched and no script.
+  assert.doesNotMatch(page, /<script|<link|<img|<iframe|<object|\ssrc=|url\(|@import/i);
+  for (const href of ["https://d20dao.org", "https://d20dao.org/explorer", "https://d20dao.org/docs", "/status.json"]) {
+    assert.ok(page.includes(`href="${href}"`), href);
+  }
 
   const head = await call(new Request("https://watchdog.d20dao.org/", { method: "HEAD" }));
   assert.equal(head.status, 200);

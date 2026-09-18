@@ -43,6 +43,18 @@ export function memoryStorage() {
   return storage;
 }
 
+const ENTITIES = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'" };
+
+/** What a reader sees on a rendered status page: no style, logo or tags, entities decoded, whitespace collapsed. */
+export function pageText(html) {
+  return html
+    .replace(/<style[\s\S]*?<\/style>|<svg[\s\S]*?<\/svg>/g, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&(?:amp|lt|gt|quot|#39);/g, (entity) => ENTITIES[entity])
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export const word = (value) => BigInt(value).toString(16).padStart(64, "0");
 export const addressWord = (address) => address.slice(2).toLowerCase().padStart(64, "0");
 export const bytes32 = (byte) => byte.repeat(32);

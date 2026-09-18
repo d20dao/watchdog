@@ -194,7 +194,7 @@ It also returns `notifier` (`configured` or `not configured`) and the last 10 no
 
 ### `GET /`
 
-The same information as a small server-rendered HTML page, with one row per AirnodeHub recipe (status, last probe, latency, reason and listing document). It is readable on a phone, follows the system light or dark theme and refreshes every 60 s.
+The same information as a small server-rendered HTML page, with one row per AirnodeHub recipe (status, last probe, latency, reason and listing document). It uses the d20dao.org dark theme with inline CSS and the inline logo only, is readable on a phone and refreshes every 60 s.
 
 ## Secrets
 

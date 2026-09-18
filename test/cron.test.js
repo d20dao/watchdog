@@ -4,7 +4,7 @@ import { runCron } from "../src/cron.js";
 import { buildStatus, renderHtml } from "../src/status.js";
 import { ingestReport, migrate, readAlerts, readChainState, readReportState, recentMessages } from "../src/store.js";
 import { groupMessages } from "../src/telegram.js";
-import { MAINNET, TESTNET, healthyRead, memoryStorage } from "./helpers.js";
+import { MAINNET, TESTNET, healthyRead, memoryStorage, pageText } from "./helpers.js";
 
 const T0 = 1789420000;
 const USDC = 10n ** 18n;
@@ -240,9 +240,10 @@ test("status JSON and HTML show backup keeper balances next to the keeper's", as
   assert.equal(m.chain.keeperBalanceUsdc, "7");
   assert.deepEqual(m.chain.backupKeeperBalances, [{ address: BACKUP, balanceUsdc: "12.5" }]);
   assert.deepEqual(status.networks["arc-testnet"].chain.backupKeeperBalances, [{ address: TESTNET.backupKeepers[0], balanceUsdc: "50" }]);
-  const html = renderHtml(status);
-  assert.ok(html.includes("<tr><th>Keeper balance</th><td>7 USDC</td></tr><tr><th>Backup keeper 0x75Af…4685 balance</th><td>12.5 USDC</td></tr>"));
-  assert.ok(html.includes("<tr><th>Backup keeper 0xbb2f…27Ee balance</th><td>50 USDC</td></tr>"));
+  const text = pageText(renderHtml(status));
+  assert.ok(text.includes("Keeper balance 7 USDC"));
+  assert.ok(text.includes("Backup keepers 0x75Af…4685 12.5 USDC"));
+  assert.ok(text.includes("Backup keepers 0xbb2f…27Ee 50 USDC"));
 
   // A failed read keeps the last known balance; a wallet never read shows as unknown.
   h.state.reads["arc-mainnet"] = { ok: false, complete: false, error: "http 429", errors: [], subrequests: 2 };
@@ -254,7 +255,7 @@ test("status JSON and HTML show backup keeper balances next to the keeper's", as
     { address: BACKUP, balanceUsdc: "12.5" },
     { address: added, balanceUsdc: null },
   ]);
-  assert.ok(renderHtml(later).includes("<tr><th>Backup keeper 0x0000…00c4 balance</th><td>unknown</td></tr>"));
+  assert.ok(pageText(renderHtml(later)).includes("Backup keepers 0x75Af…4685 12.5 USDC 0x0000…00c4 unknown"));
 });
 
 test("a network without backup keepers: no backup checks, empty status lists, no HTML rows", async () => {
@@ -269,7 +270,9 @@ test("a network without backup keepers: no backup checks, empty status lists, no
   assert.deepEqual(Object.keys(status.networks), ["arc-testnet"]);
   assert.deepEqual(status.networks["arc-testnet"].backupKeepers, []);
   assert.deepEqual(status.networks["arc-testnet"].chain.backupKeeperBalances, []);
-  assert.ok(!renderHtml(status).includes("Backup keeper"));
+  const text = pageText(renderHtml(status));
+  assert.ok(!text.includes("Backup keeper"));
+  assert.ok(!text.includes("0xbb2f…27Ee"));
 });
 
 test("migrate adds the backup balance column to an existing chain_state table in place", () => {
@@ -356,7 +359,7 @@ test("status JSON and HTML are sanitized and escaped", async () => {
   assert.ok(html.includes("&lt;b&gt;x&lt;/b&gt;"));
   assert.ok(html.includes("&quot;&amp;&#39;"));
   assert.ok(!html.includes("<b>x</b>"));
-  assert.match(html, /prefers-color-scheme:dark/);
+  assert.match(html, /<meta name="color-scheme" content="dark">/);
 });
 
 test("groupMessages respects size and send limits", () => {
