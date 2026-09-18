@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { handleFetch } from "../src/http.js";
+import { ICONS } from "../src/icons.js";
 import { buildStatus } from "../src/status.js";
 import { BACKUP_STREAM, ingestReport, readBackupReportState, readReportState } from "../src/store.js";
 import { memoryStorage, sampleReport } from "./helpers.js";
@@ -103,12 +105,20 @@ test("status endpoints: JSON, HTML, short edge cache, headers", async () => {
   assert.match(html.headers.get("content-type"), /^text\/html/);
   assert.equal(
     html.headers.get("content-security-policy"),
-    "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
   );
   const page = await html.text();
   assert.match(page, /D20DAO keeper watchdog/);
-  // Self-contained: inline CSS and SVG only, nothing fetched and no script.
-  assert.doesNotMatch(page, /<script|<link|<img|<iframe|<object|\ssrc=|url\(|@import/i);
+  // Self-contained: inline CSS and SVG, no script; the only links are the canonical URL and the page's own icons.
+  assert.doesNotMatch(page, /<script|<img|<iframe|<object|\ssrc=|url\(|@import/i);
+  const links = [...page.matchAll(/<link rel="([^"]+)" href="([^"]+)"/g)].map((m) => [m[1], m[2]]);
+  assert.equal(page.match(/<link\b/g).length, links.length);
+  assert.deepEqual(links, [
+    ["canonical", "https://watchdog.d20dao.org"],
+    ["icon", `/icon.svg?v=${ICONS["/icon.svg"].v}`],
+    ["icon", `/favicon.ico?v=${ICONS["/favicon.ico"].v}`],
+    ["apple-touch-icon", `/apple-touch-icon.png?v=${ICONS["/apple-touch-icon.png"].v}`],
+  ]);
   for (const href of ["https://d20dao.org", "https://d20dao.org/explorer", "https://d20dao.org/docs", "/status.json"]) {
     assert.ok(page.includes(`href="${href}"`), href);
   }
@@ -116,5 +126,51 @@ test("status endpoints: JSON, HTML, short edge cache, headers", async () => {
   const head = await call(new Request("https://watchdog.d20dao.org/", { method: "HEAD" }));
   assert.equal(head.status, 200);
   assert.equal((await call(new Request("https://watchdog.d20dao.org/", { method: "POST" }))).status, 405);
-  assert.equal((await call(new Request("https://watchdog.d20dao.org/favicon.ico"))).status, 404);
+  assert.equal((await call(new Request("https://watchdog.d20dao.org/robots.txt"))).status, 404);
+});
+
+test("page head: site-style title, description, canonical, social cards", async () => {
+  const { call } = setup();
+  const page = await (await call(new Request("https://watchdog.d20dao.org/"))).text();
+  const meta = (attr, key) => new RegExp(`<meta ${attr}="${key}" content="([^"]*)">`).exec(page)?.[1];
+  assert.match(page, /<html lang="en">/);
+  assert.match(page, /<title>Arc VRF status \| D20DAO<\/title>/);
+  const description = meta("name", "description");
+  assert.ok(description?.length > 20);
+  assert.equal(meta("name", "robots"), "index, follow");
+  assert.equal(meta("property", "og:title"), "Arc VRF status | D20DAO");
+  assert.equal(meta("property", "og:description"), description);
+  assert.equal(meta("property", "og:url"), "https://watchdog.d20dao.org");
+  assert.equal(meta("property", "og:site_name"), "D20DAO");
+  assert.equal(meta("property", "og:image"), "https://d20dao.org/opengraph-image.png");
+  assert.equal(meta("name", "twitter:card"), "summary_large_image");
+  assert.equal(meta("name", "twitter:site"), "@d20dao");
+  assert.equal(meta("name", "twitter:description"), description);
+  assert.equal(meta("name", "twitter:image"), "https://d20dao.org/opengraph-image.png");
+});
+
+test("serves the site's icons with their types and a long cache, without reading status", async () => {
+  const { call, counters } = setup();
+  for (const [path, icon] of Object.entries(ICONS)) {
+    const res = await call(new Request(`https://watchdog.d20dao.org${path}?v=${icon.v}`));
+    assert.equal(res.status, 200, path);
+    assert.equal(res.headers.get("content-type"), icon.type);
+    assert.equal(res.headers.get("cache-control"), "public, max-age=31536000, immutable");
+    assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+    const body = Buffer.from(await res.arrayBuffer());
+    // The version in the page's link is the content hash, so a changed icon always gets a new URL.
+    assert.ok(createHash("sha256").update(body).digest("hex").startsWith(icon.v), path);
+    // A second request returns the same bytes (the embedded body is never consumed).
+    assert.ok(Buffer.from(await (await call(new Request(`https://watchdog.d20dao.org${path}`))).arrayBuffer()).equals(body));
+
+    const head = await call(new Request(`https://watchdog.d20dao.org${path}`, { method: "HEAD" }));
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get("content-type"), icon.type);
+    assert.equal((await head.arrayBuffer()).byteLength, 0);
+    assert.equal((await call(new Request(`https://watchdog.d20dao.org${path}`, { method: "POST" }))).status, 405);
+  }
+  assert.match(ICONS["/icon.svg"].body, /^<svg /);
+  assert.deepEqual([...ICONS["/favicon.ico"].body.subarray(0, 4)], [0, 0, 1, 0]);
+  assert.deepEqual([...ICONS["/apple-touch-icon.png"].body.subarray(1, 4)], [0x50, 0x4e, 0x47]);
+  assert.equal(counters.status, 0);
 });

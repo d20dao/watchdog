@@ -255,7 +255,11 @@ It also returns `notifier` (`configured` or `not configured`) and the last 10 no
 
 ### `GET /`
 
-The same information as a small server-rendered HTML page, with backup keeper health under the backup balances, an Agent API section after each network whose agent API is watched (up or down, relayer balance, refunds owed, payments in doubt, breakers) and one row per AirnodeHub recipe (status, last probe, latency, reason and listing document). It uses the d20dao.org dark theme with inline CSS and the inline logo only, is readable on a phone and refreshes every 60 s.
+The same information as a small server-rendered HTML page, with backup keeper health under the backup balances, an Agent API section after each network whose agent API is watched (up or down, relayer balance, refunds owed, payments in doubt, breakers) and one row per AirnodeHub recipe (status, last probe, latency, reason and listing document). It uses the d20dao.org dark theme with inline CSS and the inline logo, no script, is readable on a phone and refreshes every 60 s. Its head carries the site's title pattern, description, canonical URL, Open Graph and X cards (with the d20dao.org share image) and the site's icons.
+
+### `GET /icon.svg`, `/favicon.ico`, `/apple-touch-icon.png`
+
+The d20dao.org icon set, embedded in the Worker (`src/icons.js`). The page links each one with `?v=` and a content hash, so they are served with a one-year immutable cache.
 
 ## Secrets
 

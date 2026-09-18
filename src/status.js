@@ -5,6 +5,7 @@ import { storedCalls } from "./agentapi.js";
 import { evaluateListingDocumentCheck, evaluateProbeCheck, isAgentApiCheck } from "./checks.js";
 import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, THRESHOLDS, watchedAgentApi } from "./config.js";
 import { formatDuration, formatGwei, formatUsdc, shortAddress } from "./format.js";
+import { ICONS } from "./icons.js";
 import { describeShape } from "./listings.js";
 import {
   readAgentApiState,
@@ -481,6 +482,40 @@ const BRAND_MARK =
   `<path d="M729.71 200.0 791.79 0.0H844.52L906.61 200.0H869.92L814.11 22.08H821.42L766.4 200.0ZM765.64 157.48V124.21H870.91V157.48Z"/>` +
   `<path d="M1015.95 204.17Q985.96 204.17 964.38 191.09Q942.79 178.01 931.2 154.54Q919.61 131.06 919.61 100.0Q919.61 68.94 931.2 45.46Q942.79 21.99 964.38 8.91Q985.96 -4.17 1015.95 -4.17Q1045.94 -4.17 1067.52 8.91Q1089.11 21.99 1100.7 45.46Q1112.29 68.94 1112.29 100.0Q1112.29 131.06 1100.7 154.54Q1089.11 178.01 1067.52 191.09Q1045.94 204.17 1015.95 204.17ZM1015.95 170.6Q1035.53 170.86 1048.55 162.1Q1061.56 153.34 1068.07 137.35Q1074.58 121.35 1074.58 100.0Q1074.58 78.65 1068.07 62.9Q1061.56 47.15 1048.55 38.4Q1035.53 29.65 1015.95 29.4Q996.37 29.14 983.36 37.89Q970.36 46.64 963.85 62.64Q957.34 78.65 957.32 100.0Q957.29 121.35 963.8 137.09Q970.31 152.84 983.34 161.59Q996.37 170.35 1015.95 170.6Z"/></g></svg>`;
 
+// Head metadata in the d20dao.org pattern (src/lib/site.ts in the web repo): "<page> | D20DAO" titles, the site's
+// share image and X handle, and its icon set (served by this Worker, see icons.js). Indexable, like the site.
+const PAGE_URL = "https://watchdog.d20dao.org";
+const TITLE = "Arc VRF status | D20DAO";
+const DESCRIPTION = "Live health of the D20DAO VRF keepers, agent API and AirnodeHub listings on Arc.";
+const SHARE_IMAGE = "https://d20dao.org/opengraph-image.png";
+const SHARE_IMAGE_ALT = "D20DAO logo — verifiable randomness.";
+const iconHref = (path) => `${path}?v=${ICONS[path].v}`;
+const HEAD_META = [
+  `<title>${TITLE}</title>`,
+  `<meta name="description" content="${DESCRIPTION}">`,
+  `<meta name="robots" content="index, follow">`,
+  `<link rel="canonical" href="${PAGE_URL}">`,
+  `<link rel="icon" href="${iconHref("/icon.svg")}" type="image/svg+xml" sizes="any">`,
+  `<link rel="icon" href="${iconHref("/favicon.ico")}" type="image/x-icon" sizes="48x48">`,
+  `<link rel="apple-touch-icon" href="${iconHref("/apple-touch-icon.png")}" type="image/png" sizes="180x180">`,
+  `<meta property="og:title" content="${TITLE}">`,
+  `<meta property="og:description" content="${DESCRIPTION}">`,
+  `<meta property="og:url" content="${PAGE_URL}">`,
+  `<meta property="og:site_name" content="D20DAO">`,
+  `<meta property="og:type" content="website">`,
+  `<meta property="og:locale" content="en_US">`,
+  `<meta property="og:image" content="${SHARE_IMAGE}">`,
+  `<meta property="og:image:width" content="1200">`,
+  `<meta property="og:image:height" content="630">`,
+  `<meta property="og:image:alt" content="${SHARE_IMAGE_ALT}">`,
+  `<meta name="twitter:card" content="summary_large_image">`,
+  `<meta name="twitter:site" content="@d20dao">`,
+  `<meta name="twitter:title" content="${TITLE}">`,
+  `<meta name="twitter:description" content="${DESCRIPTION}">`,
+  `<meta name="twitter:image" content="${SHARE_IMAGE}">`,
+  `<meta name="twitter:image:alt" content="${SHARE_IMAGE_ALT}">`,
+].join("\n");
+
 // Site tokens from d20dao.org (app/globals.css): muted text is white mixed 68% into black, hairlines are white at
 // 16% (strong 30%). Written out as plain colors so the page needs no color-mix() support.
 const STYLE = `
@@ -575,7 +610,7 @@ export function renderHtml(status) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <meta http-equiv="refresh" content="60">
-<title>D20DAO Watchdog</title>
+${HEAD_META}
 <style>${STYLE}</style>
 </head>
 <body>

@@ -1,6 +1,7 @@
 // HTTP routing for the Worker. Kept free of runtime-specific imports so it can be unit tested.
 
 import { LIMITS, NETWORKS } from "./config.js";
+import { ICONS } from "./icons.js";
 import { handleHealthPost } from "./report.js";
 import { renderHtml } from "./status.js";
 
@@ -37,8 +38,20 @@ export async function handleFetch(request, env, ctx, deps) {
     });
   }
 
-  if (url.pathname !== "/" && url.pathname !== "/status.json") return text(404, "not found\n");
+  const icon = Object.hasOwn(ICONS, url.pathname) ? ICONS[url.pathname] : null;
+  if (!icon && url.pathname !== "/" && url.pathname !== "/status.json") return text(404, "not found\n");
   if (request.method !== "GET" && request.method !== "HEAD") return text(405, "method not allowed\n", { allow: "GET, HEAD" });
+  if (icon) {
+    // Static bytes, linked from the page with a content hash, so browsers may keep them for a year.
+    return new Response(request.method === "HEAD" ? null : icon.body, {
+      headers: {
+        "content-type": icon.type,
+        "cache-control": "public, max-age=31536000, immutable",
+        "content-security-policy": "default-src 'none'",
+        ...COMMON_HEADERS,
+      },
+    });
+  }
 
   // Query strings are ignored so they cannot be used to bypass the short edge cache.
   const cacheKey = new Request(`${url.origin}${url.pathname}`, { method: "GET" });
@@ -59,7 +72,8 @@ export async function handleFetch(request, env, ctx, deps) {
           headers: {
             "content-type": "text/html; charset=utf-8",
             "cache-control": cacheControl,
-            "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            // img-src for the page's own icons: some browsers apply it to favicon loads.
+            "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
             ...COMMON_HEADERS,
           },
         });
