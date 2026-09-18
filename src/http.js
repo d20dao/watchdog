@@ -55,10 +55,10 @@ export async function handleFetch(request, env, ctx, deps) {
 
   // Query strings are ignored so they cannot be used to bypass the short edge cache.
   const cacheKey = new Request(`${url.origin}${url.pathname}`, { method: "GET" });
+  const cacheControl = `public, max-age=${LIMITS.statusCacheSeconds}`;
   let response = deps.cache ? await deps.cache.match(cacheKey) : undefined;
   if (!response) {
     const status = await deps.stub().getStatus();
-    const cacheControl = `public, max-age=${LIMITS.statusCacheSeconds}`;
     response = url.pathname === "/status.json"
       ? new Response(JSON.stringify(status, null, 2), {
           headers: {
@@ -79,6 +79,10 @@ export async function handleFetch(request, env, ctx, deps) {
         });
     if (deps.cache) ctx.waitUntil(deps.cache.put(cacheKey, response.clone()));
   }
-  if (request.method === "HEAD") return new Response(null, { status: response.status, headers: response.headers });
-  return response;
+  // The stored copy's max-age is the edge TTL. A hit comes back with Cache-Control raised to the zone's Browser Cache
+  // TTL (hours), which Cloudflare applies to any lower max-age; the Worker's own response is not rewritten, so
+  // browsers get the 15 s set here again, less the hit's Age.
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", cacheControl);
+  return new Response(request.method === "HEAD" ? null : response.body, { status: response.status, headers });
 }

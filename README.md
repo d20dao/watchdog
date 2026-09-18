@@ -251,7 +251,7 @@ Under `airnodehub` it returns, for each recipe: `status` (`ok`, `warning`, `alar
 `signedLagSeconds`, `nextProbeAt`, the expected data and `listingDocument` (`status`, `checkedAt`, `lastOutcome`,
 `reason`). It also returns the active `airnodehub` alerts.
 
-It also returns `notifier` (`configured` or `not configured`) and the last 10 notices. It never includes secrets, raw reports or report ids. Responses are edge-cached for 15 s, and query strings are ignored.
+It also returns `notifier` (`configured` or `not configured`) and the last 10 notices. It never includes secrets, raw reports or report ids. Responses are edge-cached for 15 s, and query strings are ignored. Browsers get `max-age=15` on a cache hit too: the Worker sets it again, because Cloudflare raises a hit's lower `max-age` to the zone's Browser Cache TTL.
 
 ### `GET /`
 

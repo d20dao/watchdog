@@ -14,7 +14,8 @@ const ENV = {
   HEALTH_KEY_ARC_MAINNET_BACKUP: "throwaway-mainnet-backup-key",
 };
 
-function setup() {
+/** @param opts.hit  optional (response) => response applied to every cache hit, as the zone does on the way out */
+function setup({ hit = (res) => res } = {}) {
   const storage = memoryStorage();
   const counters = { status: 0, ingest: 0, backup: 0 };
   const stub = {
@@ -33,7 +34,10 @@ function setup() {
   };
   const store = new Map();
   const cache = {
-    match: async (req) => store.get(req.url)?.clone(),
+    match: async (req) => {
+      const res = store.get(req.url)?.clone();
+      return res && hit(res);
+    },
     put: async (req, res) => void store.set(req.url, res),
   };
   const waits = [];
@@ -127,6 +131,35 @@ test("status endpoints: JSON, HTML, short edge cache, headers", async () => {
   assert.equal(head.status, 200);
   assert.equal((await call(new Request("https://watchdog.d20dao.org/", { method: "POST" }))).status, 405);
   assert.equal((await call(new Request("https://watchdog.d20dao.org/robots.txt"))).status, 404);
+});
+
+test("a cache hit never tells browsers to keep the status for the zone's browser TTL", async () => {
+  // Cloudflare returns Cache API hits with Cache-Control raised to the zone's Browser Cache TTL (4 h by default).
+  const { call, counters } = setup({
+    hit: (res) => {
+      const headers = new Headers(res.headers);
+      headers.set("cache-control", "public, max-age=14400");
+      headers.set("cf-cache-status", "HIT");
+      headers.set("age", "7");
+      return new Response(res.body, { status: res.status, headers });
+    },
+  });
+  for (const path of ["/", "/status.json"]) {
+    const miss = await call(new Request(`https://watchdog.d20dao.org${path}`));
+    assert.equal(miss.headers.get("cache-control"), "public, max-age=15");
+    const body = await miss.text();
+
+    const hit = await call(new Request(`https://watchdog.d20dao.org${path}`));
+    assert.equal(hit.headers.get("cf-cache-status"), "HIT");
+    assert.equal(hit.headers.get("cache-control"), "public, max-age=15", path);
+    assert.equal(hit.headers.get("age"), "7", "the hit's age still counts against the browser's 15 s");
+    assert.equal(await hit.text(), body);
+
+    const head = await call(new Request(`https://watchdog.d20dao.org${path}`, { method: "HEAD" }));
+    assert.equal(head.headers.get("cache-control"), "public, max-age=15");
+    assert.equal((await head.arrayBuffer()).byteLength, 0);
+  }
+  assert.equal(counters.status, 2, "one render per path; the rest were hits");
 });
 
 test("page head: site-style title, description, canonical, social cards", async () => {
