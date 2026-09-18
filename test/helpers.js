@@ -169,17 +169,20 @@ export function healthyRead(net = TESTNET, overrides = {}) {
 // ---------------------------------------------------------------------------------------------
 // AirnodeHub fixtures
 
-/** EpochEntropy.recipeRequest(recipe) literals, copied from contracts/EpochEntropy.sol (d20-keeper-mainnet). */
+/** EpochEntropy.recipeRequest(recipe) for the built-in recipes 0-5, as the Arc Mainnet and Testnet registries return them. */
 export const EPOCH_RECIPE_REQUESTS = Object.freeze([
   '["metaAndAssetCtxs",[["dex",""]],[["symbol","/0/universe/0/name"],["value","/1/0/dayNtlVlm"]]]',
   '["jsonRpc",[["method","eth_call"],["network","ethereum"],["params",[[["data","0x27e86d6e"],["to","0xcA11bde05977b3631167028862bE2a173976CA11"]],"latest"]]]]',
   '["lastTrade",[["assetClass","crypto"],["symbol","BTCUSD"]]]',
   '["lastTrade",[["assetClass","crypto"],["symbol","ETHUSD"]]]',
   '["latestFeeds",[["name","ETH/USD"]]]',
-  '["allMids",[],[["mid","/SOL"]]]',
   '["jsonRpc",[["method","eth_call"],["network","base"],["params",[[["data","0x27e86d6e"],["to","0xcA11bde05977b3631167028862bE2a173976CA11"]],"latest"]]]]',
-  '["latestFeeds",[["name","BTC/USD"]]]',
 ]);
+/** Listings with recipe files in the keeper repo that the registry does not build in; registering one appends a new id. */
+export const UNREGISTERED_RECIPE_REQUESTS = Object.freeze({
+  "hyperliquid-sol-mid": '["allMids",[],[["mid","/SOL"]]]',
+  "nodary-btc-usd": '["latestFeeds",[["name","BTC/USD"]]]',
+});
 
 /**
  * Real signed gateway replies, two per catalog recipe, collected 2026-09-17:

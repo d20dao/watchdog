@@ -220,7 +220,7 @@ export const AIRNODE_RECIPES = deepFreeze([
   {
     id: "drpc-base-blockhash",
     name: "dRPC Base block hash",
-    recipe: 6,
+    recipe: 5,
     url: "https://airnode-drpc.fly.dev/",
     body: {
       operation: "jsonRpc",

@@ -14,7 +14,7 @@ import {
   planProbeTasks,
   shapeMismatch,
 } from "../src/listings.js";
-import { EPOCH_RECIPE_REQUESTS, listingDocument, loadSamples } from "./helpers.js";
+import { EPOCH_RECIPE_REQUESTS, UNREGISTERED_RECIPE_REQUESTS, listingDocument, loadSamples } from "./helpers.js";
 
 const encoder = new TextEncoder();
 const byId = Object.fromEntries(AIRNODE_RECIPES.map((recipe) => [recipe.id, recipe]));
@@ -54,11 +54,12 @@ test("canonical requests of every sampled catalog recipe equal the registry lite
     "tickerlayer-btcusd": 2,
     "tickerlayer-ethusd": 3,
     "nodary-eth-usd": 4,
-    "hyperliquid-sol-mid": 5,
-    "drpc-base-blockhash": 6,
-    "nodary-btc-usd": 7,
+    "drpc-base-blockhash": 5,
   };
-  for (const sample of samples) assert.equal(canonicalRequest(sample.body), EPOCH_RECIPE_REQUESTS[recipeOf[sample.recipe]], sample.recipe);
+  for (const sample of samples) {
+    const expected = sample.recipe in recipeOf ? EPOCH_RECIPE_REQUESTS[recipeOf[sample.recipe]] : UNREGISTERED_RECIPE_REQUESTS[sample.recipe];
+    assert.equal(canonicalRequest(sample.body), expected, sample.recipe);
+  }
 });
 
 test("canonicalization sorts object keys at every depth, keeps array order, appends a projection", () => {
