@@ -1,6 +1,6 @@
 // Chain reader: at most three JSON-RPC batches per network per run.
-//   Round A (latest): chainId, head block, nextRequestId, committer, both implementation slots, the keeper balance
-//                     and the balance of each backup keeper wallet.
+//   Round A (latest): chainId, head block, nextRequestId, committer, both implementation slots, the keeper balance,
+//                     the balance of each backup keeper wallet and, when the agent API is watched, its relayer's.
 //   Round B (pinned to head): getPendingRequestIds window + coordinator logs since the stored cursor.
 //   Round C (pinned to head, only when something is pending): getRequest for the smallest ids.
 // Endpoints are tried in configured order; after a failure the run sticks to the next endpoint.
@@ -18,7 +18,7 @@ import {
   hexToSafeNumber,
   toQuantity,
 } from "./abi.js";
-import { IMPLEMENTATION_SLOT, LIMITS, SELECTORS, TOPICS } from "./config.js";
+import { IMPLEMENTATION_SLOT, LIMITS, SELECTORS, TOPICS, watchedAgentApi } from "./config.js";
 import { FetchTimeoutError, fetchText } from "./net.js";
 
 export class RpcSession {
@@ -130,11 +130,12 @@ const sameAddress = (a, b) => typeof a === "string" && typeof b === "string" && 
  * Result always has {ok, complete, rpc, error, errors, subrequests}; figures are null when unknown.
  * `pending` is null when unknown; `logs` is null when unknown or not scanned.
  * `backupBalances` is [{address, balanceWei}] in configured order (balanceWei null when unknown), or null when
- * round A failed.
+ * round A failed. `agentRelayerBalanceWei` is the agent API relayer's balance, null when unknown or not watched.
  */
 export async function readChain(net, cursor, { fetch, timeoutMs } = {}) {
   const session = new RpcSession(net.rpcs, { fetch, timeoutMs });
   const backups = net.backupKeepers ?? [];
+  const relayer = watchedAgentApi(net)?.relayer ?? null;
   const errors = [];
   const out = {
     ok: false,
@@ -150,6 +151,7 @@ export async function readChain(net, cursor, { fetch, timeoutMs } = {}) {
     registryImpl: null,
     balanceWei: null,
     backupBalances: null,
+    agentRelayerBalanceWei: null,
     pending: null,
     logs: null,
     logCursor: cursor?.logCursor ?? null,
@@ -161,7 +163,7 @@ export async function readChain(net, cursor, { fetch, timeoutMs } = {}) {
     return out;
   };
 
-  // Round A. Backup keeper balances ride in the same batch, so they cost no extra fetch.
+  // Round A. Backup keeper and agent API relayer balances ride in the same batch, so they cost no extra fetch.
   const roundA = [
     ["eth_chainId", []],
     ["eth_getBlockByNumber", ["latest", false]],
@@ -173,6 +175,8 @@ export async function readChain(net, cursor, { fetch, timeoutMs } = {}) {
   ];
   const backupIndex = roundA.length;
   for (const wallet of backups) roundA.push(["eth_getBalance", [wallet, "latest"]]);
+  const relayerIndex = roundA.length;
+  if (relayer) roundA.push(["eth_getBalance", [relayer, "latest"]]);
   const a = await session.batch(
     roundA,
     (items) => {
@@ -201,6 +205,7 @@ export async function readChain(net, cursor, { fetch, timeoutMs } = {}) {
     address,
     balanceWei: pick(a[backupIndex + i], hexToBigInt, errors, `backup balance ${address}`),
   }));
+  if (relayer) out.agentRelayerBalanceWei = pick(a[relayerIndex], hexToBigInt, errors, "agent API relayer balance");
   if (out.block.baseFeeWei == null) errors.push("block: no baseFeePerGas");
 
   const head = out.block.number;

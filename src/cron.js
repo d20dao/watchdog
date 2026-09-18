@@ -1,8 +1,11 @@
-// One watchdog run: read both chains and run any due AirnodeHub listing probes (network I/O, no storage held),
-// then evaluate and commit every state change in one synchronous transaction, then deliver queued Telegram messages.
+// One watchdog run: read both chains, poll each watched x402 agent API and run any due AirnodeHub listing probes
+// (network I/O, no storage held), then evaluate and commit every state change in one synchronous transaction, then
+// deliver queued Telegram messages.
 
+import { applyAgentApiPoll, readAgentApi } from "./agentapi.js";
 import { alertKey, transition } from "./alerts.js";
 import {
+  evaluateAgentApiChecks,
   evaluateBackupReportChecks,
   evaluateChainChecks,
   evaluateListingDocumentCheck,
@@ -13,7 +16,7 @@ import {
   networkCheckNames,
   probeCheckName,
 } from "./checks.js";
-import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS } from "./config.js";
+import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, watchedAgentApi } from "./config.js";
 import { applyDocumentResult, applyProbeResult, failedTaskResult, planProbeTasks } from "./listings.js";
 import { readChain } from "./rpc.js";
 import {
@@ -25,12 +28,14 @@ import {
   pendingMessages,
   pruneMessages,
   pruneReports,
+  readAgentApiState,
   readAlerts,
   readBackupReportState,
   readChainState,
   readProbeStates,
   readReportState,
   saveAlert,
+  writeAgentApiState,
   writeChainState,
   writeProbeState,
 } from "./store.js";
@@ -56,6 +61,7 @@ export async function runCron({
   fetch,
   clock = () => Date.now(),
   readChainImpl = readChain,
+  readAgentApiImpl = readAgentApi,
   networks: nets = NETWORKS,
   recipes = AIRNODE_RECIPES,
   loadProbes = loadProbeModule,
@@ -67,13 +73,24 @@ export async function runCron({
   });
   const tasks = planProbeTasks(recipes, readProbeStates(storage), Math.floor(clock() / 1000));
 
-  const [reads, probeResults] = await Promise.all([
+  const [reads, polls, probeResults] = await Promise.all([
     Promise.all(
       names.map(async (name, i) => {
         try {
           return await readChainImpl(nets[name], cursors[i], { fetch });
         } catch {
           return { ok: false, complete: false, error: "internal error", errors: [], subrequests: 0 };
+        }
+      }),
+    ),
+    // One /health GET per watched agent API; null for a network whose agent API is not watched.
+    Promise.all(
+      names.map(async (name) => {
+        if (!watchedAgentApi(nets[name])) return null;
+        try {
+          return await readAgentApiImpl(nets[name], { fetch, clock });
+        } catch {
+          return { ok: false, httpStatus: null, latencyMs: null, reason: "internal error" };
         }
       }),
     ),
@@ -91,11 +108,17 @@ export async function runCron({
       const read = reads[i];
       const failures = writeChainState(storage, name, now, read, readChainState(storage, name));
       const report = readReportState(storage, name);
+      let agentApi = null;
+      if (polls[i]) {
+        agentApi = applyAgentApiPoll(readAgentApiState(storage, name), polls[i], now);
+        writeAgentApiState(storage, name, now, agentApi);
+      }
       const conditions = {
         ...evaluateReportChecks(net, report, now),
         ...evaluateBackupReportChecks(net, readBackupReportState(storage, name), now),
         ...evaluateChainChecks(net, read),
         rpc: evaluateRpcCheck(failures, read.error),
+        ...evaluateAgentApiChecks(net, agentApi, read),
       };
       const existing = new Map(readAlerts(storage, name).map((row) => [row.check, row]));
       const checks = networkCheckNames(net);
@@ -126,6 +149,16 @@ export async function runCron({
         pending: read.pending ? read.pending.count : null,
         oldestPendingAge: read.pending?.oldest?.ageSeconds ?? null,
         logs: read.logs ? { from: read.logs.fromBlock, to: read.logs.toBlock, refunds: read.logs.refunds.length, foreign: read.logs.foreignFulfillments.length } : null,
+        agentApi: agentApi
+          ? {
+              reachable: agentApi.reachable,
+              ok: agentApi.reachable ? agentApi.health.ok : null,
+              httpStatus: agentApi.httpStatus,
+              reason: agentApi.reason,
+              latencyMs: agentApi.latencyMs,
+              relayerBalanceWei: read.agentRelayerBalanceWei == null ? null : read.agentRelayerBalanceWei.toString(),
+            }
+          : null,
         activeAlerts: checks.filter((check) => conditions[check] || (conditions[check] === undefined && existing.has(check))),
         messages,
       };
@@ -173,8 +206,8 @@ export async function runCron({
     messagesQueued: outcome.enqueued,
     messagesDelivered: delivered,
     deliveryError,
-    // Each probe task is exactly one fetch.
-    subrequests: chainSubrequests + tasks.length + telegramSubrequests,
+    // Each probe task and each agent API poll is exactly one fetch.
+    subrequests: chainSubrequests + polls.filter(Boolean).length + tasks.length + telegramSubrequests,
   };
 }
 

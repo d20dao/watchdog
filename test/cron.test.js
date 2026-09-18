@@ -13,7 +13,8 @@ import {
   recentMessages,
 } from "../src/store.js";
 import { groupMessages } from "../src/telegram.js";
-import { MAINNET, TESTNET, healthyRead, memoryStorage, pageText } from "./helpers.js";
+import { readAgentApi } from "../src/agentapi.js";
+import { MAINNET, TESTNET, agentApiBody, agentApiPoll, healthyRead, memoryStorage, pageText } from "./helpers.js";
 
 const T0 = 1789420000;
 const USDC = 10n ** 18n;
@@ -47,6 +48,8 @@ function harness(env = TELEGRAM) {
   const state = {
     clock: T0,
     reads: { "arc-mainnet": healthyRead(MAINNET), "arc-testnet": healthyRead(TESTNET) },
+    polls: {}, // agent API /health results per network; a healthy reply unless a test sets one
+    polled: [],
     telegram: [],
     telegramStatus: 200,
     networks: undefined, // the real configuration unless a test sets its own
@@ -64,6 +67,12 @@ function harness(env = TELEGRAM) {
       fetch,
       clock: () => state.clock * 1000,
       readChainImpl: async (net, cursor) => ({ ...state.reads[net.name], cursorSeen: cursor }),
+      readAgentApiImpl: async (net) => {
+        state.polled.push(net.name);
+        const poll = state.polls[net.name] ?? agentApiPoll();
+        if (poll instanceof Error) throw poll;
+        return poll;
+      },
       networks: state.networks,
       recipes: [], // AirnodeHub probes are covered in probe.test.js
     });
@@ -300,10 +309,12 @@ test("migrate adds the backup balance column to an existing chain_state table in
   migrate(storage); // idempotent
   const columns = storage.db.prepare("PRAGMA table_info(chain_state)").all().map((c) => c.name);
   assert.equal(columns.filter((name) => name === "backup_balances_json").length, 1);
+  assert.equal(columns.filter((name) => name === "agent_relayer_balance_wei").length, 1);
   const kept = readChainState(storage, "arc-mainnet");
   assert.equal(kept.balanceWei, "7");
   assert.equal(kept.logCursor, 42);
   assert.deepEqual(kept.backupBalances, {});
+  assert.equal(kept.agentRelayerBalanceWei, null);
 });
 
 /** Store a report on the backup (follower) stream, observed and received at `at`. */
@@ -566,4 +577,145 @@ test("sendTelegram never exposes the token in its result", async () => {
   const result = await sendTelegram(TELEGRAM, "hello", { fetch: failing });
   assert.deepEqual(result, { ok: false, error: "network error" });
   assert.ok(!JSON.stringify(result).includes("throwaway-token"));
+});
+
+// ---------------------------------------------------------------------------------------------
+// x402 agent API
+
+const TESTNET_RELAYER = TESTNET.agentApi.relayer;
+const API_COUNTS = agentApiBody().counts;
+
+test("agent API down: nothing on one failed poll, warning after 2, alarm after 5, resolved when it answers", async () => {
+  const h = harness();
+  await h.run(0);
+  assert.deepEqual(h.state.polled, ["arc-testnet"], "only the watched agent API is polled");
+  h.state.polls["arc-testnet"] = { ok: false, httpStatus: 522, latencyMs: 10, reason: "http 522" };
+  await h.run(1);
+  assert.equal(h.state.telegram.length, 0);
+  for (let minute = 2; minute <= 4; minute++) await h.run(minute);
+  h.state.polls["arc-testnet"] = new Error("boom"); // a poll that throws counts as failed too
+  await h.run(5);
+  delete h.state.polls["arc-testnet"];
+  await h.run(6);
+  assert.deepEqual(h.state.telegram.map((m) => m.text), [
+    "[arc-testnet] WARNING agent API unreachable: https://api-testnet.d20dao.org/health failed 2 polls in a row (last: http 522)",
+    "[arc-testnet] ALARM agent API unreachable: https://api-testnet.d20dao.org/health failed 5 polls in a row (last: internal error)",
+    "[arc-testnet] RESOLVED agent API unreachable after 4 min",
+  ]);
+  assert.ok(h.state.telegram.every((m) => m.chat_id === TELEGRAM.TELEGRAM_CHAT_ID));
+  assert.equal(readAlerts(h.storage, "arc-testnet").length, 0);
+});
+
+test("a refund owed alarms with what to do, stays put while the API is down, and resolves once handled", async () => {
+  const h = harness();
+  h.state.polls["arc-testnet"] = agentApiPoll({ ok: false, counts: { ...API_COUNTS, refundDue: 1 } });
+  await h.run(0);
+  assert.deepEqual(h.state.telegram.map((m) => m.text), [
+    "[arc-testnet] ALARM agent API refund owed: 1 paid call could not be served and its payer is owed a refund. " +
+      "Refund each payer by hand, then mark it handled in the agent API's operator refund list; this clears when none is left",
+  ]);
+  h.state.polls["arc-testnet"] = { ok: false, httpStatus: null, latencyMs: 10000, reason: "timeout" };
+  await h.run(1);
+  assert.equal(h.state.telegram.length, 1, "unknown while the API is down: no repeat, no resolution");
+  assert.deepEqual(readAlerts(h.storage, "arc-testnet").map((a) => a.check), ["agent_api_refund_due"]);
+  h.state.polls["arc-testnet"] = agentApiPoll({ counts: { ...API_COUNTS, refundHandled: 1 } });
+  await h.run(2);
+  assert.equal(h.state.telegram.at(-1).text, "[arc-testnet] RESOLVED agent API refund owed after 2 min");
+});
+
+test("the relayer balance is read on chain: one warning while low, even with the API down; resolved when topped up", async () => {
+  const h = harness();
+  h.state.reads["arc-testnet"] = healthyRead(TESTNET, { agentRelayerBalanceWei: 388995233348750000n });
+  h.state.polls["arc-testnet"] = { ok: false, httpStatus: null, latencyMs: 10, reason: "network error" };
+  await h.run(0);
+  delete h.state.polls["arc-testnet"];
+  for (let minute = 1; minute < 40; minute++) await h.run(minute);
+  assert.deepEqual(h.state.telegram.map((m) => m.text), [
+    `[arc-testnet] WARNING agent API relayer balance low: relayer ${TESTNET_RELAYER} holds 0.388995 USDC (warning below 1, alarm below 0.36); top it up before sales stop at 3 calls' cost`,
+  ]);
+  assert.equal(readChainState(h.storage, "arc-testnet").agentRelayerBalanceWei, "388995233348750000");
+  // A failed chain read keeps the stored balance and the alert.
+  h.state.reads["arc-testnet"] = { ok: false, complete: false, error: "timeout", errors: [], subrequests: 2 };
+  await h.run(40);
+  assert.equal(readChainState(h.storage, "arc-testnet").agentRelayerBalanceWei, "388995233348750000");
+  h.state.reads["arc-testnet"] = healthyRead(TESTNET, { agentRelayerBalanceWei: 5n * USDC });
+  await h.run(41);
+  assert.equal(h.state.telegram.at(-1).text, "[arc-testnet] RESOLVED agent API relayer balance low after 41 min");
+});
+
+test("mainnet's agent API is off: not polled, not read, no checks, no section; the enabled flag turns it on", async () => {
+  const h = harness();
+  const summary = await h.run(0);
+  assert.equal(summary.networks["arc-mainnet"].agentApi, null);
+  assert.equal(summary.networks["arc-testnet"].agentApi.reachable, true);
+  assert.equal(summary.subrequests, 2 + 2 + 1, "two chain batches per network and one /health poll");
+  let status = buildStatus(h.storage, TELEGRAM, T0 + 5);
+  assert.deepEqual(status.networks["arc-mainnet"].agentApi, { enabled: false });
+  assert.ok(!pageText(renderHtml(status)).includes("Agent API · arc-mainnet"));
+
+  const live = { ...MAINNET, agentApi: { ...MAINNET.agentApi, enabled: true } };
+  h.state.networks = { "arc-mainnet": live, "arc-testnet": TESTNET };
+  h.state.reads["arc-mainnet"] = healthyRead(live, { agentRelayerBalanceWei: 3n * USDC });
+  await h.run(1);
+  assert.deepEqual(h.state.polled, ["arc-testnet", "arc-mainnet", "arc-testnet"]);
+  assert.deepEqual(h.state.telegram.map((m) => m.text), [
+    "[arc-mainnet] WARNING agent API relayer balance low: relayer 0x8B465645ed88F6d487d279003aD3681e7aF8e8B7 holds 3 USDC (warning below 4, alarm below 1); top it up before sales stop at 3 calls' cost",
+  ]);
+  status = buildStatus(h.storage, TELEGRAM, T0 + 65, [], h.state.networks);
+  assert.equal(status.networks["arc-mainnet"].agentApi.url, "https://api.d20dao.org");
+  assert.ok(pageText(renderHtml(status)).includes("Agent API · arc-mainnet"));
+
+  // Switched off again: its alerts resolve and it is no longer polled.
+  h.state.networks = { "arc-mainnet": MAINNET, "arc-testnet": TESTNET };
+  await h.run(2);
+  assert.equal(h.state.telegram.at(-1).text, "[arc-mainnet] RESOLVED agent API relayer balance low after 1 min");
+  assert.deepEqual(h.state.polled.slice(3), ["arc-testnet"]);
+});
+
+test("status JSON and HTML: the Agent API section shows the figures and its own alerts, never payers or payment ids", async () => {
+  const h = harness();
+  const body = agentApiBody({
+    ok: false,
+    counts: { ...API_COUNTS, refundDue: 2, refundHandled: 1 },
+    inDoubt: { count: 1, overdue: 0, oldestSeconds: 90 },
+    breaker: { state: "open", failures: 3, attempts: 3, openForSeconds: 42 },
+    payer: "0x1234567890abcdef1234567890abcdef12345678",
+    refunds: [{ paymentId: "0x" + "ab".repeat(32), payer: "0x1234567890abcdef1234567890abcdef12345678" }],
+  });
+  h.state.polls["arc-testnet"] = await readAgentApi(TESTNET, { fetch: async () => new Response(JSON.stringify(body), { status: 503 }) });
+  h.state.reads["arc-testnet"] = healthyRead(TESTNET, { agentRelayerBalanceWei: 388995233348750000n });
+  await h.run(0);
+  const status = buildStatus(h.storage, TELEGRAM, T0 + 5);
+  const a = status.networks["arc-testnet"].agentApi;
+  assert.equal(a.status, "not ok");
+  assert.equal(a.httpStatus, 503);
+  assert.equal(a.relayerBalanceUsdc, "0.388995");
+  assert.equal(a.relayerWarnBelowUsdc, "1");
+  assert.equal(a.relayerAlarmBelowUsdc, "0.36");
+  assert.equal(a.health.refundsOwed, 2);
+  assert.equal(a.health.refundsHandled, 1);
+  assert.deepEqual(a.alerts.map((x) => x.check).sort(), ["agent_api_breaker", "agent_api_refund_due", "agent_api_relayer_balance"]);
+  assert.ok(!status.networks["arc-testnet"].alerts.some((x) => x.check.startsWith("agent_api")), "listed under agentApi only");
+  const json = JSON.stringify(status);
+  assert.ok(!json.includes("0x1234") && !json.includes("abab"), "no payer or payment id");
+
+  const html = renderHtml(status);
+  assert.ok(!html.includes("0x1234") && !html.includes("abab"));
+  const text = pageText(html);
+  assert.ok(text.includes("Agent API · arc-testnet ALARM"));
+  assert.match(text, /API Not OK checked 5s ago/);
+  assert.ok(text.includes("Relayer balance 0.388995 USDC warning below 1 · alarm below 0.36"));
+  assert.ok(text.includes("Refunds owed 2 1 handled"));
+  assert.ok(text.includes("In-doubt payments 1 oldest 1m 30s"));
+  assert.ok(text.includes("Reports ok no Relayer funded yes Sender ok Settlement breaker open, 42s left Delivery breaker closed"));
+  assert.ok(text.includes("Wallet 0xF6b4…05C3 Calls in progress 0 Relayer alarm 1m 59s ago"));
+  assert.match(html, /<p class="pill alarm">/);
+});
+
+test("migrate creates the agent API state table on an existing database", () => {
+  const storage = memoryStorage();
+  storage.db.exec("DROP TABLE agent_api_state");
+  migrate(storage);
+  const tables = storage.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((t) => t.name);
+  assert.ok(tables.includes("agent_api_state"));
 });

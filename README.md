@@ -7,8 +7,9 @@ This Worker runs on Cloudflare instead. It:
 
 1. receives each keeper's outbound health reports (`POST /v1/health/<network>`), and its backup's (`POST /v1/health/<network>/backup`),
 2. reads both chains every minute,
-3. probes the AirnodeHub listings the epoch registry depends on, once an hour each,
-4. posts to the operator Telegram chat with its own bot token.
+3. polls the public `/health` of the x402 agent API every minute, on each network where it is enabled,
+4. probes the AirnodeHub listings the epoch registry depends on, once an hour each,
+5. posts to the operator Telegram chat with its own bot token.
 
 ```
 keeper (arc-mainnet) ──POST /v1/health/arc-mainnet─────────┐
@@ -18,7 +19,8 @@ backup (arc-testnet) ──POST /v1/health/arc-testnet/backup──┤
                                                            ▼
            Worker (validation, auth)  ──RPC──►  Durable Object "Watchdog" (SQLite)
            cron * * * * *            ──RPC──►    ├─ JSON-RPC batches to Arc (Blockdaemon, then public)
-           GET / and /status.json    ──RPC──►    ├─ AirnodeHub listing probes (signed POST, OpenAPI GET)
+           GET / and /status.json    ──RPC──►    ├─ GET /health of the x402 agent API
+                                                 ├─ AirnodeHub listing probes (signed POST, OpenAPI GET)
                                                  ├─ threshold checks and alert lifecycle
                                                  └─ Telegram sendMessage
 ```
@@ -56,7 +58,7 @@ Backup checks apply only to networks with `backupKeepers`. A backup that has nev
 
 Chain reading, per network per run:
 
-* **Round A** (one batch, `latest`): `eth_chainId`, head block (number, timestamp, `baseFeePerGas`), `nextRequestId()`, `committer()`, both implementation slots, the keeper balance and the balance of each backup keeper wallet.
+* **Round A** (one batch, `latest`): `eth_chainId`, head block (number, timestamp, `baseFeePerGas`), `nextRequestId()`, `committer()`, both implementation slots, the keeper balance, the balance of each backup keeper wallet and, where the agent API is enabled, its relayer's balance.
 * **Round B** (one batch, pinned to the head block): `getPendingRequestIds(max(1, next − 256), 256)` and one `eth_getLogs` for both event topics, from the stored cursor + 1 to the head. Each scan covers at most 5,000 blocks (about 42 min at Arc's 0.5 s blocks), and a backlog catches up over later runs. On the first run the cursor starts at the head, with no backfill. If the log query fails, the cursor stays where it is and the next span is halved (never below 250 blocks).
 * **Round C** (one batch, only when something is pending): `getRequest` for up to the 3 smallest pending ids.
 
@@ -66,6 +68,43 @@ Known scan limits:
 
 * `getPendingRequestIds` only sees the last 256 request ids and excludes expired requests, so a request that expired unserved shows up through `refund` (and the keeper's `expired` events) rather than `pending`.
 * Keeper report retries keep their original `observedAt`. `health_age` is measured on the keeper clock, so a delivery gap raises `heartbeat` only, not both.
+
+## x402 agent API
+
+The agent API sells random numbers to AI agents over x402. Each network's `agentApi` block in `src/config.js` holds
+its `url`, its relayer wallet and an `enabled` flag:
+
+| Network | API | Relayer | Watched |
+| --- | --- | --- | --- |
+| `arc-testnet` | `https://api-testnet.d20dao.org` | `0xF6b446dC2F30e6A802DFB7bD4c222d84F6cd05C3` | yes |
+| `arc-mainnet` | `https://api.d20dao.org` | `0x8B465645ed88F6d487d279003aD3681e7aF8e8B7` | no: set `enabled: true` to watch it |
+
+While `enabled` is false, the network's agent API is neither polled nor read on chain, raises no alerts and has no status
+section. Setting it back to false resolves its open alerts on the next run.
+
+On each watched network, every run does one `GET <url>/health` (no credentials; 10 s timeout, 16 KiB limit). A reply
+counts when it is JSON with a boolean `ok` and names this network, whether its status is 200 or 503. Only a fixed set of
+figures is kept from it: states, counts, ages, the relayer's balance and whether the reported relayer is the configured
+one. Nothing else in the reply is stored, logged or shown. The relayer's balance is also read on chain by the watchdog
+itself, in round A, so the balance check keeps working while the API is down.
+
+The checks use the network's scope, so they go to its Telegram group like its other alerts:
+
+| Check (key) | Warning | Alarm |
+| --- | --- | --- |
+| `agent_api`: `/health` failed in a row (unreachable, timed out, an HTTP error without a health reply, not JSON) | 2 polls | 5 polls |
+| `agent_api` also alarms when `/health` names a different relayer, or reports `ok: false` that no check below explains | — | alarm |
+| `agent_api_relayer_balance`: relayer native USDC, read on chain (`agentApiRelayerWarnWei`, `agentApiRelayerAlarmWei`) | mainnet < 4, testnet < 1 USDC | mainnet < 1, testnet < 0.36 USDC |
+| `agent_api_funded`: `relayer.funded` is false; the API has stopped selling | — | alarm |
+| `agent_api_stuck`: `stuck` is true; the API refuses new calls | — | alarm |
+| `agent_api_breaker`: the settlement breaker (closes by itself a minute later) or the delivery breaker (paid calls not served) is open | settlement | delivery |
+| `agent_api_refund_due`: `counts.refundDue` > 0, paid calls whose payers are owed a refund by hand; clears once they are marked handled | — | alarm |
+| `agent_api_in_doubt`: `inDoubt.overdue` > 0, settlements Gateway has confirmed neither way past the API's limit | — | alarm |
+| `agent_api_alarm_loop`: the relayer's alarm last ran ≥ 30 min ago while it stores calls. It runs at least every 10 min while any are stored and stops when none are, so an idle relayer never raises it | — | alarm |
+
+After a failed poll the figures from `/health` are unknown: their alerts are neither resolved nor repeated until a poll
+succeeds again. The API stops selling by itself once its relayer holds less than 3 calls' cost (about 0.04 USDC a call on
+mainnet, 0.09 on testnet). The balance thresholds, one value per network in `THRESHOLDS`, warn well before that.
 
 ## AirnodeHub listing probes
 
@@ -198,7 +237,13 @@ For each network, this returns:
 * the same for the backup under `backupReport`, plus its `role` (`{"everReported": false}` until it reports),
 * the configured `backupKeepers`,
 * the last chain check time and figures: block, pending count, oldest pending age, keeper balance in USDC (`keeperBalanceUsdc`) and each backup keeper's balance (`backupKeeperBalances`: `[{address, balanceUsdc}]`, `null` until read), base fee and fee-cap usage, wiring checks, log cursor,
-* active alerts with severity and `since`.
+* active alerts with severity and `since`,
+* under `agentApi`, `{"enabled": false}` when the network's agent API is not watched, otherwise: `status` (`ok`, `not ok`,
+  `unreachable` or `not checked`), the last poll's time, HTTP status, latency and failure reason, `consecutiveFailures`,
+  `lastOkAt`, the relayer balance read on chain (`relayerBalanceUsdc`) with its thresholds, the kept `/health` figures of
+  the last successful poll under `health` (ok, funded, stuck, both breakers, calls in progress and stored, refunds owed
+  and handled, payments in doubt, last relayer alarm) and the agent API's own alerts, which are not repeated in the
+  network's `alerts`.
 
 Under `airnodehub` it returns, for each recipe: `status` (`ok`, `warning`, `alarm` or `not probed`), `lastProbeAt`,
 `lastProbeAgeSeconds`, `latencyMs`, `lastOutcome` (`ok`, `failure`, `request_hash`, `signer`, `data_shape` or
@@ -210,7 +255,7 @@ It also returns `notifier` (`configured` or `not configured`) and the last 10 no
 
 ### `GET /`
 
-The same information as a small server-rendered HTML page, with backup keeper health under the backup balances and one row per AirnodeHub recipe (status, last probe, latency, reason and listing document). It uses the d20dao.org dark theme with inline CSS and the inline logo only, is readable on a phone and refreshes every 60 s.
+The same information as a small server-rendered HTML page, with backup keeper health under the backup balances, an Agent API section after each network whose agent API is watched (up or down, relayer balance, refunds owed, payments in doubt, breakers) and one row per AirnodeHub recipe (status, last probe, latency, reason and listing document). It uses the d20dao.org dark theme with inline CSS and the inline logo only, is readable on a phone and refreshes every 60 s.
 
 ## Secrets
 
@@ -285,7 +330,8 @@ Layout:
 | `src/http.js` | routing, status caching and security headers |
 | `src/report.js` | report auth, bounded body read, envelope validation |
 | `src/watchdog.js` | the Durable Object: `ingestReport`, `runCron`, `getStatus` |
-| `src/cron.js` | one run: read chains, evaluate, commit, deliver |
+| `src/cron.js` | one run: read chains, poll agent APIs, evaluate, commit, deliver |
+| `src/agentapi.js` | x402 agent API `/health` poll, the figures kept from it, poll state |
 | `src/rpc.js`, `src/abi.js`, `src/net.js` | JSON-RPC batches with fallback, hand-rolled ABI, timed fetch |
 | `src/checks.js`, `src/alerts.js` | pure threshold evaluation and alert lifecycle |
 | `src/listings.js` | AirnodeHub canonical requests, data shapes, probe schedule and state, listing document check (pure, no dependencies) |
@@ -304,7 +350,7 @@ npx wrangler deploy
 
 The first deploy creates the `Watchdog` SQLite Durable Object class (migration `v1`), the custom domain `watchdog.d20dao.org` and the `* * * * *` cron trigger. `workers_dev` and preview URLs are disabled.
 
-Schema changes are applied in place when the object starts (`migrate` in `src/store.js`). Missing tables are created, and columns added since the first deploy are added when missing (for example `chain_state.backup_balances_json` and `report_state.role`). Stored rows are kept, and no new migration tag is needed.
+Schema changes are applied in place when the object starts (`migrate` in `src/store.js`). Missing tables are created (for example `agent_api_state`), and columns added since the first deploy are added when missing (for example `chain_state.backup_balances_json`, `chain_state.agent_relayer_balance_wei` and `report_state.role`). Stored rows are kept, and no new migration tag is needed.
 
 The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an `exports` field for Durable Object classes. The two are mutually exclusive, and moving a deployed Worker to `exports` cannot be reverted.
 
@@ -314,11 +360,11 @@ The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an 
 | --- | --- |
 | Worker CPU 10 ms per invocation | The Worker only routes: report validation plus hashing measured ~0.1–0.4 ms (up to ~1.7 ms on a cold isolate) for 0.5–61 KB reports. The cron handler just calls the Durable Object. The signature code is never evaluated here. Loading the whole 204 KB bundle (parse plus top-level evaluation, Node 24) went from 3.3 ms to 5.9 ms with the probe; this is isolate startup, not per-request work. |
 | Durable Object CPU (30 s per request) | A full run for both networks with replayed live RPC responses measured ~0.4 ms warm and ~1.6 ms cold. A worst-case 5,000-block scan returning 1,000 logs measured ~3.5–5 ms. One AirnodeHub probe (reply parse, request hash, secp256k1 recovery, shape) measured 1.1–2 ms warm. The first probe after the object starts adds ~11 ms of module evaluation and ~7 ms of first verification. A run with all five probes due measured ~9 ms warm and ~39 ms cold; a run with none due adds ~0.06 ms. Parsing and checking the 60 KB Hyperliquid listing document takes ~0.1 ms. |
-| Subrequests 50 per invocation | 2 batches per network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper balances are extra calls inside the round A batch, so they add no fetches. AirnodeHub adds ≤ 5 per run (5 at the first run, then 1 in each of 5 runs an hour, plus retries and 4 document reads a day), so ≤ 20 in total. |
+| Subrequests 50 per invocation | 2 batches per network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper and agent API relayer balances are extra calls inside the round A batch, so they add no fetches. Each watched agent API adds 1 `/health` poll. AirnodeHub adds ≤ 5 per run (5 at the first run, then 1 in each of 5 runs an hour, plus retries and 4 document reads a day), so ≤ 22 in total. |
 | DO requests 100,000/day | 2 networks × 2 keepers (primary and backup) × 2,880 reports + 1,440 cron runs ≈ 13,000/day, plus status views (edge-cached 15 s). |
-| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. AirnodeHub probe state is 1 row per probe or document read, ≈ 130/day (more while a listing is retried every 10 min). Alerts and messages only change on transitions. Total ≈ 61,000/day. |
+| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. AirnodeHub probe state is 1 row per probe or document read, ≈ 130/day (more while a listing is retried every 10 min). Agent API poll state is 1 row per watched network per run, ≈ 1,440/day each. Alerts and messages only change on transitions. Total ≈ 64,000/day with both agent APIs watched. |
 | DO rows read 5,000,000/day | Point lookups plus a few rows per run; probe state and AirnodeHub alerts add about 11 per run (≈ 16,000/day). Well under 100,000/day. |
-| DO duration 13,000 GB-s/day | Billed only while handling a request (RPC wait included): about 1 s × 1,440 runs + ~20 ms × 11,520 reports at 128 MB ≈ 220 GB-s/day. AirnodeHub probes wait alongside the chain reads: 0.1–9 s each (fly.dev cold starts), at most 15 s, so ≤ 120 × 15 s × 0.128 GB ≈ 230 GB-s/day more in the worst case. Timers are cleared so the object can hibernate. |
+| DO duration 13,000 GB-s/day | Billed only while handling a request (RPC wait included): about 1 s × 1,440 runs + ~20 ms × 11,520 reports at 128 MB ≈ 220 GB-s/day. AirnodeHub probes wait alongside the chain reads: 0.1–9 s each (fly.dev cold starts), at most 15 s, so ≤ 120 × 15 s × 0.128 GB ≈ 230 GB-s/day more in the worst case. Agent API polls also wait alongside the chain reads and are bounded by their 10 s timeout. Timers are cleared so the object can hibernate. |
 | DO storage 5 GB | 3 days of report ids (≈ 35,000 small rows, primary and backup) plus a bounded 100-row message log. |
 | Cron triggers (5 per account) | 1 |
 

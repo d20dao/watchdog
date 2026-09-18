@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  AGENT_API_CHECK_NAMES,
   CHECK_NAMES,
   backupBalanceCheckName,
   evaluateBackupReportChecks,
@@ -224,7 +225,8 @@ test("check names per network: backup checks follow the keeper balance; none wit
   assert.ok(networkCheckNames(TESTNET).includes("backup_balance:0xbb2fde97a5f4855bef872c71fbb80be3170127ee"));
   const { backupKeepers, ...unset } = TESTNET;
   for (const net of [{ ...TESTNET, backupKeepers: [] }, unset]) {
-    assert.deepEqual(networkCheckNames(net), [...CHECK_NAMES]);
+    // Testnet's agent API is watched, so its checks follow the keeper's.
+    assert.deepEqual(networkCheckNames(net), [...CHECK_NAMES, ...AGENT_API_CHECK_NAMES]);
     const checks = evaluateChainChecks(net, healthyRead(net, { balanceWei: 1n }));
     assert.ok(!Object.keys(checks).some((check) => check.startsWith("backup_balance:")));
     assert.equal(checks.balance.severity, "alarm");

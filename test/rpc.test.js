@@ -121,9 +121,35 @@ test("round A reads every backup keeper balance in the same batch, each on its o
   assert.deepEqual(read.errors, ["backup balance 0x00000000000000000000000000000000000000b3: rpc error -32000"]);
 });
 
+test("round A reads the agent API relayer balance, last, only while the agent API is watched", async () => {
+  const relayer = TESTNET.agentApi.relayer;
+  const rpc = mockRpc(TESTNET, { balances: { [relayer.toLowerCase()]: 389n * 10n ** 15n } });
+  const read = await readChain(TESTNET, { logCursor: 62576776, logSpan: 5000 }, { fetch: rpc.fetch });
+  assert.equal(read.complete, true);
+  assert.equal(rpc.calls[0].batch.length, 9, "seven fixed calls, the backup keeper and the relayer");
+  assert.deepEqual(rpc.calls[0].batch[8].params, [relayer, "latest"]);
+  assert.equal(read.agentRelayerBalanceWei, 389n * 10n ** 15n);
+  assert.equal(read.subrequests, 2, "no extra round trip");
+
+  // A failed balance item leaves the rest of the read intact.
+  const failing = mockRpc(TESTNET, { balanceErrors: [relayer.toLowerCase()] });
+  const partial = await readChain(TESTNET, { logCursor: 62576776, logSpan: 5000 }, { fetch: failing.fetch });
+  assert.equal(partial.complete, true);
+  assert.equal(partial.agentRelayerBalanceWei, null);
+  assert.deepEqual(partial.errors, ["agent API relayer balance: rpc error -32000"]);
+
+  // Not watched (mainnet until its API is live): not read at all.
+  const off = mockRpc(MAINNET);
+  const unwatched = await readChain(MAINNET, null, { fetch: off.fetch });
+  assert.equal(MAINNET.agentApi.enabled, false);
+  assert.ok(!off.calls[0].batch.some((c) => c.method === "eth_getBalance" && c.params[0] === MAINNET.agentApi.relayer));
+  assert.equal(unwatched.agentRelayerBalanceWei, null);
+});
+
 test("a network without backup keepers reads only the keeper balance", async () => {
-  const { backupKeepers, ...unset } = TESTNET;
-  for (const net of [{ ...TESTNET, backupKeepers: [] }, unset]) {
+  // Without a watched agent API either, so the keeper's is the only balance in round A.
+  const { backupKeepers, agentApi, ...unset } = TESTNET;
+  for (const net of [{ ...unset, backupKeepers: [] }, unset]) {
     const rpc = mockRpc(net);
     const read = await readChain(net, null, { fetch: rpc.fetch });
     assert.equal(read.ok, true);

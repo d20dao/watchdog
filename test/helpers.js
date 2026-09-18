@@ -2,7 +2,8 @@
 
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { NETWORKS } from "../src/config.js";
+import { sanitizeHealth } from "../src/agentapi.js";
+import { NETWORKS, watchedAgentApi } from "../src/config.js";
 import { migrate } from "../src/store.js";
 
 /** Minimal emulation of ctx.storage.{sql.exec, transactionSync} backed by node:sqlite. */
@@ -158,12 +159,42 @@ export function healthyRead(net = TESTNET, overrides = {}) {
     registryImpl: net.implementations.registry.toLowerCase(),
     balanceWei: 50n * 10n ** 18n,
     backupBalances: (net.backupKeepers ?? []).map((address) => ({ address, balanceWei: 50n * 10n ** 18n })),
+    agentRelayerBalanceWei: watchedAgentApi(net) ? 50n * 10n ** 18n : null,
     pending: { count: 0, ids: [], oldest: null },
     logs: { fromBlock: 990, toBlock: 1000, refunds: [], foreignFulfillments: [] },
     logCursor: 1000,
     logSpan: 5000,
     ...overrides,
   };
+}
+
+// ---------------------------------------------------------------------------------------------
+// x402 agent API fixtures
+
+/** A testnet /health body in the shape the agent API returns (captured 2026-09-19), with top-level overrides. */
+export function agentApiBody(overrides = {}) {
+  return {
+    ok: true,
+    network: "arc-testnet",
+    relayer: { address: TESTNET.agentApi.relayer, balance: "0.38899523334875", funded: true, minCalls: 3 },
+    relay: { address: "0xAbDF8Da37E8539FEC5c2a532A3039A5eFF805457", balance: "0" },
+    counts: { settling: 0, paid: 0, sent: 0, requested: 0, expiring: 0, done: 71, rejected: 42, refundDue: 0, refundHandled: 0 },
+    pending: 0,
+    oldestUnrequestedSeconds: 0,
+    inDoubt: { count: 0, overdue: 0, oldestSeconds: 0 },
+    stuck: false,
+    inflight: null,
+    breaker: { state: "closed", failures: 0, attempts: 0, openForSeconds: 0 },
+    delivery: { state: "closed", expiries: 0, failures: 0, openForSeconds: 0, lastReason: null },
+    lastSettleError: null,
+    lastAlarmSecondsAgo: 119,
+    ...overrides,
+  };
+}
+
+/** A successful readAgentApi() result for a testnet /health body with `overrides`. */
+export function agentApiPoll(overrides = {}) {
+  return { ok: true, httpStatus: 200, latencyMs: 80, health: sanitizeHealth(agentApiBody(overrides), TESTNET.agentApi) };
 }
 
 // ---------------------------------------------------------------------------------------------

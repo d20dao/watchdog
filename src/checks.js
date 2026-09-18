@@ -5,7 +5,8 @@
 // `event: true` marks one-shot notices (refunds, foreign submitters, dropped events): they are
 // reported once per occurrence and auto-resolve silently on the next run without new occurrences.
 
-import { LIMITS, THRESHOLDS } from "./config.js";
+import { storedCalls } from "./agentapi.js";
+import { LIMITS, THRESHOLDS, watchedAgentApi } from "./config.js";
 import { formatDuration, formatGwei, formatUsdc, listWithMore, requestLink, shortAddress } from "./format.js";
 
 export const CHECK_NAMES = Object.freeze([
@@ -31,10 +32,31 @@ export const CHECK_NAMES = Object.freeze([
 /** Balance check of one backup keeper wallet: one alert per address, so each wallet resolves on its own. */
 export const backupBalanceCheckName = (address) => `backup_balance:${address.toLowerCase()}`;
 
-/** Every check of a network: the fixed checks, with one balance check per backup keeper after the keeper's own. */
+/**
+ * Checks of the x402 agent API, for networks whose `agentApi` is enabled. They use the network's scope, so they reach
+ * its Telegram group; the status page shows them in the network's Agent API section.
+ */
+export const AGENT_API_CHECK_NAMES = Object.freeze([
+  "agent_api", // /health unreachable or not JSON, ok false with no cause below, or another relayer
+  "agent_api_relayer_balance", // read on chain by the watchdog, so it works while the API is down
+  "agent_api_funded",
+  "agent_api_stuck",
+  "agent_api_breaker",
+  "agent_api_refund_due",
+  "agent_api_in_doubt",
+  "agent_api_alarm_loop",
+]);
+
+export const isAgentApiCheck = (check) => check === "agent_api" || check.startsWith("agent_api_");
+
+/**
+ * Every check of a network: the fixed checks, with one balance check per backup keeper after the keeper's own, then
+ * the agent API checks when it is watched.
+ */
 export function networkCheckNames(net) {
   const backups = (net.backupKeepers ?? []).map(backupBalanceCheckName);
-  return CHECK_NAMES.flatMap((check) => (check === "balance" ? [check, ...backups] : [check]));
+  const checks = CHECK_NAMES.flatMap((check) => (check === "balance" ? [check, ...backups] : [check]));
+  return watchedAgentApi(net) ? [...checks, ...AGENT_API_CHECK_NAMES] : checks;
 }
 
 const warning = (title, detail, extra = {}) => ({ severity: "warning", title, detail, ...extra });
@@ -222,6 +244,129 @@ export function evaluateChainChecks(net, chain) {
       ? null
       : alarm("registry implementation changed", `ERC-1967 slot is ${chain.registryImpl}, expected ${net.implementations.registry}`);
   }
+  return result;
+}
+
+// ---------------------------------------------------------------------------------------------
+// x402 agent API. `poll` is the stored poll state after this run's poll (see applyAgentApiPoll), `chain` this run's
+// readChain() result.
+
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * Health figures only count when this run's poll succeeded: after a failed poll they are unknown, so their alerts are
+ * neither resolved nor repeated, and the poll alert itself warns after 2 failed polls in a row and alarms after 5.
+ * A network whose agent API is not watched clears every check.
+ */
+export function evaluateAgentApiChecks(net, poll, chain) {
+  const result = Object.fromEntries(AGENT_API_CHECK_NAMES.map((check) => [check, undefined]));
+  const api = watchedAgentApi(net);
+  if (!api) return Object.fromEntries(AGENT_API_CHECK_NAMES.map((check) => [check, null]));
+  const T = THRESHOLDS;
+
+  const warnWei = T.agentApiRelayerWarnWei[net.name];
+  const alarmWei = T.agentApiRelayerAlarmWei[net.name] ?? 0n;
+  if (warnWei == null) {
+    result.agent_api_relayer_balance = null;
+  } else if (chain?.ok && chain.agentRelayerBalanceWei != null) {
+    result.agent_api_relayer_balance = balanceCondition(
+      chain.agentRelayerBalanceWei,
+      "agent API relayer balance low",
+      `relayer ${api.relayer} holds ${formatUsdc(chain.agentRelayerBalanceWei)} USDC (warning below ${formatUsdc(warnWei)}, alarm below ${formatUsdc(alarmWei)}); top it up before sales stop at 3 calls' cost`,
+      alarmWei,
+      warnWei,
+    );
+  }
+
+  if (!poll) return result;
+  const failures = poll.failures ?? 0;
+  if (failures > 0) {
+    if (failures >= T.agentApiDownWarnPolls) {
+      const detail = `${api.url}/health failed ${failures} polls in a row (last: ${poll.reason ?? "unknown"})`;
+      result.agent_api = failures >= T.agentApiDownAlarmPolls ? alarm("agent API unreachable", detail) : warning("agent API unreachable", detail);
+    }
+    return result;
+  }
+  const h = poll.health;
+  if (!h) return result;
+
+  if (h.relayerFunded === false) {
+    const balance = h.relayerBalance == null ? "" : ` holds ${h.relayerBalance} USDC,`;
+    result.agent_api_funded = alarm(
+      "agent API relayer cannot pay for calls",
+      `the API reports its relayer${balance} under ${h.relayerMinCalls ?? 3} calls' cost: it has stopped selling`,
+    );
+  } else if (h.relayerFunded === true) {
+    result.agent_api_funded = null;
+  }
+
+  if (h.stuck === true) {
+    result.agent_api_stuck = alarm("agent API sender stuck", "the relayer's transaction sender reports stuck: the API refuses new calls");
+  } else if (h.stuck === false) {
+    result.agent_api_stuck = null;
+  }
+
+  const settlement = h.settlementBreaker ?? {};
+  const delivery = h.deliveryBreaker ?? {};
+  if (settlement.state && delivery.state) {
+    const open = [];
+    if (settlement.state === "open") {
+      open.push(`settlement breaker open (${settlement.failures ?? "?"} of ${settlement.attempts ?? "?"} recent settle calls failed)`);
+    }
+    if (delivery.state === "open") {
+      open.push(`delivery breaker open (${delivery.expiries ?? "?"} requests expired unserved, ${delivery.failures ?? "?"} failed to open)`);
+    }
+    const detail = `${open.join("; ")}: the API refuses new calls until it closes`;
+    // The settlement breaker closes by itself a minute after settle calls stop failing; the delivery breaker means
+    // paid calls are not being served.
+    result.agent_api_breaker = open.length === 0
+      ? null
+      : delivery.state === "open"
+        ? alarm("agent API breaker open", detail)
+        : warning("agent API breaker open", detail);
+  }
+
+  const owed = h.counts?.refundDue;
+  if (owed != null) {
+    result.agent_api_refund_due = owed === 0
+      ? null
+      : alarm(
+          "agent API refund owed",
+          `${plural(owed, "paid call")} could not be served and ${owed === 1 ? "its payer is" : "their payers are"} owed a refund. ` +
+            "Refund each payer by hand, then mark it handled in the agent API's operator refund list; this clears when none is left",
+        );
+  }
+
+  const overdue = h.inDoubt?.overdue;
+  if (overdue != null) {
+    result.agent_api_in_doubt = overdue === 0
+      ? null
+      : alarm(
+          "agent API payments in doubt",
+          `${plural(overdue, "settlement")} unconfirmed past the API's limit (oldest ${formatDuration(h.inDoubt.oldestSeconds ?? 0)}): ` +
+            "Gateway has confirmed neither way whether the payer was charged",
+        );
+  }
+
+  const stored = storedCalls(h);
+  if (stored === 0) {
+    result.agent_api_alarm_loop = null; // nothing stored: the relayer's alarm rightly stops
+  } else if (stored != null && h.lastAlarmSecondsAgo != null) {
+    result.agent_api_alarm_loop = h.lastAlarmSecondsAgo >= T.agentApiAlarmLoopSeconds
+      ? alarm(
+          "agent API relayer alarm loop stopped",
+          `its last alarm ran ${formatDuration(h.lastAlarmSecondsAgo)} ago with ${plural(stored, "call")} stored; it runs at least every 10 min while any are`,
+        )
+      : null;
+  }
+
+  // The API's own `ok` also needs its relay contract configured, which no field above shows.
+  const explained = [result.agent_api_funded, result.agent_api_stuck, result.agent_api_breaker, result.agent_api_refund_due, result.agent_api_in_doubt].some(Boolean);
+  result.agent_api = h.relayerMatches === false
+    ? alarm("agent API relayer differs", `/health names a relayer other than ${api.relayer}, the wallet the watchdog checks`)
+    : h.ok === false && !explained
+      ? alarm("agent API not ok", "/health reports ok: false, and none of the fields the watchdog checks explains it")
+      : null;
   return result;
 }
 

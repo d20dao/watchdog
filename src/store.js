@@ -57,7 +57,8 @@ const SCHEMA = [
      registry_impl TEXT,
      log_cursor INTEGER,
      log_span INTEGER,
-     backup_balances_json TEXT
+     backup_balances_json TEXT,
+     agent_relayer_balance_wei TEXT
    ) WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS alerts (
      alert_key TEXT PRIMARY KEY,
@@ -99,6 +100,12 @@ const SCHEMA = [
      failed_json TEXT
    ) WITHOUT ROWID`,
   `CREATE INDEX IF NOT EXISTS backup_reports_by_received_at ON backup_reports (received_at)`,
+  // x402 agent API poll state per network, as JSON (see src/agentapi.js): sanitized figures only, never a reply body.
+  `CREATE TABLE IF NOT EXISTS agent_api_state (
+     network TEXT PRIMARY KEY,
+     updated_at INTEGER NOT NULL,
+     state_json TEXT NOT NULL
+   ) WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS backup_report_state (
      network TEXT PRIMARY KEY,
      first_received_at INTEGER NOT NULL,
@@ -129,6 +136,8 @@ const ADDED_COLUMNS = [
   ["chain_state", "backup_balances_json", "TEXT"],
   // health.role of the latest report ("primary" or "follower"); null until a report carries it.
   ["report_state", "role", "TEXT"],
+  // The agent API relayer's balance in wei, read on chain; null while the agent API is not watched.
+  ["chain_state", "agent_relayer_balance_wei", "TEXT"],
 ];
 
 /** Report streams: each keeps its own report ids and state. Table names are fixed here, never taken from input. */
@@ -328,6 +337,7 @@ export function readChainState(storage, network) {
     logCursor: r.log_cursor,
     logSpan: r.log_span,
     backupBalances: parseJson(r.backup_balances_json, {}),
+    agentRelayerBalanceWei: r.agent_relayer_balance_wei ?? null,
   };
 }
 
@@ -357,8 +367,9 @@ export function writeChainState(storage, network, now, read, previous) {
   storage.sql.exec(
     `INSERT INTO chain_state (network, checked_at, ok, complete, error, rpc, consecutive_failures, last_success_at,
        block_number, block_timestamp, base_fee_wei, balance_wei, next_request_id, pending_count, oldest_pending_id,
-       oldest_pending_age, committer, coordinator_impl, registry_impl, log_cursor, log_span, backup_balances_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       oldest_pending_age, committer, coordinator_impl, registry_impl, log_cursor, log_span, backup_balances_json,
+       agent_relayer_balance_wei)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (network) DO UPDATE SET checked_at = excluded.checked_at, ok = excluded.ok, complete = excluded.complete,
        error = excluded.error, rpc = excluded.rpc, consecutive_failures = excluded.consecutive_failures,
        last_success_at = excluded.last_success_at, block_number = excluded.block_number,
@@ -367,7 +378,8 @@ export function writeChainState(storage, network, now, read, previous) {
        pending_count = excluded.pending_count, oldest_pending_id = excluded.oldest_pending_id,
        oldest_pending_age = excluded.oldest_pending_age, committer = excluded.committer,
        coordinator_impl = excluded.coordinator_impl, registry_impl = excluded.registry_impl,
-       log_cursor = excluded.log_cursor, log_span = excluded.log_span, backup_balances_json = excluded.backup_balances_json`,
+       log_cursor = excluded.log_cursor, log_span = excluded.log_span, backup_balances_json = excluded.backup_balances_json,
+       agent_relayer_balance_wei = excluded.agent_relayer_balance_wei`,
     network,
     now,
     read.ok ? 1 : 0,
@@ -390,8 +402,28 @@ export function writeChainState(storage, network, now, read, previous) {
     read.ok ? read.logCursor : previous?.logCursor ?? null,
     read.ok ? read.logSpan : previous?.logSpan ?? null,
     JSON.stringify(mergeBackupBalances(read, previous)),
+    keep(str(read.agentRelayerBalanceWei), previous?.agentRelayerBalanceWei),
   );
   return failures;
+}
+
+// ---------------------------------------------------------------------------------------------
+// x402 agent API poll state
+
+export function readAgentApiState(storage, network) {
+  const r = first(storage, "SELECT state_json FROM agent_api_state WHERE network = ?", network);
+  const state = r ? parseJson(r.state_json, null) : null;
+  return state && typeof state === "object" ? state : null;
+}
+
+export function writeAgentApiState(storage, network, now, state) {
+  storage.sql.exec(
+    `INSERT INTO agent_api_state (network, updated_at, state_json) VALUES (?, ?, ?)
+     ON CONFLICT (network) DO UPDATE SET updated_at = excluded.updated_at, state_json = excluded.state_json`,
+    network,
+    now,
+    JSON.stringify(state),
+  );
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -1,11 +1,20 @@
 // Sanitized public read model: status JSON and a small server-rendered HTML page.
 // Never includes secrets, raw report bodies or report ids.
 
-import { evaluateListingDocumentCheck, evaluateProbeCheck } from "./checks.js";
-import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, THRESHOLDS } from "./config.js";
+import { storedCalls } from "./agentapi.js";
+import { evaluateListingDocumentCheck, evaluateProbeCheck, isAgentApiCheck } from "./checks.js";
+import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, THRESHOLDS, watchedAgentApi } from "./config.js";
 import { formatDuration, formatGwei, formatUsdc, shortAddress } from "./format.js";
 import { describeShape } from "./listings.js";
-import { readAlerts, readBackupReportState, readChainState, readProbeStates, readReportState, recentMessages } from "./store.js";
+import {
+  readAgentApiState,
+  readAlerts,
+  readBackupReportState,
+  readChainState,
+  readProbeStates,
+  readReportState,
+  recentMessages,
+} from "./store.js";
 import { notifierConfigured } from "./telegram.js";
 
 const age = (now, t) => (t == null ? null : Math.max(0, now - t));
@@ -95,6 +104,55 @@ function listingStatus(storage, now, recipes) {
   };
 }
 
+/**
+ * The x402 agent API of one network: the watchdog's own on-chain read of the relayer balance and the sanitized
+ * figures of the last /health poll (never a reply body, payer or payment id). `{enabled: false}` when not watched.
+ */
+function agentApiView(name, net, storage, c, now, alerts) {
+  const api = watchedAgentApi(net);
+  if (!api) return { enabled: false };
+  const s = readAgentApiState(storage, name);
+  const h = s?.health ?? null;
+  const warnWei = THRESHOLDS.agentApiRelayerWarnWei[name];
+  const alarmWei = THRESHOLDS.agentApiRelayerAlarmWei[name];
+  return {
+    enabled: true,
+    url: api.url,
+    relayer: api.relayer,
+    status: !s ? "not checked" : !s.reachable ? "unreachable" : h.ok ? "ok" : "not ok",
+    checkedAt: s?.checkedAt ?? null,
+    checkedAgeSeconds: age(now, s?.checkedAt),
+    httpStatus: s?.httpStatus ?? null,
+    latencyMs: s?.latencyMs ?? null,
+    reason: s?.reason ?? null,
+    consecutiveFailures: s?.failures ?? 0,
+    lastOkAt: s?.lastOkAt ?? null,
+    lastOkAgeSeconds: age(now, s?.lastOkAt),
+    // Read on chain by the watchdog itself, at the network's last chain check.
+    relayerBalanceUsdc: c?.agentRelayerBalanceWei == null ? null : formatUsdc(BigInt(c.agentRelayerBalanceWei)),
+    relayerWarnBelowUsdc: warnWei == null ? null : formatUsdc(warnWei),
+    relayerAlarmBelowUsdc: alarmWei == null ? null : formatUsdc(alarmWei),
+    // As the API reported them in its last successful poll (lastOkAt).
+    health: h
+      ? {
+          ok: h.ok,
+          relayerFunded: h.relayerFunded,
+          relayerMatches: h.relayerMatches,
+          stuck: h.stuck,
+          settlementBreaker: h.settlementBreaker,
+          deliveryBreaker: h.deliveryBreaker,
+          pendingCalls: h.pending,
+          storedCalls: storedCalls(h),
+          refundsOwed: h.counts.refundDue,
+          refundsHandled: h.counts.refundHandled,
+          inDoubt: h.inDoubt,
+          lastAlarmSecondsAgo: h.lastAlarmSecondsAgo,
+        }
+      : null,
+    alerts,
+  };
+}
+
 export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets = NETWORKS) {
   const networks = {};
   for (const name of Object.keys(nets)) {
@@ -103,6 +161,7 @@ export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets =
     const r = readReportState(storage, name);
     const b = readBackupReportState(storage, name);
     const c = readChainState(storage, name);
+    const alerts = readAlerts(storage, name).map(alertView(now));
     let feeCapUsagePercent = null;
     if (c?.baseFeeWei != null) {
       const needed = 2n * BigInt(c.baseFeeWei) + THRESHOLDS.feeHeadroomWei;
@@ -147,7 +206,9 @@ export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets =
             refundScanCursorBlock: c.logCursor,
           }
         : null,
-      alerts: readAlerts(storage, name).map(alertView(now)),
+      // The agent API's alerts share the network's scope (and Telegram group) but are listed under agentApi.
+      agentApi: agentApiView(name, net, storage, c, now, alerts.filter((a) => isAgentApiCheck(a.check))),
+      alerts: alerts.filter((a) => !isAgentApiCheck(a.check)),
     };
   }
   return {
@@ -297,6 +358,76 @@ function backupKeepers(n) {
   return parts.length ? `<h3>Backup keepers</h3>${parts.join("")}` : "";
 }
 
+const API_STATUS = { ok: ["Up", "ok"], "not ok": ["Not OK", "alarm"], unreachable: ["Down", "alarm"], "not checked": ["—", "muted"] };
+
+/** Tone of an agent API figure: the severity of its active alert, if any. */
+const alertTone = (alerts, check) => alerts.find((a) => a.check === check)?.severity ?? "";
+
+function breakerRow(title, b) {
+  if (!b?.state) return row(title, "unknown");
+  if (b.state !== "open") return row(title, "closed");
+  return row(title, b.openForSeconds ? `open, ${formatDuration(b.openForSeconds)} left` : "open", "alarm");
+}
+
+const yesNo = (value, bad) => (value == null ? ["unknown", ""] : [value ? "yes" : "no", value === bad ? "alarm" : ""]);
+
+function agentApiSection(name, a) {
+  const h = a.health;
+  const [upText, upTone] = pick(API_STATUS, a.status) ?? [String(a.status), "muted"];
+  const upCaption =
+    a.status === "not checked" ? "not checked yet"
+    : a.status === "unreachable" ? `${a.reason ?? "failed"} · last up ${ago(a.lastOkAgeSeconds)}`
+    : `checked ${ago(a.checkedAgeSeconds)}${a.latencyMs == null ? "" : ` · ${a.latencyMs} ms`}`;
+  const limits = a.relayerWarnBelowUsdc == null ? "no thresholds" : `warning below ${a.relayerWarnBelowUsdc} · alarm below ${a.relayerAlarmBelowUsdc}`;
+  const doubt = h?.inDoubt ?? {};
+  const doubtCaption =
+    !h ? "not checked yet"
+    : doubt.overdue ? `${doubt.overdue} overdue · oldest ${formatDuration(doubt.oldestSeconds ?? 0)}`
+    : doubt.count ? `oldest ${formatDuration(doubt.oldestSeconds ?? 0)}`
+    : "none unconfirmed";
+
+  const stats = [
+    stat("API", upText, upCaption, upTone),
+    stat("Relayer balance", a.relayerBalanceUsdc == null ? "unknown" : `${a.relayerBalanceUsdc} USDC`, limits, alertTone(a.alerts, "agent_api_relayer_balance")),
+    stat("Refunds owed", h ? h.refundsOwed ?? "unknown" : "—", h ? `${h.refundsHandled ?? 0} handled` : "not checked yet", alertTone(a.alerts, "agent_api_refund_due")),
+    stat("In-doubt payments", h ? doubt.count ?? "unknown" : "—", doubtCaption, alertTone(a.alerts, "agent_api_in_doubt")),
+  ];
+
+  const health = [];
+  if (!h) {
+    health.push(row("Health", "not checked yet"));
+  } else {
+    const [ok, okTone] = yesNo(h.ok, false);
+    const [funded, fundedTone] = yesNo(h.relayerFunded, false);
+    health.push(
+      row("Reports ok", ok, okTone),
+      row("Relayer funded", funded, fundedTone),
+      row("Sender", h.stuck == null ? "unknown" : h.stuck ? "stuck" : "ok", h.stuck ? "alarm" : ""),
+      breakerRow("Settlement breaker", h.settlementBreaker),
+      breakerRow("Delivery breaker", h.deliveryBreaker),
+    );
+  }
+
+  const relayer = [row("Wallet", shortAddress(a.relayer))];
+  if (h) {
+    const loop = h.storedCalls === 0 ? "idle, nothing stored" : h.lastAlarmSecondsAgo == null ? "not run yet" : `${formatDuration(h.lastAlarmSecondsAgo)} ago`;
+    relayer.push(
+      row("Calls in progress", h.pendingCalls ?? "unknown"),
+      row("Relayer alarm", loop, alertTone(a.alerts, "agent_api_alarm_loop")),
+    );
+  }
+  relayer.push(row("Checked", a.checkedAgeSeconds == null ? "not yet" : ago(a.checkedAgeSeconds)));
+
+  return (
+    `<section class="section">` +
+    sectionHead(`Agent API · ${name}`, a.alerts, { link: `<a href="${escapeHtml(a.url)}">API</a>` }) +
+    `<dl class="stats">${stats.join("")}</dl>` +
+    `<div class="cols"><div><h3>Health</h3><table class="kv">${health.join("")}</table></div>` +
+    `<div><h3>Relayer</h3><table class="kv">${relayer.join("")}</table></div></div>` +
+    `</section>`
+  );
+}
+
 function listingRow(r) {
   const probed = r.status !== "not probed";
   const status = probed ? state(r.status, label(r.status)) : `<span class="muted">not probed yet</span>`;
@@ -429,9 +560,13 @@ h3{margin:0 0 4px;color:var(--fg);letter-spacing:.08em}
 
 export function renderHtml(status) {
   const sections =
-    Object.entries(status.networks).map(([name, n]) => networkSection(name, n)).join("") +
-    (status.airnodehub ? listingsSection(status.airnodehub) : "");
-  const alerts = [...Object.values(status.networks).flatMap((n) => n.alerts), ...(status.airnodehub?.alerts ?? [])];
+    Object.entries(status.networks)
+      .map(([name, n]) => networkSection(name, n) + (n.agentApi?.enabled ? agentApiSection(name, n.agentApi) : ""))
+      .join("") + (status.airnodehub ? listingsSection(status.airnodehub) : "");
+  const alerts = [
+    ...Object.values(status.networks).flatMap((n) => [...n.alerts, ...(n.agentApi?.alerts ?? [])]),
+    ...(status.airnodehub?.alerts ?? []),
+  ];
   const overall = worstOf(alerts);
   return `<!doctype html>
 <html lang="en">

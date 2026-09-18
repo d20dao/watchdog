@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
-import { AIRNODE_RECIPES, LIMITS, NETWORK_NAMES } from "../src/config.js";
+import { AIRNODE_RECIPES, LIMITS, NETWORKS, NETWORK_NAMES, watchedAgentApi } from "../src/config.js";
 import { runCron } from "../src/cron.js";
 import {
   attestationDigest,
@@ -18,7 +18,10 @@ import {
 } from "../src/probe.js";
 import { buildStatus, renderHtml } from "../src/status.js";
 import { readAlerts, readProbeStates } from "../src/store.js";
-import { MAINNET, TESTNET, healthyRead, listingDocument, loadSamples, memoryStorage, pageText } from "./helpers.js";
+import { MAINNET, TESTNET, agentApiPoll, healthyRead, listingDocument, loadSamples, memoryStorage, pageText } from "./helpers.js";
+
+// Agent API polls are covered in agentapi.test.js; here they always answer healthy without a fetch.
+const readAgentApiImpl = async () => agentApiPoll();
 
 const SAMPLES = loadSamples();
 const byId = Object.fromEntries(AIRNODE_RECIPES.map((recipe) => [recipe.id, recipe]));
@@ -335,6 +338,7 @@ function harness(recipes, { env = TELEGRAM } = {}) {
       fetch,
       clock: () => state.clock * 1000,
       readChainImpl: async (net) => reads[net.name] ?? healthyRead(net),
+      readAgentApiImpl,
       recipes,
     });
   };
@@ -451,6 +455,7 @@ test("a recipe removed from the configuration resolves its alerts and drops its 
     },
     clock: () => (T0 + 120) * 1000,
     readChainImpl: async (net) => healthyRead(net),
+    readAgentApiImpl,
     recipes: [BETA],
   });
   assert.ok(!JSON.stringify(summary.airnodehub.probes).includes("alpha"));
@@ -502,10 +507,11 @@ test("status JSON and HTML show each recipe's last probe, latency, status and re
 });
 
 test("subrequest budget: at most 50 per run, and one probe per run once the schedule settles", async () => {
-  // Static worst case: every RPC round falls back (3 rounds x 2 endpoints per network), 3 Telegram sends and a
-  // full set of probe tasks.
-  const worst = NETWORK_NAMES.length * 3 * 2 + LIMITS.telegramMaxSendsPerRun + LIMITS.probeMaxPerRun;
+  // Static worst case: every RPC round falls back (3 rounds x 2 endpoints per network), one /health poll per network,
+  // 3 Telegram sends and a full set of probe tasks.
+  const worst = NETWORK_NAMES.length * (3 * 2 + 1) + LIMITS.telegramMaxSendsPerRun + LIMITS.probeMaxPerRun;
   assert.ok(worst <= 50, `worst case ${worst}`);
+  const polled = NETWORK_NAMES.filter((name) => watchedAgentApi(NETWORKS[name])).length;
 
   // A fresh object with the real configuration: 5 probes and 4 listing documents are due, capped per run.
   const real = harness(AIRNODE_RECIPES);
@@ -516,12 +522,12 @@ test("subrequest budget: at most 50 per run, and one probe per run once the sche
   };
   const fallbackReads = Object.fromEntries(NETWORK_NAMES.map((name) => [name, { ...healthyRead(name === "arc-mainnet" ? MAINNET : TESTNET), subrequests: 6, balanceWei: 1n }]));
   const runReal = (minutes) =>
-    runCron({ storage: real.storage, env: TELEGRAM, fetch: failing, clock: () => (T0 + minutes * 60) * 1000, readChainImpl: async (net) => fallbackReads[net.name] });
+    runCron({ storage: real.storage, env: TELEGRAM, fetch: failing, clock: () => (T0 + minutes * 60) * 1000, readChainImpl: async (net) => fallbackReads[net.name], readAgentApiImpl });
   const one = await runReal(0);
   assert.equal(real.state.gatewayCalls.length, LIMITS.probeMaxPerRun);
   assert.ok(real.state.gatewayCalls.every((c) => c.method === "POST"));
   assert.ok(one.subrequests <= 50);
-  assert.equal(one.subrequests, 12 + LIMITS.probeMaxPerRun + 1);
+  assert.equal(one.subrequests, 12 + polled + LIMITS.probeMaxPerRun + 1);
   const two = await runReal(1);
   assert.deepEqual(two.airnodehub.probes.map((p) => p.listingDocument), [
     "https://airnode-hyperliquid.fly.dev/",

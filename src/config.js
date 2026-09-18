@@ -41,6 +41,13 @@ export const NETWORKS = Object.freeze({
     explorer: "https://arc.d20dao.org",
     healthKeySecret: "HEALTH_KEY_ARC_MAINNET",
     backupHealthKeySecret: "HEALTH_KEY_ARC_MAINNET_BACKUP",
+    // x402 agent API: its public /health and the balance of its relayer wallet. Unwatched while `enabled` is false:
+    // no poll, no balance read, no alerts and no status section.
+    agentApi: Object.freeze({
+      enabled: false,
+      url: "https://api.d20dao.org",
+      relayer: "0x8B465645ed88F6d487d279003aD3681e7aF8e8B7",
+    }),
   }),
   "arc-testnet": Object.freeze({
     name: "arc-testnet",
@@ -60,10 +67,18 @@ export const NETWORKS = Object.freeze({
     explorer: "https://arc-testnet.d20dao.org",
     healthKeySecret: "HEALTH_KEY_ARC_TESTNET",
     backupHealthKeySecret: "HEALTH_KEY_ARC_TESTNET_BACKUP",
+    agentApi: Object.freeze({
+      enabled: true,
+      url: "https://api-testnet.d20dao.org",
+      relayer: "0xF6b446dC2F30e6A802DFB7bD4c222d84F6cd05C3",
+    }),
   }),
 });
 
 export const NETWORK_NAMES = Object.freeze(Object.keys(NETWORKS));
+
+/** A network's x402 agent API configuration when it is watched, otherwise null. */
+export const watchedAgentApi = (net) => (net?.agentApi?.enabled === true ? net.agentApi : null);
 
 export const THRESHOLDS = Object.freeze({
   heartbeatWarnSeconds: 150,
@@ -79,6 +94,21 @@ export const THRESHOLDS = Object.freeze({
   // so it needs less runway than the primary before anyone has to act.
   backupBalanceWarnWei: 2n * USDC,
   backupBalanceAlarmWei: 1n * USDC,
+  // x402 agent API relayer wallet, whose balance the watchdog reads on chain itself: one value per network. The API
+  // stops selling by itself (503, nothing charged) once the relayer holds less than 3 calls' cost. To move the point
+  // where the team is told to top up, change that network's value in agentApiRelayerWarnWei.
+  //   arc-mainnet: about 0.04 USDC a call. Warn below 4 USDC (about 100 calls); alarm below 1 USDC (25 calls, about
+  //                eight times the 0.12 USDC where sales stop).
+  //   arc-testnet: about 0.09 USDC a call, and the relayer is kept with only a few calls' worth. Warn below 1 USDC
+  //                (about 11 calls); alarm below 0.36 USDC (4 calls), while one call is left before sales stop at 0.27.
+  agentApiRelayerWarnWei: Object.freeze({ "arc-mainnet": 4n * USDC, "arc-testnet": 1n * USDC }),
+  agentApiRelayerAlarmWei: Object.freeze({ "arc-mainnet": 1n * USDC, "arc-testnet": (36n * USDC) / 100n }),
+  // Agent API /health polls in a row that failed (unreachable, timed out, or no JSON health reply).
+  agentApiDownWarnPolls: 2,
+  agentApiDownAlarmPolls: 5,
+  // The relayer's Durable Object alarm runs at least every 10 minutes while it stores any call (its housekeeping
+  // tick), and not at all while it stores none. Three missed ticks mean the loop has stopped.
+  agentApiAlarmLoopSeconds: 30 * 60,
   // Testnet runs at 41 % of its 100 gwei cap on a normal 20 gwei base fee, so warn only well above that.
   feeWarnPercent: 60n,
   feeAlarmPercent: 85n,
@@ -127,6 +157,9 @@ export const LIMITS = Object.freeze({
   listingDocumentIntervalSeconds: 24 * 3600,
   listingDocumentRetrySeconds: 3600,
   listingDocumentMaxBytes: 1024 * 1024,
+  // Agent API /health reads the relayer's Durable Object and the chain before it answers.
+  agentApiTimeoutMs: 10_000,
+  agentApiMaxResponseBytes: 16 * 1024,
 });
 
 export const DURABLE_OBJECT_NAME = "watchdog";
