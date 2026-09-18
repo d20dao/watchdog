@@ -28,7 +28,8 @@ export const NETWORKS = Object.freeze({
     coordinator: "0xd20da057469C45928912d983F45790C41e290571",
     registry: "0xd20Da048C1A68fa3Bc0B5f5Bc454D1530062C82D",
     keeper: "0xA5496Bb35905Bfe0Bac7D23Ca18c008F5E6Eb13e",
-    backupKeepers: Object.freeze([]),
+    // Follower keeper authorized as a backup committer; its fulfillments are ours, not a foreign submitter.
+    backupKeepers: Object.freeze(["0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685"]),
     // Expected ERC-1967 implementations; update after each reviewed upgrade.
     implementations: Object.freeze({
       coordinator: "0xd20da0DADa4352A1a9722be43a2D85923443458c",
