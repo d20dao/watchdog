@@ -77,7 +77,7 @@ its `url`, its relayer wallet and an `enabled` flag:
 | Network | API | Relayer | Watched |
 | --- | --- | --- | --- |
 | `arc-testnet` | `https://api-testnet.d20dao.org` | `0xF6b446dC2F30e6A802DFB7bD4c222d84F6cd05C3` | yes |
-| `arc-mainnet` | `https://api.d20dao.org` | `0x8B465645ed88F6d487d279003aD3681e7aF8e8B7` | no: set `enabled: true` to watch it |
+| `arc-mainnet` | `https://api.d20dao.org` | `0x8B465645ed88F6d487d279003aD3681e7aF8e8B7` | yes |
 
 While `enabled` is false, the network's agent API is neither polled nor read on chain, raises no alerts and has no status
 section. Setting it back to false resolves its open alerts on the next run.

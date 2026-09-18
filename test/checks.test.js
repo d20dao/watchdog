@@ -10,7 +10,7 @@ import {
   evaluateRpcCheck,
   networkCheckNames,
 } from "../src/checks.js";
-import { MAINNET, TESTNET, healthyRead } from "./helpers.js";
+import { MAINNET, TESTNET, healthyRead, withAgentApi } from "./helpers.js";
 
 const NOW = 1789420300;
 const GWEI = 10n ** 9n;
@@ -210,12 +210,14 @@ test("several backup keepers: each wallet has its own check, matched case-insens
   assert.deepEqual(networkCheckNames(net).slice(6, 9), ["balance", backupBalanceCheckName(a), backupBalanceCheckName(b)]);
 });
 
-test("check names per network: backup checks follow the keeper balance; none without backups", () => {
-  assert.deepEqual(networkCheckNames(MAINNET), [
+test("check names per network: backup checks follow the keeper balance, none without backups; agent API checks last while watched", () => {
+  const keeperChecks = [
     ...CHECK_NAMES.slice(0, CHECK_NAMES.indexOf("balance") + 1),
     "backup_balance:0x75af60e2165e8e6d2f6cfd5d9ddda83446044685",
     ...CHECK_NAMES.slice(CHECK_NAMES.indexOf("balance") + 1),
-  ]);
+  ];
+  assert.deepEqual(networkCheckNames(withAgentApi(MAINNET, true)), [...keeperChecks, ...AGENT_API_CHECK_NAMES]);
+  assert.deepEqual(networkCheckNames(withAgentApi(MAINNET, false)), keeperChecks);
   assert.deepEqual(networkCheckNames(MAINNET).slice(7, 11), [
     "backup_balance:0x75af60e2165e8e6d2f6cfd5d9ddda83446044685",
     "backup_heartbeat",
@@ -223,9 +225,10 @@ test("check names per network: backup checks follow the keeper balance; none wit
     "backup_role",
   ]);
   assert.ok(networkCheckNames(TESTNET).includes("backup_balance:0xbb2fde97a5f4855bef872c71fbb80be3170127ee"));
-  const { backupKeepers, ...unset } = TESTNET;
-  for (const net of [{ ...TESTNET, backupKeepers: [] }, unset]) {
-    // Testnet's agent API is watched, so its checks follow the keeper's.
+  const liveTestnet = withAgentApi(TESTNET, true);
+  const { backupKeepers, ...unset } = liveTestnet;
+  for (const net of [{ ...liveTestnet, backupKeepers: [] }, unset]) {
+    // With the agent API watched, its checks follow the keeper's.
     assert.deepEqual(networkCheckNames(net), [...CHECK_NAMES, ...AGENT_API_CHECK_NAMES]);
     const checks = evaluateChainChecks(net, healthyRead(net, { balanceWei: 1n }));
     assert.ok(!Object.keys(checks).some((check) => check.startsWith("backup_balance:")));

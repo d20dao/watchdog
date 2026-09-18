@@ -105,6 +105,9 @@ export function encodeRequest(fields = {}) {
 export const TESTNET = NETWORKS["arc-testnet"];
 export const MAINNET = NETWORKS["arc-mainnet"];
 
+/** A copy of `net` whose x402 agent API is watched (`true`) or not (`false`), whatever the configuration says. */
+export const withAgentApi = (net, enabled) => ({ ...net, agentApi: { ...net.agentApi, enabled } });
+
 /** The receiver doc's example envelope, filled with testnet deployment values. */
 export function sampleReport(overrides = {}) {
   const origin = `5042002:${TESTNET.coordinator}:${TESTNET.keeper}`;
@@ -171,12 +174,15 @@ export function healthyRead(net = TESTNET, overrides = {}) {
 // ---------------------------------------------------------------------------------------------
 // x402 agent API fixtures
 
-/** A testnet /health body in the shape the agent API returns (captured 2026-09-19), with top-level overrides. */
-export function agentApiBody(overrides = {}) {
+/**
+ * A /health body in the shape the agent API returns (captured on testnet 2026-09-19), naming `net` and its relayer,
+ * with top-level overrides.
+ */
+export function agentApiBody(overrides = {}, net = TESTNET) {
   return {
     ok: true,
-    network: "arc-testnet",
-    relayer: { address: TESTNET.agentApi.relayer, balance: "0.38899523334875", funded: true, minCalls: 3 },
+    network: net.name,
+    relayer: { address: net.agentApi.relayer, balance: "0.38899523334875", funded: true, minCalls: 3 },
     relay: { address: "0xAbDF8Da37E8539FEC5c2a532A3039A5eFF805457", balance: "0" },
     counts: { settling: 0, paid: 0, sent: 0, requested: 0, expiring: 0, done: 71, rejected: 42, refundDue: 0, refundHandled: 0 },
     pending: 0,
@@ -192,9 +198,9 @@ export function agentApiBody(overrides = {}) {
   };
 }
 
-/** A successful readAgentApi() result for a testnet /health body with `overrides`. */
-export function agentApiPoll(overrides = {}) {
-  return { ok: true, httpStatus: 200, latencyMs: 80, health: sanitizeHealth(agentApiBody(overrides), TESTNET.agentApi) };
+/** A successful readAgentApi() result for `net`'s /health body with `overrides`. */
+export function agentApiPoll(overrides = {}, net = TESTNET) {
+  return { ok: true, httpStatus: 200, latencyMs: 80, health: sanitizeHealth(agentApiBody(overrides, net), net.agentApi) };
 }
 
 // ---------------------------------------------------------------------------------------------

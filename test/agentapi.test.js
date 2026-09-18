@@ -2,14 +2,16 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { applyAgentApiPoll, readAgentApi, sanitizeHealth, storedCalls } from "../src/agentapi.js";
 import { AGENT_API_CHECK_NAMES, evaluateAgentApiChecks } from "../src/checks.js";
-import { MAINNET, TESTNET, agentApiBody, agentApiPoll, healthyRead } from "./helpers.js";
+import { MAINNET, TESTNET, agentApiBody, agentApiPoll, healthyRead, withAgentApi } from "./helpers.js";
 
 const USDC = 10n ** 18n;
 const severity = (c) => (c === undefined ? "unknown" : c === null ? "clear" : c.severity);
-const LIVE_MAINNET = { ...MAINNET, agentApi: { ...MAINNET.agentApi, enabled: true } };
+// Mainnet with its agent API watched and not watched, whatever src/config.js says today.
+const LIVE_MAINNET = withAgentApi(MAINNET, true);
+const OFF_MAINNET = withAgentApi(MAINNET, false);
 
-/** The stored poll state after one successful poll of `overrides`. */
-const polled = (overrides = {}) => applyAgentApiPoll(null, agentApiPoll(overrides), 1000);
+/** The stored poll state after one successful poll of `net`'s /health with `overrides`. */
+const polled = (overrides = {}, net = TESTNET) => applyAgentApiPoll(null, agentApiPoll(overrides, net), 1000);
 
 /** A fetch answering every request with `body` (an object is sent as JSON) and `status`, recording each call. */
 function answering(body, status = 200, headers = {}) {
@@ -94,6 +96,13 @@ test("readAgentApi: a plain GET of /health, 200 and 503 are both health replies"
   assert.equal(red.httpStatus, 503);
   assert.equal(red.health.ok, false);
   assert.equal(red.health.counts.refundDue, 1);
+
+  // Mainnet's reply names mainnet and its own relayer.
+  const main = answering(agentApiBody({}, LIVE_MAINNET));
+  const mainPoll = await readAgentApi(LIVE_MAINNET, { fetch: main.fetch });
+  assert.equal(main.calls[0].url, "https://api.d20dao.org/health");
+  assert.equal(mainPoll.ok, true);
+  assert.equal(mainPoll.health.relayerMatches, true);
 });
 
 test("readAgentApi: outages and replies that are not this network's health are failed polls", async () => {
@@ -132,14 +141,17 @@ test("a healthy agent API and a funded relayer raise nothing", () => {
   assert.ok(Object.values(r).every((c) => c === null));
 });
 
-test("an agent API that is not watched clears every check and is never read", () => {
-  assert.equal(MAINNET.agentApi.enabled, false, "mainnet stays off until its API is live");
-  const r = evaluateAgentApiChecks(MAINNET, polled({ ok: false, stuck: true }), healthyRead(MAINNET, { agentRelayerBalanceWei: 0n }));
-  assert.ok(Object.values(r).every((c) => c === null));
+test("an agent API that is not watched clears every check; watched, the same figures alarm", () => {
+  const poll = polled({ ok: false, stuck: true }, LIVE_MAINNET);
+  const off = evaluateAgentApiChecks(OFF_MAINNET, poll, healthyRead(OFF_MAINNET, { agentRelayerBalanceWei: 0n }));
+  assert.ok(Object.values(off).every((c) => c === null));
+  const on = evaluateAgentApiChecks(LIVE_MAINNET, poll, healthyRead(LIVE_MAINNET, { agentRelayerBalanceWei: 0n }));
+  assert.equal(severity(on.agent_api_stuck), "alarm");
+  assert.equal(severity(on.agent_api_relayer_balance), "alarm");
 });
 
 test("relayer balance on chain: testnet < 1 USDC warning, < 0.36 alarm; mainnet < 4 warning, < 1 alarm", () => {
-  const at = (net, wei) => evaluateAgentApiChecks(net, polled(), healthyRead(net, { agentRelayerBalanceWei: wei })).agent_api_relayer_balance;
+  const at = (net, wei) => evaluateAgentApiChecks(net, polled({}, net), healthyRead(net, { agentRelayerBalanceWei: wei })).agent_api_relayer_balance;
   assert.equal(severity(at(TESTNET, 1n * USDC)), "clear");
   assert.equal(severity(at(TESTNET, 1n * USDC - 1n)), "warning");
   assert.equal(severity(at(TESTNET, 36n * USDC / 100n)), "warning");

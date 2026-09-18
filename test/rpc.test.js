@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { IMPLEMENTATION_SLOT, TOPICS } from "../src/config.js";
 import { readChain } from "../src/rpc.js";
-import { MAINNET, TESTNET, addressWord, encodePending, encodeRequest, word } from "./helpers.js";
+import { MAINNET, TESTNET, addressWord, encodePending, encodeRequest, withAgentApi, word } from "./helpers.js";
+
+// Mainnet with its agent API watched and not watched, whatever src/config.js says today.
+const LIVE_MAINNET = withAgentApi(MAINNET, true);
+const OFF_MAINNET = withAgentApi(MAINNET, false);
 
 const NOW = 1789420000;
 
@@ -70,8 +74,8 @@ function mockRpc(net, options = {}) {
 }
 
 test("round A reads head, figures and wiring from the primary endpoint in one batch", async () => {
-  const rpc = mockRpc(MAINNET, { next: 15n });
-  const read = await readChain(MAINNET, { logCursor: null, logSpan: null }, { fetch: rpc.fetch });
+  const rpc = mockRpc(LIVE_MAINNET, { next: 15n });
+  const read = await readChain(LIVE_MAINNET, { logCursor: null, logSpan: null }, { fetch: rpc.fetch });
   assert.equal(read.ok, true);
   assert.equal(read.complete, true);
   assert.equal(read.rpc, "rpc.blockdaemon.mainnet.arc.io");
@@ -86,10 +90,12 @@ test("round A reads head, figures and wiring from the primary endpoint in one ba
   assert.equal(read.logs, null);
   assert.equal(read.logCursor, 62576776);
   assert.equal(rpc.calls.length, 2);
-  // Seven fixed calls plus the backup keeper balance, all in the same batch.
-  assert.equal(rpc.calls[0].batch.length, 8);
+  // Seven fixed calls plus the backup keeper and agent API relayer balances, all in the same batch.
+  assert.equal(rpc.calls[0].batch.length, 9);
   assert.deepEqual(rpc.calls[0].batch[7].params, [MAINNET.backupKeepers[0], "latest"]);
+  assert.deepEqual(rpc.calls[0].batch[8].params, [MAINNET.agentApi.relayer, "latest"]);
   assert.deepEqual(read.backupBalances, [{ address: MAINNET.backupKeepers[0], balanceWei: 35n * 10n ** 18n }]);
+  assert.equal(read.agentRelayerBalanceWei, 35n * 10n ** 18n);
   assert.equal(read.subrequests, 2);
   // Pending scan window: max(1, next - 256) with limit 256, pinned to the head block.
   const [pendingCall] = rpc.calls[1].batch;
@@ -99,17 +105,17 @@ test("round A reads head, figures and wiring from the primary endpoint in one ba
 
 test("round A reads every backup keeper balance in the same batch, each on its own", async () => {
   const second = "0x00000000000000000000000000000000000000B2";
-  const net = { ...MAINNET, backupKeepers: [MAINNET.backupKeepers[0], second, "0x00000000000000000000000000000000000000b3"] };
+  const net = { ...LIVE_MAINNET, backupKeepers: [MAINNET.backupKeepers[0], second, "0x00000000000000000000000000000000000000b3"] };
   const rpc = mockRpc(net, {
     balances: { [MAINNET.keeper.toLowerCase()]: 40n * 10n ** 18n, [MAINNET.backupKeepers[0].toLowerCase()]: 12n * 10n ** 18n, [second.toLowerCase()]: 0n },
     balanceErrors: ["0x00000000000000000000000000000000000000b3"],
   });
   const read = await readChain(net, { logCursor: 62576776, logSpan: 5000 }, { fetch: rpc.fetch });
   assert.equal(read.complete, true, "a failed balance item leaves the read complete");
-  assert.equal(rpc.calls[0].batch.length, 10);
+  assert.equal(rpc.calls[0].batch.length, 11);
   assert.deepEqual(
     rpc.calls[0].batch.filter((c) => c.method === "eth_getBalance").map((c) => c.params),
-    [MAINNET.keeper, ...net.backupKeepers].map((wallet) => [wallet, "latest"]),
+    [MAINNET.keeper, ...net.backupKeepers, MAINNET.agentApi.relayer].map((wallet) => [wallet, "latest"]),
   );
   assert.equal(read.subrequests, 2, "no extra round trip");
   assert.equal(read.balanceWei, 40n * 10n ** 18n);
@@ -138,12 +144,17 @@ test("round A reads the agent API relayer balance, last, only while the agent AP
   assert.equal(partial.agentRelayerBalanceWei, null);
   assert.deepEqual(partial.errors, ["agent API relayer balance: rpc error -32000"]);
 
-  // Not watched (mainnet until its API is live): not read at all.
-  const off = mockRpc(MAINNET);
-  const unwatched = await readChain(MAINNET, null, { fetch: off.fetch });
-  assert.equal(MAINNET.agentApi.enabled, false);
+  // Not watched: not read at all. Watched, the same network's relayer is read last.
+  const off = mockRpc(OFF_MAINNET);
+  const unwatched = await readChain(OFF_MAINNET, null, { fetch: off.fetch });
+  assert.equal(off.calls[0].batch.length, 8, "seven fixed calls and the backup keeper");
   assert.ok(!off.calls[0].batch.some((c) => c.method === "eth_getBalance" && c.params[0] === MAINNET.agentApi.relayer));
   assert.equal(unwatched.agentRelayerBalanceWei, null);
+  const on = mockRpc(LIVE_MAINNET, { balances: { [MAINNET.agentApi.relayer.toLowerCase()]: 7n * 10n ** 18n } });
+  const watched = await readChain(LIVE_MAINNET, null, { fetch: on.fetch });
+  assert.equal(on.calls[0].batch.length, 9);
+  assert.deepEqual(on.calls[0].batch[8].params, [MAINNET.agentApi.relayer, "latest"]);
+  assert.equal(watched.agentRelayerBalanceWei, 7n * 10n ** 18n);
 });
 
 test("a network without backup keepers reads only the keeper balance", async () => {

@@ -44,7 +44,7 @@ export const NETWORKS = Object.freeze({
     // x402 agent API: its public /health and the balance of its relayer wallet. Unwatched while `enabled` is false:
     // no poll, no balance read, no alerts and no status section.
     agentApi: Object.freeze({
-      enabled: false,
+      enabled: true,
       url: "https://api.d20dao.org",
       relayer: "0x8B465645ed88F6d487d279003aD3681e7aF8e8B7",
     }),

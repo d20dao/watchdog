@@ -20,8 +20,8 @@ import { buildStatus, renderHtml } from "../src/status.js";
 import { readAlerts, readProbeStates } from "../src/store.js";
 import { MAINNET, TESTNET, agentApiPoll, healthyRead, listingDocument, loadSamples, memoryStorage, pageText } from "./helpers.js";
 
-// Agent API polls are covered in agentapi.test.js; here they always answer healthy without a fetch.
-const readAgentApiImpl = async () => agentApiPoll();
+// Agent API polls are covered in agentapi.test.js; here each answers healthy for its own network, without a fetch.
+const readAgentApiImpl = async (net) => agentApiPoll({}, net);
 
 const SAMPLES = loadSamples();
 const byId = Object.fromEntries(AIRNODE_RECIPES.map((recipe) => [recipe.id, recipe]));

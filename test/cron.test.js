@@ -14,13 +14,15 @@ import {
 } from "../src/store.js";
 import { groupMessages } from "../src/telegram.js";
 import { readAgentApi } from "../src/agentapi.js";
-import { MAINNET, TESTNET, agentApiBody, agentApiPoll, healthyRead, memoryStorage, pageText } from "./helpers.js";
+import { MAINNET, TESTNET, agentApiBody, agentApiPoll, healthyRead, memoryStorage, pageText, withAgentApi } from "./helpers.js";
 
 const T0 = 1789420000;
 const USDC = 10n ** 18n;
 const BACKUP = MAINNET.backupKeepers[0];
 const BACKUP_CHECK = "backup_balance:0x75af60e2165e8e6d2f6cfd5d9ddda83446044685";
 const TELEGRAM = { TELEGRAM_BOT_TOKEN: "123456:throwaway-token", TELEGRAM_CHAT_ID: "-1001234567890" };
+// Each agent API's /health, answered by the harness fetch with a healthy body naming that network and its relayer.
+const AGENT_API_HEALTH = new Map([MAINNET, TESTNET].map((net) => [`${net.agentApi.url}/health`, net]));
 
 function record(network, overrides = {}) {
   return {
@@ -42,20 +44,24 @@ function record(network, overrides = {}) {
   };
 }
 
-/** Harness with a controllable clock, per-network chain reads and a recording Telegram fetch. */
+/**
+ * Harness with a controllable clock, per-network chain reads, agent API /health replies and a recording Telegram fetch.
+ */
 function harness(env = TELEGRAM) {
   const storage = memoryStorage();
   const state = {
     clock: T0,
-    reads: { "arc-mainnet": healthyRead(MAINNET), "arc-testnet": healthyRead(TESTNET) },
-    polls: {}, // agent API /health results per network; a healthy reply unless a test sets one
+    reads: {}, // readChain() results per network; a healthy read of the network as configured unless a test sets one
+    polls: {}, // readAgentApi() results per network; the fetch's healthy /health reply unless a test sets one
     polled: [],
     telegram: [],
     telegramStatus: 200,
     networks: undefined, // the real configuration unless a test sets its own
   };
   const fetch = async (url, init) => {
-    assert.ok(url.startsWith("https://api.telegram.org/bot"), "only Telegram is fetched directly");
+    const api = AGENT_API_HEALTH.get(url);
+    if (api) return Response.json(agentApiBody({}, api));
+    assert.ok(url.startsWith("https://api.telegram.org/bot"), "only Telegram and agent API /health are fetched directly");
     state.telegram.push(JSON.parse(init.body));
     return new Response("{}", { status: state.telegramStatus });
   };
@@ -66,12 +72,12 @@ function harness(env = TELEGRAM) {
       env,
       fetch,
       clock: () => state.clock * 1000,
-      readChainImpl: async (net, cursor) => ({ ...state.reads[net.name], cursorSeen: cursor }),
-      readAgentApiImpl: async (net) => {
+      readChainImpl: async (net, cursor) => ({ ...(state.reads[net.name] ?? healthyRead(net)), cursorSeen: cursor }),
+      readAgentApiImpl: async (net, deps) => {
         state.polled.push(net.name);
-        const poll = state.polls[net.name] ?? agentApiPoll();
+        const poll = state.polls[net.name];
         if (poll instanceof Error) throw poll;
-        return poll;
+        return poll ?? readAgentApi(net, deps);
       },
       networks: state.networks,
       recipes: [], // AirnodeHub probes are covered in probe.test.js
@@ -584,11 +590,15 @@ test("sendTelegram never exposes the token in its result", async () => {
 
 const TESTNET_RELAYER = TESTNET.agentApi.relayer;
 const API_COUNTS = agentApiBody().counts;
+// Mainnet with its agent API watched and not watched, whatever src/config.js says today.
+const LIVE_MAINNET = withAgentApi(MAINNET, true);
+const OFF_MAINNET = withAgentApi(MAINNET, false);
 
 test("agent API down: nothing on one failed poll, warning after 2, alarm after 5, resolved when it answers", async () => {
   const h = harness();
+  h.state.networks = { "arc-mainnet": LIVE_MAINNET, "arc-testnet": TESTNET };
   await h.run(0);
-  assert.deepEqual(h.state.polled, ["arc-testnet"], "only the watched agent API is polled");
+  assert.deepEqual(h.state.polled, ["arc-mainnet", "arc-testnet"], "each watched agent API is polled once a run");
   h.state.polls["arc-testnet"] = { ok: false, httpStatus: 522, latencyMs: 10, reason: "http 522" };
   await h.run(1);
   assert.equal(h.state.telegram.length, 0);
@@ -643,21 +653,26 @@ test("the relayer balance is read on chain: one warning while low, even with the
   assert.equal(h.state.telegram.at(-1).text, "[arc-testnet] RESOLVED agent API relayer balance low after 41 min");
 });
 
-test("mainnet's agent API is off: not polled, not read, no checks, no section; the enabled flag turns it on", async () => {
+test("an agent API that is not watched: not polled, not read, no checks, no section; the enabled flag turns it on", async () => {
   const h = harness();
+  h.state.networks = { "arc-mainnet": OFF_MAINNET, "arc-testnet": TESTNET };
   const summary = await h.run(0);
+  assert.deepEqual(h.state.polled, ["arc-testnet"], "only the watched agent API is polled");
   assert.equal(summary.networks["arc-mainnet"].agentApi, null);
   assert.equal(summary.networks["arc-testnet"].agentApi.reachable, true);
   assert.equal(summary.subrequests, 2 + 2 + 1, "two chain batches per network and one /health poll");
-  let status = buildStatus(h.storage, TELEGRAM, T0 + 5);
+  assert.equal(readChainState(h.storage, "arc-mainnet").agentRelayerBalanceWei, null, "relayer balance not read");
+  let status = buildStatus(h.storage, TELEGRAM, T0 + 5, [], h.state.networks);
   assert.deepEqual(status.networks["arc-mainnet"].agentApi, { enabled: false });
   assert.ok(!pageText(renderHtml(status)).includes("Agent API · arc-mainnet"));
 
-  const live = { ...MAINNET, agentApi: { ...MAINNET.agentApi, enabled: true } };
-  h.state.networks = { "arc-mainnet": live, "arc-testnet": TESTNET };
-  h.state.reads["arc-mainnet"] = healthyRead(live, { agentRelayerBalanceWei: 3n * USDC });
-  await h.run(1);
+  // Watched: mainnet's /health names mainnet and its own relayer, so only the low balance is raised.
+  h.state.networks = { "arc-mainnet": LIVE_MAINNET, "arc-testnet": TESTNET };
+  h.state.reads["arc-mainnet"] = healthyRead(LIVE_MAINNET, { agentRelayerBalanceWei: 3n * USDC });
+  const watched = await h.run(1);
   assert.deepEqual(h.state.polled, ["arc-testnet", "arc-mainnet", "arc-testnet"]);
+  assert.equal(watched.networks["arc-mainnet"].agentApi.ok, true);
+  assert.equal(watched.subrequests, 2 + 2 + 2 + 1, "two chain batches per network, two /health polls and one Telegram send");
   assert.deepEqual(h.state.telegram.map((m) => m.text), [
     "[arc-mainnet] WARNING agent API relayer balance low: relayer 0x8B465645ed88F6d487d279003aD3681e7aF8e8B7 holds 3 USDC (warning below 4, alarm below 1); top it up before sales stop at 3 calls' cost",
   ]);
@@ -666,10 +681,12 @@ test("mainnet's agent API is off: not polled, not read, no checks, no section; t
   assert.ok(pageText(renderHtml(status)).includes("Agent API · arc-mainnet"));
 
   // Switched off again: its alerts resolve and it is no longer polled.
-  h.state.networks = { "arc-mainnet": MAINNET, "arc-testnet": TESTNET };
+  h.state.networks = { "arc-mainnet": OFF_MAINNET, "arc-testnet": TESTNET };
   await h.run(2);
   assert.equal(h.state.telegram.at(-1).text, "[arc-mainnet] RESOLVED agent API relayer balance low after 1 min");
   assert.deepEqual(h.state.polled.slice(3), ["arc-testnet"]);
+  status = buildStatus(h.storage, TELEGRAM, T0 + 125, [], h.state.networks);
+  assert.deepEqual(status.networks["arc-mainnet"].agentApi, { enabled: false });
 });
 
 test("status JSON and HTML: the Agent API section shows the figures and its own alerts, never payers or payment ids", async () => {
