@@ -237,7 +237,6 @@ const utc = (t) => `${new Date(t * 1000).toISOString().replace("T", " ").slice(0
 // Tones are fixed class names; stored values only ever select one of them and never reach markup themselves.
 const TONES = { ok: "ok", warning: "warning", alarm: "alarm", muted: "muted" };
 const LABELS = { ok: "OK", warning: "WARNING", alarm: "ALARM" };
-const DELIVERY_TONES = { sent: "ok", pending: "warning", failed: "alarm", not_sent: "muted" };
 const DOCUMENT_VIEW = { ok: ["ok", "ok"], alarm: ["MISMATCH", "alarm"] };
 
 const pick = (map, key) => (typeof key === "string" && Object.hasOwn(map, key) ? map[key] : undefined);
@@ -463,15 +462,6 @@ function listingsSection(listings) {
   );
 }
 
-function noticesSection(messages) {
-  if (!messages.length) return "";
-  const items = messages.map((m) => {
-    const tone = pick(DELIVERY_TONES, m.delivery) ?? "muted";
-    return `<li><span class="when">${escapeHtml(utc(m.at))}</span>${state(tone, String(m.delivery ?? "").replace(/_/g, " "))}<p>${escapeHtml(m.text)}</p></li>`;
-  });
-  return `<section class="section"><div class="head"><h2>Recent notices</h2></div><ul class="notices">${items.join("")}</ul></section>`;
-}
-
 // D20DAO lockup from the site's brand mark (src/components/brand-mark.tsx in the web repo).
 const BRAND_MARK =
   `<svg role="img" aria-label="D20DAO" height="26" width="137.7" viewBox="0 -5 1112.29 210" xmlns="http://www.w3.org/2000/svg"><title>D20DAO</title>` +
@@ -577,11 +567,6 @@ h3{margin:0 0 4px;color:var(--fg);letter-spacing:.08em}
 .table tbody th{min-width:12em;font-weight:400;white-space:normal}
 .table small{display:block;margin-top:4px;font:12px/1.4 var(--mono);color:var(--muted)}
 .table .note td{padding-top:0;white-space:normal;overflow-wrap:anywhere;font:12px/1.6 var(--mono);color:var(--muted)}
-.notices{list-style:none;margin:0;padding:0;border-top:1px solid var(--line)}
-.notices li{display:grid;grid-template-columns:14em 8em minmax(0,1fr);gap:6px 16px;align-items:baseline;padding:14px 0;border-bottom:1px solid var(--line);font-size:var(--caption);line-height:1.6}
-.notices .state{justify-self:start}
-.notices p{margin:0;overflow-wrap:anywhere}
-.when{font:12px/1.6 var(--mono);color:var(--muted);font-variant-numeric:tabular-nums}
 .ok{color:var(--green)}.warning{color:var(--orange)}.alarm{color:var(--pink)}.muted{color:var(--muted)}
 .pill.ok,.state.ok{border-color:rgba(61,220,132,.45)}
 .pill.warning,.state.warning{border-color:rgba(255,159,28,.45)}
@@ -589,8 +574,7 @@ h3{margin:0 0 4px;color:var(--fg);letter-spacing:.08em}
 .pill.ok i{box-shadow:0 0 0 3px rgba(61,220,132,.22)}
 @media (prefers-reduced-motion:reduce){a{transition:none}}
 @media (max-width:900px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.stats>div:nth-child(3){border-left:0}.stats>div:nth-child(n+3){border-top:1px solid var(--line)}.cols{grid-template-columns:minmax(0,1fr)}.header nav{gap:8px 16px}}
-@media (max-width:600px){.shell{width:calc(100% - 32px)}main{padding-top:28px}.header{flex-wrap:wrap;gap:16px}.header nav{width:100%}.brand svg{height:22px}.brand span{padding-left:12px;margin-left:0}.section{margin-top:32px;padding-top:24px}.table th,.table td{padding:12px 10px}.notices li{grid-template-columns:auto minmax(0,1fr)}.notices p{grid-column:1/-1}}
-@media (max-width:420px){.stats>div{padding:14px}.stats .fig{font-size:17px}}
+@media (max-width:600px){.shell{width:calc(100% - 32px)}main{padding-top:28px}.header{flex-wrap:wrap;gap:16px}.header nav{width:100%}.brand svg{height:22px}.brand span{padding-left:12px;margin-left:0}.section{margin-top:32px;padding-top:24px}.table th,.table td{padding:12px 10px}@media (max-width:420px){.stats>div{padding:14px}.stats .fig{font-size:17px}}
 `;
 
 export function renderHtml(status) {
@@ -619,7 +603,7 @@ ${HEAD_META}
 <header class="header"><a class="brand" href="https://d20dao.org">${BRAND_MARK}<span>Status</span></a><nav aria-label="D20DAO"><a href="https://d20dao.org/explorer">Explorer</a><a href="https://d20dao.org/docs">Docs</a><a href="/status.json">status.json</a></nav></header>
 <main id="status" tabindex="-1">
 <div class="top"><div><h1>D20DAO keeper watchdog</h1><p class="tagline">Generated ${escapeHtml(utc(status.generatedAt))} · notifier ${escapeHtml(status.notifier)}</p></div><p${cls("pill", overall)}><i aria-hidden="true"></i>${label(overall)}</p></div>
-${sections}${noticesSection(status.recentMessages)}
+${sections}
 </main>
 </div>
 </body>
