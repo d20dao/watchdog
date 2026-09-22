@@ -30,9 +30,10 @@ export const NETWORKS = Object.freeze({
     keeper: "0xA5496Bb35905Bfe0Bac7D23Ca18c008F5E6Eb13e",
     // Follower keeper authorized as a backup committer; its fulfillments are ours, not a foreign submitter.
     backupKeepers: Object.freeze(["0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685"]),
-    // Expected ERC-1967 implementations; update after each reviewed upgrade.
+    // Expected ERC-1967 implementations; update after each reviewed upgrade. A list accepts each of its addresses,
+    // so a reviewed upgrade can be approved before it executes: the current implementation first, then the next.
     implementations: Object.freeze({
-      coordinator: "0xd20da0DADa4352A1a9722be43a2D85923443458c",
+      coordinator: Object.freeze(["0xd20da0DADa4352A1a9722be43a2D85923443458c", "0xD20da000125643B4db5A6A36A3b853c17745DF44"]),
       registry: "0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865",
     }),
     feeCapWei: 2000n * GWEI,
@@ -59,7 +60,7 @@ export const NETWORKS = Object.freeze({
     backupKeepers: Object.freeze(["0xbb2fdE97a5F4855bEf872C71fbb80Be3170127Ee"]),
     // Recipe registry and per-submitter keeper share, upgraded on 2026-09-18.
     implementations: Object.freeze({
-      coordinator: "0xd20da0DADa4352A1a9722be43a2D85923443458c",
+      coordinator: Object.freeze(["0xd20da0DADa4352A1a9722be43a2D85923443458c", "0xD20da000125643B4db5A6A36A3b853c17745DF44"]),
       registry: "0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865",
     }),
     feeCapWei: 100n * GWEI,

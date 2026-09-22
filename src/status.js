@@ -20,6 +20,8 @@ import { notifierConfigured } from "./telegram.js";
 
 const age = (now, t) => (t == null ? null : Math.max(0, now - t));
 const same = (a, b) => (a == null ? null : a.toLowerCase() === b.toLowerCase());
+// An implementation setting is one address or a list of accepted ones (see config.js).
+const accepted = (a, expected) => (a == null ? null : [].concat(expected).some((b) => same(a, b)));
 
 /** One report stream's stored state as published: the same fields for the keeper and its backup. */
 function reportView(r, now) {
@@ -202,8 +204,8 @@ export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets =
             feeCapGwei: formatGwei(net.feeCapWei),
             feeCapUsagePercent,
             committerIsKeeper: same(c.committer, net.keeper),
-            coordinatorImplementationExpected: same(c.coordinatorImpl, net.implementations.coordinator),
-            registryImplementationExpected: same(c.registryImpl, net.implementations.registry),
+            coordinatorImplementationExpected: accepted(c.coordinatorImpl, net.implementations.coordinator),
+            registryImplementationExpected: accepted(c.registryImpl, net.implementations.registry),
             refundScanCursorBlock: c.logCursor,
           }
         : null,

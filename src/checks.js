@@ -235,14 +235,16 @@ export function evaluateChainChecks(net, chain) {
       : alarm("registry committer is not the keeper", `committer() is ${chain.committer}, expected ${net.keeper}`);
   }
   if (chain.coordinatorImpl != null) {
-    result.coordinator_impl = lower(chain.coordinatorImpl) === lower(net.implementations.coordinator)
+    const expected = [].concat(net.implementations.coordinator);
+    result.coordinator_impl = expected.some((a) => lower(a) === lower(chain.coordinatorImpl))
       ? null
-      : alarm("coordinator implementation changed", `ERC-1967 slot is ${chain.coordinatorImpl}, expected ${net.implementations.coordinator}`);
+      : alarm("coordinator implementation changed", `ERC-1967 slot is ${chain.coordinatorImpl}, expected ${expected.join(" or ")}`);
   }
   if (chain.registryImpl != null) {
-    result.registry_impl = lower(chain.registryImpl) === lower(net.implementations.registry)
+    const expected = [].concat(net.implementations.registry);
+    result.registry_impl = expected.some((a) => lower(a) === lower(chain.registryImpl))
       ? null
-      : alarm("registry implementation changed", `ERC-1967 slot is ${chain.registryImpl}, expected ${net.implementations.registry}`);
+      : alarm("registry implementation changed", `ERC-1967 slot is ${chain.registryImpl}, expected ${expected.join(" or ")}`);
   }
   return result;
 }

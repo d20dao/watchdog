@@ -273,6 +273,18 @@ test("committer and implementation slots", () => {
   }
 });
 
+test("a listed implementation is accepted, so an approved upgrade raises no alarm", () => {
+  const current = "0x00000000000000000000000000000000000000c1";
+  const next = "0x00000000000000000000000000000000000000c2";
+  const net = { ...MAINNET, implementations: { ...MAINNET.implementations, coordinator: [current, next] } };
+  for (const impl of [current, next, next.toUpperCase().replace("0X", "0x")]) {
+    assert.equal(severity(evaluateChainChecks(net, healthyRead(net, { coordinatorImpl: impl })).coordinator_impl), "clear");
+  }
+  const other = evaluateChainChecks(net, healthyRead(net, { coordinatorImpl: "0x00000000000000000000000000000000000000c3" }));
+  assert.equal(other.coordinator_impl.severity, "alarm");
+  assert.equal(other.coordinator_impl.detail, `ERC-1967 slot is 0x00000000000000000000000000000000000000c3, expected ${current} or ${next}`);
+});
+
 test("refund logs raise an alarm event with request ids", () => {
   const refunds = [812n, 813n].map((requestId) => ({
     requestId,

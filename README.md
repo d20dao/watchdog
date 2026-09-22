@@ -49,7 +49,7 @@ These run every minute for each network. Thresholds live in `src/config.js` (`TH
 | `backup_role`: backup's latest report has a `health.role` other than `follower` | — | alarm |
 | `base_fee`: 2 × baseFee + 1 gwei against the fee cap (mainnet 2000 gwei, testnet 100 gwei) | > 60 % | > 85 % |
 | `committer`: registry `committer()` ≠ keeper wallet | — | alarm |
-| `coordinator_impl`, `registry_impl`: ERC-1967 implementation slot ≠ expected | — | alarm |
+| `coordinator_impl`, `registry_impl`: ERC-1967 implementation slot is not an expected one (a list approves a reviewed upgrade before it executes) | — | alarm |
 | `foreign_submitter`: `RandomnessFulfilled` whose submitter is neither the keeper nor a configured backup keeper | one-shot notice | — |
 | `rpc`: watchdog chain read failed or was partial for ≥ 3 consecutive runs | "watchdog cannot read chain" | — |
 | `dropped_events`: keeper `droppedTotal` increased (the receiver contract asks receivers to alert on dropped counts) | one-shot notice | — |
