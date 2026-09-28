@@ -31,6 +31,43 @@ export function canonicalRequest(body) {
   return JSON.stringify(parts);
 }
 
+const sortedEntries = (object) => Object.keys(object ?? {}).sort(compareKeys).map((key) => [key, object[key]]);
+
+/**
+ * AirnodeHub passthrough request, as the gateway signs it and as a passthrough recipe registers it: the JSON of
+ * ["passthrough", method, path, query entries sorted by name, body as sent (or ""), projection entries sorted by
+ * alias when the request projects].
+ */
+export function canonicalPassthroughRequest(passthrough) {
+  const parts = ["passthrough", passthrough.method, passthrough.path, sortedEntries(passthrough.query), passthrough.body ?? ""];
+  if (passthrough.projection !== undefined) parts.push(sortedEntries(passthrough.projection));
+  return JSON.stringify(parts);
+}
+
+/** The canonical request a recipe's gateway signs: its passthrough request, or the canonical form of its POST / body. */
+export function recipeRequest(recipe) {
+  return recipe.passthrough ? canonicalPassthroughRequest(recipe.passthrough) : canonicalRequest(recipe.body);
+}
+
+const percentEncode = (text) =>
+  Array.from(encoder.encode(text), (byte) =>
+    /[A-Za-z0-9._~-]/.test(String.fromCharCode(byte)) ? String.fromCharCode(byte) : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`,
+  ).join("");
+
+/**
+ * Where a keeper sends a passthrough request: the gateway's /api and the path, then the query entries and one
+ * x-airnode-project parameter per projection entry in canonical order, names and values percent-encoded except
+ * unreserved characters, exactly as the keeper builds it.
+ */
+export function passthroughUrl(recipe) {
+  const { path, query, projection } = recipe.passthrough;
+  const params = [
+    ...sortedEntries(query).map(([name, value]) => `${percentEncode(name)}=${percentEncode(value)}`),
+    ...sortedEntries(projection).map(([alias, pointer]) => `x-airnode-project=${percentEncode(`${alias}:${pointer}`)}`),
+  ];
+  return `${recipe.url.replace(/\/+$/, "")}/api${path}${params.length ? `?${params.join("&")}` : ""}`;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Signed data shape (a port of EpochEntropy._validate and its _literal, _number and _hex helpers)
 
@@ -264,6 +301,7 @@ export function checkListingDocument(recipe, doc) {
   if (address.toLowerCase() !== recipe.signer.toLowerCase()) {
     return { outcome: "signer", reason: `x-airnode.address is ${address}, catalog expects ${recipe.signer}` };
   }
+  if (recipe.passthrough) return checkPassthroughRoute(recipe, doc);
 
   const schema = doc.paths?.["/"]?.post?.requestBody?.content?.["application/json"]?.schema;
   const alternatives = isObject(schema) ? (Array.isArray(schema.oneOf) ? schema.oneOf : [schema]) : [];
@@ -298,6 +336,30 @@ export function checkListingDocument(recipe, doc) {
     !Object.hasOwn(op.properties, "responseProjection")
   ) {
     return operation(`${name} no longer accepts responseProjection`);
+  }
+  return { outcome: "ok", reason: null };
+}
+
+/**
+ * A passthrough recipe against x-airnode.passthrough.routes: its operation must still be routed with the method, path
+ * template, parameter locations and constant body the recipe was built for. Reasons never echo document values.
+ */
+function checkPassthroughRoute(recipe, doc) {
+  const { operation: name, route: expected } = recipe.passthrough;
+  const operation = (reason) => ({ outcome: "operation", reason });
+  const routes = doc["x-airnode"].passthrough?.routes;
+  if (!isObject(routes)) return { outcome: "failure", reason: "listing document lists no passthrough routes" };
+  const route = routes[name];
+  if (!isObject(route)) return operation(`${name} is no longer offered through /api`);
+  if (route.method !== expected.method) return operation(`${name} through /api changed its method`);
+  if (route.path !== expected.path) return operation(`${name} through /api changed its path`);
+  for (const [parameter, location] of Object.entries(expected.parameters ?? {})) {
+    if (!isObject(route.parameters) || route.parameters[parameter] !== location) {
+      return operation(`${name} through /api no longer takes ${parameter} in the ${location}`);
+    }
+  }
+  if (JSON.stringify(route.body ?? null) !== JSON.stringify(expected.body ?? null)) {
+    return operation(`${name} through /api changed its constant body`);
   }
   return { outcome: "ok", reason: null };
 }

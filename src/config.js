@@ -185,7 +185,10 @@ const MULTICALL3_GET_LAST_BLOCK_HASH = { to: "0xcA11bde05977b3631167028862bE2a17
  *   name    shown in messages and on the status page
  *   recipe  EpochEntropy recipe id: recipeRequest(recipe) must equal the canonical form of `body`
  *   url     the listing's gateway: POST `body` for a signed reply, GET for the listing's OpenAPI document
- *   body    the request, sent as JSON
+ *   body    the request, sent as JSON (POST / recipes)
+ *   passthrough  instead of body, the provider's own request at the gateway's /api: {operation, method, path, query?,
+ *           body? (exact text), projection?, route}; route is the entry the listing document's
+ *           x-airnode.passthrough.routes held for the operation when the recipe was built
  *   signer  the airnode address the registry catalog holds for this recipe
  *   shape   the signed data bytes EpochEntropy._validate accepts (at most 128 bytes), as a sequence of:
  *             {literal: "..."}             exactly this text
@@ -195,6 +198,30 @@ const MULTICALL3_GET_LAST_BLOCK_HASH = { to: "0xcA11bde05977b3631167028862bE2a17
  *             {integer: {digits: n}}       exactly n digits, no leading zero
  *             {hex: n}                     exactly n lowercase hex characters
  */
+// Signed records EpochEntropy accepts; a listing's POST / and passthrough forms answer with the same record.
+const SHAPES = {
+  btcDayVolume: [{ literal: '{"symbol":"BTC","value":"' }, { number: "decimal" }, { literal: '"}' }],
+  blockHash: [{ literal: '{"id":null,"jsonrpc":"2.0","result":"0x' }, { hex: 64 }, { literal: '"}' }],
+  btcUsdTrade: [
+    { literal: '{"symbol":"BTCUSD","price":' },
+    { number: "json" },
+    { literal: ',"size":' },
+    { number: "json" },
+    { literal: ',"timestamp":' },
+    { integer: { maxDigits: 16 } },
+    { literal: "}" },
+  ],
+  ethUsdFeed: [
+    { literal: '{"ETH/USD":{"value":' },
+    { number: "json" },
+    { literal: ',"timestamp":' },
+    { integer: { digits: 13 } },
+    { literal: ',"category":"crypto"}}' },
+  ],
+};
+const JSON_RPC_BLOCK_HASH_BODY = JSON.stringify({ jsonrpc: "2.0", id: null, method: "eth_call", params: [MULTICALL3_GET_LAST_BLOCK_HASH, "latest"] });
+const JSON_RPC_ROUTE = { method: "POST", path: "/ogrpc", parameters: { network: "query", method: "body", params: "body" } };
+
 export const AIRNODE_RECIPES = deepFreeze([
   {
     id: "hyperliquid-btc-day-volume",
@@ -207,7 +234,7 @@ export const AIRNODE_RECIPES = deepFreeze([
       responseProjection: { symbol: "/0/universe/0/name", value: "/1/0/dayNtlVlm" },
     },
     signer: "0x509F4275Cbe2E2201cc5444bAc8948E3cc7c665B",
-    shape: [{ literal: '{"symbol":"BTC","value":"' }, { number: "decimal" }, { literal: '"}' }],
+    shape: SHAPES.btcDayVolume,
   },
   {
     id: "drpc-ethereum-blockhash",
@@ -219,7 +246,7 @@ export const AIRNODE_RECIPES = deepFreeze([
       parameters: { network: "ethereum", method: "eth_call", params: [MULTICALL3_GET_LAST_BLOCK_HASH, "latest"] },
     },
     signer: "0x511AcE8648D2f64260d50D036F8f8ce622d92137",
-    shape: [{ literal: '{"id":null,"jsonrpc":"2.0","result":"0x' }, { hex: 64 }, { literal: '"}' }],
+    shape: SHAPES.blockHash,
   },
   {
     id: "tickerlayer-btcusd",
@@ -228,15 +255,7 @@ export const AIRNODE_RECIPES = deepFreeze([
     url: "https://airnode-tickerlayer.fly.dev/",
     body: { operation: "lastTrade", parameters: { assetClass: "crypto", symbol: "BTCUSD" } },
     signer: "0x32f5eA20F05fdADfCD50Cb8eD920acE96D5f9f2c",
-    shape: [
-      { literal: '{"symbol":"BTCUSD","price":' },
-      { number: "json" },
-      { literal: ',"size":' },
-      { number: "json" },
-      { literal: ',"timestamp":' },
-      { integer: { maxDigits: 16 } },
-      { literal: "}" },
-    ],
+    shape: SHAPES.btcUsdTrade,
   },
   {
     id: "nodary-eth-usd",
@@ -245,13 +264,7 @@ export const AIRNODE_RECIPES = deepFreeze([
     url: "https://airnode-nodary.fly.dev/",
     body: { operation: "latestFeeds", parameters: { name: "ETH/USD" } },
     signer: "0xE70f1e8b22a21e4Bb5188918a3033341b281E4c0",
-    shape: [
-      { literal: '{"ETH/USD":{"value":' },
-      { number: "json" },
-      { literal: ',"timestamp":' },
-      { integer: { digits: 13 } },
-      { literal: ',"category":"crypto"}}' },
-    ],
+    shape: SHAPES.ethUsdFeed,
   },
   {
     id: "drpc-base-blockhash",
@@ -263,6 +276,70 @@ export const AIRNODE_RECIPES = deepFreeze([
       parameters: { network: "base", method: "eth_call", params: [MULTICALL3_GET_LAST_BLOCK_HASH, "latest"] },
     },
     signer: "0x511AcE8648D2f64260d50D036F8f8ce622d92137",
-    shape: [{ literal: '{"id":null,"jsonrpc":"2.0","result":"0x' }, { hex: 64 }, { literal: '"}' }],
+    shape: SHAPES.blockHash,
+  },
+  // The same listings through the gateways' passthrough (/api), registered as recipes 6 to 10 in the same slot order.
+  {
+    id: "hyperliquid-btc-day-volume-api",
+    name: "Hyperliquid BTC day volume (/api)",
+    recipe: 6,
+    url: "https://airnode-hyperliquid.fly.dev/",
+    passthrough: {
+      operation: "metaAndAssetCtxs",
+      method: "POST",
+      path: "/info",
+      body: '{"type":"metaAndAssetCtxs","dex":""}',
+      projection: { symbol: "/0/universe/0/name", value: "/1/0/dayNtlVlm" },
+      route: { method: "POST", path: "/info", body: { type: "metaAndAssetCtxs" }, parameters: { dex: "body" } },
+    },
+    signer: "0x509F4275Cbe2E2201cc5444bAc8948E3cc7c665B",
+    shape: SHAPES.btcDayVolume,
+  },
+  {
+    id: "drpc-ethereum-blockhash-api",
+    name: "dRPC Ethereum block hash (/api)",
+    recipe: 7,
+    url: "https://airnode-drpc.fly.dev/",
+    passthrough: { operation: "jsonRpc", method: "POST", path: "/ogrpc", query: { network: "ethereum" }, body: JSON_RPC_BLOCK_HASH_BODY, route: JSON_RPC_ROUTE },
+    signer: "0x511AcE8648D2f64260d50D036F8f8ce622d92137",
+    shape: SHAPES.blockHash,
+  },
+  {
+    id: "tickerlayer-btcusd-api",
+    name: "TickerLayer BTCUSD last trade (/api)",
+    recipe: 8,
+    url: "https://airnode-tickerlayer.fly.dev/",
+    passthrough: {
+      operation: "lastTrade",
+      method: "GET",
+      path: "/crypto/trade/last/BTCUSD",
+      route: { method: "GET", path: "/{assetClass}/trade/last/{symbol}", parameters: { assetClass: "path", symbol: "path" } },
+    },
+    signer: "0x32f5eA20F05fdADfCD50Cb8eD920acE96D5f9f2c",
+    shape: SHAPES.btcUsdTrade,
+  },
+  {
+    id: "nodary-eth-usd-api",
+    name: "Nodary ETH/USD (/api)",
+    recipe: 9,
+    url: "https://airnode-nodary.fly.dev/",
+    passthrough: {
+      operation: "latestFeeds",
+      method: "GET",
+      path: "/feed/latest",
+      query: { name: "ETH/USD" },
+      route: { method: "GET", path: "/feed/latest", parameters: { name: "query" } },
+    },
+    signer: "0xE70f1e8b22a21e4Bb5188918a3033341b281E4c0",
+    shape: SHAPES.ethUsdFeed,
+  },
+  {
+    id: "drpc-base-blockhash-api",
+    name: "dRPC Base block hash (/api)",
+    recipe: 10,
+    url: "https://airnode-drpc.fly.dev/",
+    passthrough: { operation: "jsonRpc", method: "POST", path: "/ogrpc", query: { network: "base" }, body: JSON_RPC_BLOCK_HASH_BODY, route: JSON_RPC_ROUTE },
+    signer: "0x511AcE8648D2f64260d50D036F8f8ce622d92137",
+    shape: SHAPES.blockHash,
   },
 ]);

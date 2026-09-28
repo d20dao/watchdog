@@ -121,19 +121,31 @@ Probed recipes (`AIRNODE_RECIPES` in `src/config.js`):
 | `drpc-ethereum-blockhash` (1) | `airnode-drpc.fly.dev`, `jsonRpc` `eth_call` Multicall3 `getLastBlockHash()` on `ethereum` | `0x511A…2137` | `{"id":null,"jsonrpc":"2.0","result":"0x<64 lowercase hex>"}` |
 | `tickerlayer-btcusd` (2) | `airnode-tickerlayer.fly.dev`, `lastTrade` crypto `BTCUSD` | `0x32f5…9f2c` | `{"symbol":"BTCUSD","price":<number>,"size":<number>,"timestamp":<integer>}` |
 | `nodary-eth-usd` (4) | `airnode-nodary.fly.dev`, `latestFeeds` `ETH/USD` | `0xE70f…E4c0` | `{"ETH/USD":{"value":<number>,"timestamp":<13-digit integer>,"category":"crypto"}}` |
-| `drpc-base-blockhash` (6) | `airnode-drpc.fly.dev`, as recipe 1 on `base` | `0x511A…2137` | as recipe 1 |
+| `drpc-base-blockhash` (5) | `airnode-drpc.fly.dev`, as recipe 1 on `base` | `0x511A…2137` | as recipe 1 |
+| `<id>-api` (6, 7, 8, 9, 10) | the same five listings through the gateway's passthrough (`/api`), in that order | as their POST / recipe | as their POST / recipe |
 
-Each probe POSTs the configured body to the gateway (15 s timeout, reply at most 16 KiB) and checks, in order:
+AirnodeHub is retiring the `POST /` envelope. Each listing is probed in both forms until the catalog has moved to the
+passthrough recipes: a failing `POST /` probe then signals that the envelope is gone, and the `-api` probes show
+that the recipes replacing it work.
 
-1. **Reply:** HTTP 200 with a JSON object carrying the signed envelope (`airnode`, `requestHash`, `timestamp`, `data`, `signature`). A timeout, network error, other HTTP status, invalid JSON, an oversized reply or an unsigned `{"error": ...}` counts as a *failed probe*.
-2. **Request hash:** `requestHash` = keccak256 of the AirnodeHub canonical request of the configured body. Every object, at any depth, becomes its `[key, value]` entries sorted by key, arrays keep their order, and a `responseProjection` is appended as a third element. The tests pin each canonical string to `EpochEntropy.recipeRequest`.
+Each probe calls the gateway exactly as the keeper does (15 s timeout, reply at most 16 KiB). A `POST /` recipe posts
+its body and reads the signed envelope. A passthrough recipe sends the provider's own request to `<gateway>/api` +
+path, with the query entries and one `x-airnode-project` parameter per projection entry in canonical order,
+percent-encoded except unreserved characters, and reads the attestation from the `X-Airnode-Address`,
+`X-Airnode-Request-Hash`, `X-Airnode-Timestamp` and `X-Airnode-Signature` headers over the body exactly as received.
+Each reply is checked in order:
+
+1. **Reply:** HTTP 200 with the signed envelope (`airnode`, `requestHash`, `timestamp`, `data`, `signature`) or, for a passthrough recipe, the attestation headers. A timeout, network error, other HTTP status, invalid JSON, an oversized reply, an unsigned `{"error": ...}` or a passthrough answer without attestation headers counts as a *failed probe*.
+2. **Request hash:** `requestHash` = keccak256 of the recipe's canonical request. For a `POST /` recipe that is the AirnodeHub canonical request of the configured body: every object, at any depth, becomes its `[key, value]` entries sorted by key, arrays keep their order, and a `responseProjection` is appended as a third element. For a passthrough recipe it is the JSON of `["passthrough", method, path, query entries sorted by name, body as sent]` with the projection entries sorted by alias as a sixth element. The tests pin each canonical string to `EpochEntropy.recipeRequest`.
 3. **Signer:** `airnode` is the configured signer, and the EIP-191 personal-sign signer of keccak256(abi.encodePacked(bytes32 requestHash, uint256 timestamp, bytes data)) is the configured signer. The data bytes are `data` itself when it is a string, otherwise `JSON.stringify(data)`. Signatures follow OpenZeppelin `ECDSA.recover`: 65 bytes, v 27 or 28, low s.
 4. **Data shape:** the data bytes pass a port of `EpochEntropy._validate` for the recipe: 1 to 128 bytes, exact literals and key order, the same number grammar.
 5. **Signed timestamp:** at most 240 s before the probe (the registry's `MAX_ATTESTATION_AGE`) and at most 60 s after it.
 
 Once a day the watchdog also GETs each gateway's OpenAPI document (one request per gateway URL, covering all its
 recipes). It checks that `x-airnode.address` is the configured signer and that the operation is still offered, still
-accepts every parameter and the projection the recipe sends, and requires no parameter the recipe omits. A document
+accepts every parameter and the projection the recipe sends, and requires no parameter the recipe omits. For a
+passthrough recipe it checks `x-airnode.passthrough.routes`: the operation keeps the method, path template,
+parameter locations and constant body the recipe was built for. A document
 that cannot be read or is in an unrecognized format raises nothing, because the POST probe covers reachability. The
 read is retried an hour later.
 

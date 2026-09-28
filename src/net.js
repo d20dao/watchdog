@@ -45,7 +45,7 @@ async function readTextLimited(response, maxBytes) {
 }
 
 /**
- * POST/GET and return {status, ok, text}. `readBody: false` discards the body without reading it, and so does an
+ * POST/GET and return {status, ok, text, headers}. `readBody: false` discards the body without reading it, and so does an
  * error status unless `readErrorBody` is set.
  * With `maxBytes`, a longer body throws ResponseTooLargeError as soon as the limit is passed.
  * Throws FetchTimeoutError on timeout; other network errors are rethrown as-is.
@@ -63,10 +63,10 @@ export async function fetchText(fetchImpl, url, init, timeoutMs, { readBody = tr
       try {
         await response.body?.cancel();
       } catch {}
-      return { status: response.status, ok: response.ok, text: null };
+      return { status: response.status, ok: response.ok, text: null, headers: response.headers };
     }
     const text = maxBytes === undefined ? await response.text() : await readTextLimited(response, maxBytes);
-    return { status: response.status, ok: response.ok, text };
+    return { status: response.status, ok: response.ok, text, headers: response.headers };
   } catch (err) {
     if (timedOut) throw new FetchTimeoutError();
     throw err;

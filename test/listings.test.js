@@ -6,32 +6,41 @@ import {
   MAX_DATA_BYTES,
   applyDocumentResult,
   applyProbeResult,
+  canonicalPassthroughRequest,
   canonicalRequest,
   checkListingDocument,
   describeShape,
   listingUrls,
   nextSlot,
+  passthroughUrl,
   planProbeTasks,
+  recipeRequest,
   shapeMismatch,
 } from "../src/listings.js";
-import { EPOCH_RECIPE_REQUESTS, UNREGISTERED_RECIPE_REQUESTS, listingDocument, loadSamples } from "./helpers.js";
+import { readFileSync } from "node:fs";
+import { EPOCH_RECIPE_REQUESTS, PASSTHROUGH_RECIPE_REQUESTS, UNREGISTERED_RECIPE_REQUESTS, listingDocument, loadSamples } from "./helpers.js";
 
 const encoder = new TextEncoder();
 const byId = Object.fromEntries(AIRNODE_RECIPES.map((recipe) => [recipe.id, recipe]));
 const matches = (recipe, text) => shapeMismatch(recipe.shape, encoder.encode(text));
 
-test("configuration: five recipes with unique ids, registry recipes, https gateways and signers", () => {
-  assert.deepEqual(
-    AIRNODE_RECIPES.map((r) => r.id),
-    ["hyperliquid-btc-day-volume", "drpc-ethereum-blockhash", "tickerlayer-btcusd", "nodary-eth-usd", "drpc-base-blockhash"],
-  );
-  assert.equal(new Set(AIRNODE_RECIPES.map((r) => r.recipe)).size, AIRNODE_RECIPES.length);
+test("configuration: the five catalog recipes and their passthrough forms, unique ids and registry recipes, https gateways and signers", () => {
+  const listings = ["hyperliquid-btc-day-volume", "drpc-ethereum-blockhash", "tickerlayer-btcusd", "nodary-eth-usd", "drpc-base-blockhash"];
+  assert.deepEqual(AIRNODE_RECIPES.map((r) => r.id), [...listings, ...listings.map((id) => `${id}-api`)]);
+  assert.deepEqual(AIRNODE_RECIPES.map((r) => r.recipe), [0, 1, 2, 4, 5, 6, 7, 8, 9, 10]);
   for (const r of AIRNODE_RECIPES) {
     assert.match(r.id, /^[a-z0-9-]+$/);
     assert.match(r.url, /^https:\/\/[a-z0-9.-]+\/$/);
     assert.match(r.signer, /^0x[0-9a-fA-F]{40}$/);
-    assert.ok(Object.isFrozen(r) && Object.isFrozen(r.body) && Object.isFrozen(r.shape));
+    // A recipe is either a POST / body or a passthrough request, never both.
+    assert.ok((r.body === undefined) !== (r.passthrough === undefined), r.id);
+    assert.ok(Object.isFrozen(r) && Object.isFrozen(r.body ?? r.passthrough) && Object.isFrozen(r.shape));
     assert.doesNotThrow(() => describeShape(r.shape));
+  }
+  // Each passthrough form serves the same listing with the same signer and record as its POST / recipe.
+  for (const id of listings) {
+    const [post, api] = [byId[id], byId[`${id}-api`]];
+    assert.deepEqual([api.url, api.signer, api.shape, api.passthrough.operation], [post.url, post.signer, post.shape, post.body.operation]);
   }
   assert.deepEqual(listingUrls(AIRNODE_RECIPES), [
     "https://airnode-hyperliquid.fly.dev/",
@@ -42,7 +51,29 @@ test("configuration: five recipes with unique ids, registry recipes, https gatew
 });
 
 test("canonical requests equal EpochEntropy.recipeRequest for every configured recipe", () => {
-  for (const r of AIRNODE_RECIPES) assert.equal(canonicalRequest(r.body), EPOCH_RECIPE_REQUESTS[r.recipe], r.id);
+  for (const r of AIRNODE_RECIPES) {
+    assert.equal(recipeRequest(r), r.passthrough ? PASSTHROUGH_RECIPE_REQUESTS[r.recipe] : EPOCH_RECIPE_REQUESTS[r.recipe], r.id);
+    if (!r.passthrough) assert.equal(recipeRequest(r), canonicalRequest(r.body));
+  }
+});
+
+test("passthrough requests and URLs match the keeper's shared cases", () => {
+  const cases = JSON.parse(readFileSync(new URL("./fixtures/passthrough-request-cases.json", import.meta.url), "utf8"));
+  for (const c of cases.valid) {
+    const [, method, path, query, body, projection] = JSON.parse(c.request);
+    const passthrough = {
+      method,
+      path,
+      query: Object.fromEntries(query),
+      ...(body === "" ? {} : { body }),
+      ...(projection === undefined ? {} : { projection: Object.fromEntries(projection) }),
+    };
+    assert.equal(canonicalPassthroughRequest(passthrough), c.request, c.note);
+    assert.equal(passthroughUrl({ url: c.gateway, passthrough }), c.url, c.note);
+  }
+  // The configured recipes are sent where the keeper sends them.
+  assert.equal(passthroughUrl(byId["nodary-eth-usd-api"]), "https://airnode-nodary.fly.dev/api/feed/latest?name=ETH%2FUSD");
+  assert.equal(passthroughUrl(byId["tickerlayer-btcusd-api"]), "https://airnode-tickerlayer.fly.dev/api/crypto/trade/last/BTCUSD");
 });
 
 test("canonical requests of every sampled catalog recipe equal the registry literal", () => {
@@ -78,6 +109,11 @@ test("canonicalization sorts object keys at every depth, keeps array order, appe
 
 test("describeShape renders the expected data of each recipe", () => {
   assert.deepEqual(AIRNODE_RECIPES.map((r) => describeShape(r.shape)), [
+    '{"symbol":"BTC","value":"<decimal>"}',
+    '{"id":null,"jsonrpc":"2.0","result":"0x<64 lowercase hex>"}',
+    '{"symbol":"BTCUSD","price":<number>,"size":<number>,"timestamp":<integer>}',
+    '{"ETH/USD":{"value":<number>,"timestamp":<13-digit integer>,"category":"crypto"}}',
+    '{"id":null,"jsonrpc":"2.0","result":"0x<64 lowercase hex>"}',
     '{"symbol":"BTC","value":"<decimal>"}',
     '{"id":null,"jsonrpc":"2.0","result":"0x<64 lowercase hex>"}',
     '{"symbol":"BTCUSD","price":<number>,"size":<number>,"timestamp":<integer>}',
@@ -177,16 +213,16 @@ test("planProbeTasks: everything is due at first; listing documents only in runs
   const first = planProbeTasks(AIRNODE_RECIPES, empty, now);
   assert.equal(first.length, LIMITS.probeMaxPerRun);
   assert.ok(first.every((t) => t.kind === "probe"));
-  assert.deepEqual(first.map((t) => t.phase), [0, 720, 1440, 2160, 2880]);
-  assert.equal(planProbeTasks(AIRNODE_RECIPES, empty, now, 20).length, 5, "documents wait while probes are due");
+  assert.deepEqual(first.map((t) => t.phase), [0, 360, 720, 1080, 1440]);
+  assert.equal(planProbeTasks(AIRNODE_RECIPES, empty, now, 20).length, 10, "documents wait while probes are due");
   assert.deepEqual(planProbeTasks(AIRNODE_RECIPES, empty, now, 2).map((t) => t.recipes[0].id), ["hyperliquid-btc-day-volume", "drpc-ethereum-blockhash"]);
 
-  // After a full round of probes, the four listing documents are due; dRPC's covers both of its recipes.
+  // After a full round of probes, the four listing documents are due; dRPC's covers its four recipes.
   const states = new Map(AIRNODE_RECIPES.map((r) => [r.id, { nextProbeAt: now + 60 }]));
   const documents = planProbeTasks(AIRNODE_RECIPES, states, now);
   assert.deepEqual(documents.map((t) => t.kind), ["document", "document", "document", "document"]);
   assert.deepEqual(documents.map((t) => t.phase), [0, 21600, 43200, 64800]);
-  assert.deepEqual(documents[1].recipes.map((r) => r.id), ["drpc-ethereum-blockhash", "drpc-base-blockhash"]);
+  assert.deepEqual(documents[1].recipes.map((r) => r.id), ["drpc-ethereum-blockhash", "drpc-base-blockhash", "drpc-ethereum-blockhash-api", "drpc-base-blockhash-api"]);
 
   // Nothing due until the next slot; the most overdue probe goes first.
   for (const s of states.values()) s.document = { nextCheckAt: now + 86400 };
@@ -199,7 +235,7 @@ test("planProbeTasks: everything is due at first; listing documents only in runs
   states.get("nodary-eth-usd").nextProbeAt = now + 60;
   states.get("drpc-ethereum-blockhash").nextProbeAt = now + 60;
   states.get("drpc-base-blockhash").document.nextCheckAt = now;
-  assert.deepEqual(planProbeTasks(AIRNODE_RECIPES, states, now).map((t) => [t.kind, t.recipes.length]), [["document", 2]]);
+  assert.deepEqual(planProbeTasks(AIRNODE_RECIPES, states, now).map((t) => [t.kind, t.recipes.length]), [["document", 4]]);
 });
 
 test("probe state: failures count up, a failed probe keeps the last verdict, passing realigns to the phase", () => {
@@ -292,4 +328,31 @@ test("checkListingDocument: signer, operation, parameters and projection", () =>
   assert.equal(checkListingDocument(hyper, { "x-airnode": { address: hyper.signer }, paths: {} }).outcome, "failure");
   // Addresses compare case-insensitively.
   assert.equal(checkListingDocument(hyper, listingDocument(hyper.signer.toLowerCase(), [{ operation: "metaAndAssetCtxs", parameters: ["dex"], projection: true }])).outcome, "ok");
+});
+
+test("checkListingDocument: a passthrough recipe needs its /api route with the same method, path, parameters and body", () => {
+  const [nodary, hyper, ticker] = [byId["nodary-eth-usd-api"], byId["hyperliquid-btc-day-volume-api"], byId["tickerlayer-btcusd-api"]];
+  // The routes the live gateways publish (x-airnode.passthrough.routes, 2026-09-28).
+  const routes = {
+    latestFeeds: { method: "GET", path: "/feed/latest", parameters: { name: "query" } },
+    metaAndAssetCtxs: { method: "POST", path: "/info", body: { type: "metaAndAssetCtxs" }, parameters: { dex: "body" } },
+    lastTrade: { method: "GET", path: "/{assetClass}/trade/last/{symbol}", parameters: { assetClass: "path", symbol: "path" } },
+  };
+  const doc = (signer, overrides = {}) => listingDocument(signer, [], { ...routes, ...overrides });
+  for (const recipe of [nodary, hyper, ticker]) assert.deepEqual(checkListingDocument(recipe, doc(recipe.signer)), { outcome: "ok", reason: null }, recipe.id);
+  const outcome = (recipe, overrides) => checkListingDocument(recipe, doc(recipe.signer, overrides));
+  assert.deepEqual(outcome(nodary, { latestFeeds: undefined }), { outcome: "operation", reason: "latestFeeds is no longer offered through /api" });
+  assert.equal(outcome(nodary, { latestFeeds: { ...routes.latestFeeds, method: "POST" } }).reason, "latestFeeds through /api changed its method");
+  assert.equal(outcome(nodary, { latestFeeds: { ...routes.latestFeeds, path: "/feeds/latest" } }).reason, "latestFeeds through /api changed its path");
+  assert.equal(outcome(nodary, { latestFeeds: { ...routes.latestFeeds, parameters: { name: "body" } } }).reason, "latestFeeds through /api no longer takes name in the query");
+  assert.equal(outcome(hyper, { metaAndAssetCtxs: { ...routes.metaAndAssetCtxs, body: { type: "meta" } } }).reason, "metaAndAssetCtxs through /api changed its constant body");
+  assert.equal(outcome(ticker, { lastTrade: { ...routes.lastTrade, parameters: { assetClass: "path" } } }).reason, "lastTrade through /api no longer takes symbol in the path");
+  // A new optional parameter is not a change to the recipe.
+  assert.equal(outcome(nodary, { latestFeeds: { ...routes.latestFeeds, parameters: { name: "query", category: "query" } } }).outcome, "ok");
+  // Another signer is reported as for POST / recipes; a document without passthrough routes is a failed read.
+  assert.equal(checkListingDocument(nodary, doc("0x" + "11".repeat(20))).outcome, "signer");
+  assert.equal(checkListingDocument(nodary, listingDocument(nodary.signer, [])).outcome, "failure");
+  // Document values are never echoed into a reason.
+  const hostile = outcome(nodary, { latestFeeds: { ...routes.latestFeeds, method: "<b>SECRET</b>" } });
+  assert.ok(!hostile.reason.includes("SECRET"));
 });

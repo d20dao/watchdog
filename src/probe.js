@@ -5,7 +5,7 @@
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { LIMITS, THRESHOLDS } from "./config.js";
-import { canonicalRequest, checkListingDocument, describeShape, failedTaskResult, shapeMismatch } from "./listings.js";
+import { canonicalRequest, checkListingDocument, describeShape, failedTaskResult, passthroughUrl, recipeRequest, shapeMismatch } from "./listings.js";
 import { FetchTimeoutError, ResponseTooLargeError, fetchText } from "./net.js";
 
 const encoder = new TextEncoder();
@@ -36,6 +36,11 @@ export function hexToBytes(hex) {
 /** keccak256 of the canonical request, lowercase 0x hex: the requestHash a gateway signs and the registry's queryHash. */
 export function requestHash(body) {
   return "0x" + bytesToHex(keccak_256(encoder.encode(canonicalRequest(body))));
+}
+
+/** keccak256 of the canonical request a recipe's gateway signs, for a POST / body or a passthrough request alike. */
+export function recipeRequestHash(recipe) {
+  return "0x" + bytesToHex(keccak_256(encoder.encode(recipeRequest(recipe))));
 }
 
 /** The bytes a gateway signs: `data` itself when it is a string, otherwise its compact JSON. */
@@ -96,7 +101,7 @@ export function evaluateResponse(recipe, payload, nowSec) {
     return failure(Object.hasOwn(payload, "error") ? "unsigned gateway error" : "reply is not a signed response");
   }
 
-  const expected = requestHash(recipe.body);
+  const expected = recipeRequestHash(recipe);
   const got = payload.requestHash;
   if (typeof got !== "string" || got.toLowerCase() !== expected) {
     const shown = typeof got === "string" && HASH.test(got) ? shortHash(got.toLowerCase()) : "no valid requestHash";
@@ -144,20 +149,34 @@ export function evaluateResponse(recipe, payload, nowSec) {
 const transportReason = (err) =>
   err instanceof FetchTimeoutError ? "timeout" : err instanceof ResponseTooLargeError ? "reply too large" : "network error";
 
-/** POST a recipe to its gateway and judge the reply. Never throws. */
+/** The X-Airnode-* headers a passthrough reply attests with, as the envelope field each one stands for. */
+const ATTESTATION_HEADERS = { airnode: "x-airnode-address", requestHash: "x-airnode-request-hash", timestamp: "x-airnode-timestamp", signature: "x-airnode-signature" };
+
+/**
+ * Send a recipe to its gateway as the keeper does and judge the reply. A POST / recipe posts its body and reads the
+ * signed envelope; a passthrough recipe sends its request to the gateway's /api and reads the attestation from the
+ * X-Airnode-* headers over the body exactly as received. Never throws.
+ */
 export async function probeRecipe(recipe, { fetch, clock = () => Date.now(), timeoutMs = LIMITS.probeTimeoutMs }) {
   const started = clock();
   const elapsed = () => Math.max(0, Math.round(clock() - started));
+  const passthrough = recipe.passthrough;
   let response;
   try {
     response = await fetchText(
       fetch,
-      recipe.url,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json", "user-agent": USER_AGENT },
-        body: JSON.stringify(recipe.body),
-      },
+      passthrough ? passthroughUrl(recipe) : recipe.url,
+      passthrough
+        ? {
+            method: passthrough.method,
+            headers: { ...(passthrough.body === undefined ? {} : { "content-type": "application/json" }), accept: "*/*", "user-agent": USER_AGENT },
+            ...(passthrough.body === undefined ? {} : { body: passthrough.body }),
+          }
+        : {
+            method: "POST",
+            headers: { "content-type": "application/json", accept: "application/json", "user-agent": USER_AGENT },
+            body: JSON.stringify(recipe.body),
+          },
       timeoutMs,
       { maxBytes: LIMITS.probeMaxResponseBytes },
     );
@@ -167,10 +186,19 @@ export async function probeRecipe(recipe, { fetch, clock = () => Date.now(), tim
   const latencyMs = elapsed();
   if (!response.ok) return { ...failure(`http ${response.status}`), latencyMs };
   let payload;
-  try {
-    payload = JSON.parse(response.text);
-  } catch {
-    return { ...failure("invalid json"), latencyMs };
+  if (passthrough) {
+    const attested = Object.entries(ATTESTATION_HEADERS).flatMap(([field, name]) => {
+      const value = response.headers?.get(name);
+      return value === null || value === undefined ? [] : [[field, value.trim()]];
+    });
+    if (attested.length === 0) return { ...failure("unsigned gateway answer"), latencyMs };
+    payload = { ...Object.fromEntries(attested), data: response.text };
+  } else {
+    try {
+      payload = JSON.parse(response.text);
+    } catch {
+      return { ...failure("invalid json"), latencyMs };
+    }
   }
   return { ...evaluateResponse(recipe, payload, Math.floor(clock() / 1000)), latencyMs };
 }

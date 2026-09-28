@@ -11,6 +11,7 @@ import {
   hexToBytes,
   probeRecipe,
   readListingDocument,
+  recipeRequestHash,
   recoverSigner,
   requestHash,
   runProbeTasks,
@@ -18,7 +19,8 @@ import {
 } from "../src/probe.js";
 import { buildStatus, renderHtml } from "../src/status.js";
 import { readAlerts, readProbeStates } from "../src/store.js";
-import { MAINNET, TESTNET, agentApiPoll, healthyRead, listingDocument, loadSamples, memoryStorage, pageText } from "./helpers.js";
+import { passthroughUrl } from "../src/listings.js";
+import { MAINNET, TESTNET, agentApiPoll, healthyRead, listingDocument, loadPassthroughSamples, loadSamples, memoryStorage, pageText } from "./helpers.js";
 
 // Agent API polls are covered in agentapi.test.js; here each answers healthy for its own network, without a fetch.
 const readAgentApiImpl = async (net) => agentApiPoll({}, net);
@@ -70,7 +72,7 @@ function personalSign(digest, key) {
 }
 
 /** A gateway reply for `recipe`, signed with `key` over `hash` (the recipe's request hash by default). */
-function signedReply(recipe, data, timestamp, { key = TEST_KEY, hash = requestHash(recipe.body), airnode = recipe.signer } = {}) {
+function signedReply(recipe, data, timestamp, { key = TEST_KEY, hash = recipeRequestHash(recipe), airnode = recipe.signer } = {}) {
   const digest = attestationDigest(hash, BigInt(timestamp), signedDataBytes(data));
   return { airnode, requestHash: hash, timestamp: String(timestamp), data, signature: personalSign(digest, key) };
 }
@@ -86,7 +88,13 @@ const TRADE_DATA = (ms) => ({ symbol: "BTCUSD", price: 76437.4, size: 0.00003761
 // Request hash and signature
 
 test("requestHash of every configured recipe equals the requestHash its gateway signed", () => {
-  for (const recipe of AIRNODE_RECIPES) {
+  const passthrough = loadPassthroughSamples().recipes;
+  for (const recipe of AIRNODE_RECIPES.filter((r) => r.passthrough)) {
+    const entry = passthrough.find((e) => `${e.name}-api` === recipe.id);
+    assert.equal(entry.samples.length, 2, recipe.id);
+    for (const s of entry.samples) assert.equal(recipeRequestHash(recipe), s.requestHash, recipe.id);
+  }
+  for (const recipe of AIRNODE_RECIPES.filter((r) => !r.passthrough)) {
     const samples = SAMPLES.filter((s) => s.recipe === recipe.id);
     assert.equal(samples.length, 2, recipe.id);
     for (const s of samples) assert.equal(requestHash(recipe.body), s.response.requestHash, recipe.id);
@@ -250,6 +258,45 @@ test("probeRecipe POSTs the configured body and never echoes the reply", async (
   assert.equal((await run(hang, { timeoutMs: 10 })).reason, "timeout");
 });
 
+test("probeRecipe sends a passthrough recipe to the gateway's /api as the keeper does and verifies the header attestation", async () => {
+  const entries = loadPassthroughSamples().recipes;
+  for (const recipe of AIRNODE_RECIPES.filter((r) => r.passthrough)) {
+    const sample = entries.find((e) => `${e.name}-api` === recipe.id).samples[0];
+    let ms = Number(sample.timestamp) * 1000;
+    const seen = [];
+    const headers = {
+      "content-type": "application/json; charset=utf-8",
+      "x-airnode-address": sample.airnode,
+      "x-airnode-request-hash": sample.requestHash,
+      "x-airnode-timestamp": sample.timestamp,
+      "x-airnode-signature": sample.signature,
+      "x-airnode-operation": sample.operation,
+    };
+    const fetch = async (url, init) => {
+      seen.push({ url, init });
+      ms += 90;
+      return new Response(sample.data, { headers });
+    };
+    assert.deepEqual(await probeRecipe(recipe, { fetch, clock: () => ms }), { outcome: "ok", reason: null, signedLagSeconds: 0, latencyMs: 90 }, recipe.id);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].url, passthroughUrl(recipe));
+    assert.equal(seen[0].init.method, recipe.passthrough.method);
+    assert.equal(seen[0].init.body, recipe.passthrough.body);
+    assert.equal(seen[0].init.headers["content-type"], recipe.passthrough.body === undefined ? undefined : "application/json");
+
+    const answer = (body, h) => async () => new Response(body, { headers: h });
+    const run = (fetchImpl) => probeRecipe(recipe, { fetch: fetchImpl, clock: () => ms });
+    // One changed digit keeps the shape but breaks the signature over the body exactly as received.
+    const tampered = sample.data.replace(/[0-9](?=[^0-9]*$)/, (digit) => String((Number(digit) + 1) % 10));
+    assert.equal((await run(answer(tampered, headers))).outcome, "signer", recipe.id);
+    // The same listing's POST / request hash is not this recipe's query.
+    const post = byId[recipe.id.replace(/-api$/, "")];
+    assert.equal((await run(answer(sample.data, { ...headers, "x-airnode-request-hash": requestHash(post.body) }))).outcome, "request_hash");
+    assert.deepEqual(await run(answer(sample.data, { "content-type": "application/json" })), { outcome: "failure", reason: "unsigned gateway answer", latencyMs: 0 });
+    assert.deepEqual(await run(async () => new Response("SECRET-UPSTREAM-DETAIL", { status: 429 })), { outcome: "failure", reason: "http 429", latencyMs: 0 });
+  }
+});
+
 test("readListingDocument checks every recipe served at the URL", async () => {
   const [eth, base] = [byId["drpc-ethereum-blockhash"], byId["drpc-base-blockhash"]];
   const doc = listingDocument(eth.signer, [{ operation: "jsonRpc", parameters: ["network", "method", "params"], required: ["network", "method"] }]);
@@ -279,7 +326,7 @@ test("runProbeTasks keeps task order and at most probeConcurrency requests open"
   };
   const results = await runProbeTasks(tasks, { fetch });
   assert.equal(peak, LIMITS.probeConcurrency);
-  assert.deepEqual(results.map((r) => r.reason), ["http 503", "http 503", "http 503", "http 500", "http 503"]);
+  assert.deepEqual(results.map((r) => r.reason), ["http 503", "http 503", "http 503", "http 500", "http 503", "http 503", "http 503", "http 503", "http 500", "http 503"]);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -298,11 +345,23 @@ function harness(recipes, { env = TELEGRAM } = {}) {
   const storage = memoryStorage();
   const state = { clock: T0, modes: {}, documents: {}, telegram: [], gatewayCalls: [], open: 0, peak: 0 };
   for (const recipe of recipes) {
-    state.documents[recipe.url] = listingDocument(TEST_SIGNER, recipes
-      .filter((r) => r.url === recipe.url)
-      .map((r) => ({ operation: r.body.operation, parameters: Object.keys(r.body.parameters), projection: r.body.responseProjection !== undefined })));
+    const served = recipes.filter((r) => r.url === recipe.url);
+    const routes = served.filter((r) => r.passthrough).map((r) => [r.passthrough.operation, r.passthrough.route]);
+    state.documents[recipe.url] = listingDocument(
+      TEST_SIGNER,
+      served
+        .filter((r) => r.body)
+        .map((r) => ({ operation: r.body.operation, parameters: Object.keys(r.body.parameters), projection: r.body.responseProjection !== undefined })),
+      routes.length ? Object.fromEntries(routes) : undefined,
+    );
   }
   const dataFor = (recipe, ms) => (recipe.shape[0].literal.startsWith('{"symbol"') ? TRADE_DATA(ms) : NODARY_DATA(ms));
+  const replyFor = (recipe, mode, ms) =>
+    mode === "hash" ? signedReply(recipe, dataFor(recipe, ms), state.clock, { hash: "0x" + "ab".repeat(32) })
+    : mode === "signer" ? signedReply(recipe, dataFor(recipe, ms), state.clock, { key: new Uint8Array(32).fill(9) })
+    : mode === "shape" ? signedReply(recipe, { ...dataFor(recipe, ms), extra: true }, state.clock)
+    : mode === "stale" ? signedReply(recipe, dataFor(recipe, ms), state.clock - 600)
+    : signedReply(recipe, dataFor(recipe, ms), state.clock);
   const fetch = async (url, init) => {
     if (url.startsWith("https://api.telegram.org/")) {
       state.telegram.push(JSON.parse(init.body).text);
@@ -313,6 +372,21 @@ function harness(recipes, { env = TELEGRAM } = {}) {
     state.peak = Math.max(state.peak, state.open);
     await Promise.resolve();
     state.open--;
+    if (url.includes("/api/")) {
+      // A passthrough recipe: the attestation travels in headers over the body exactly as sent.
+      const recipe = recipes.find((r) => r.passthrough && passthroughUrl(r) === url);
+      const mode = state.modes[recipe.id] ?? "ok";
+      if (mode === "http503") return new Response("gateway down: SECRET-UPSTREAM-DETAIL", { status: 503 });
+      const reply = replyFor(recipe, mode, state.clock * 1000 + 120);
+      return new Response(JSON.stringify(reply.data), {
+        headers: {
+          "x-airnode-address": reply.airnode,
+          "x-airnode-request-hash": reply.requestHash,
+          "x-airnode-timestamp": reply.timestamp,
+          "x-airnode-signature": reply.signature,
+        },
+      });
+    }
     if (init.method === "GET") {
       const doc = state.documents[url];
       return typeof doc === "number" ? new Response("", { status: doc }) : new Response(JSON.stringify(doc));
@@ -322,13 +396,7 @@ function harness(recipes, { env = TELEGRAM } = {}) {
     const mode = state.modes[recipe.id] ?? "ok";
     const ms = state.clock * 1000 + 120;
     if (mode === "http503") return new Response("gateway down: SECRET-UPSTREAM-DETAIL", { status: 503 });
-    const reply =
-      mode === "hash" ? signedReply(recipe, dataFor(recipe, ms), state.clock, { hash: "0x" + "ab".repeat(32) })
-      : mode === "signer" ? signedReply(recipe, dataFor(recipe, ms), state.clock, { key: new Uint8Array(32).fill(9) })
-      : mode === "shape" ? signedReply(recipe, { ...dataFor(recipe, ms), extra: true }, state.clock)
-      : mode === "stale" ? signedReply(recipe, dataFor(recipe, ms), state.clock - 600)
-      : signedReply(recipe, dataFor(recipe, ms), state.clock);
-    return new Response(JSON.stringify(reply));
+    return new Response(JSON.stringify(replyFor(recipe, mode, ms)));
   };
   const run = (minutes, reads = {}) => {
     if (minutes !== undefined) state.clock = T0 + Math.round(minutes * 60);
@@ -513,7 +581,7 @@ test("subrequest budget: at most 50 per run, and one probe per run once the sche
   assert.ok(worst <= 50, `worst case ${worst}`);
   const polled = NETWORK_NAMES.filter((name) => watchedAgentApi(NETWORKS[name])).length;
 
-  // A fresh object with the real configuration: 5 probes and 4 listing documents are due, capped per run.
+  // A fresh object with the real configuration: 10 probes and 4 listing documents are due, capped per run.
   const real = harness(AIRNODE_RECIPES);
   const failing = async (url, init) => {
     if (url.startsWith("https://api.telegram.org/")) return new Response("{}");
@@ -529,16 +597,23 @@ test("subrequest budget: at most 50 per run, and one probe per run once the sche
   assert.ok(one.subrequests <= 50);
   assert.equal(one.subrequests, 12 + polled + LIMITS.probeMaxPerRun + 1);
   const two = await runReal(1);
-  assert.deepEqual(two.airnodehub.probes.map((p) => p.listingDocument), [
+  assert.equal(real.state.gatewayCalls.length, 2 * LIMITS.probeMaxPerRun);
+  assert.ok(real.state.gatewayCalls.slice(LIMITS.probeMaxPerRun).every((c) => c.url.includes("/api/")), "the passthrough probes follow");
+  assert.ok(two.subrequests <= 50);
+  const three = await runReal(2);
+  assert.deepEqual(three.airnodehub.probes.map((p) => p.listingDocument), [
     "https://airnode-hyperliquid.fly.dev/",
     "https://airnode-drpc.fly.dev/",
     "https://airnode-tickerlayer.fly.dev/",
     "https://airnode-nodary.fly.dev/",
   ]);
 
-  // A simulated day with five healthy recipes on four gateways, one run per minute.
+  // A simulated day with ten healthy recipes (five POST /, five passthrough) on four gateways, one run per minute.
   const recipes = AIRNODE_RECIPES.map((recipe, i) =>
-    testRecipe(`sim-${i}`, `Sim ${i}`, recipe.url, i % 2 === 0 ? byId["nodary-eth-usd"] : byId["tickerlayer-btcusd"], { body: recipe.body }),
+    testRecipe(`sim-${i}`, `Sim ${i}`, recipe.url, i % 2 === 0 ? byId["nodary-eth-usd"] : byId["tickerlayer-btcusd"], {
+      body: recipe.body,
+      passthrough: recipe.passthrough,
+    }),
   );
   const sim = harness(recipes);
   const perRun = [];
@@ -553,7 +628,7 @@ test("subrequest budget: at most 50 per run, and one probe per run once the sche
   }
   assert.ok(sim.state.peak <= LIMITS.probeConcurrency);
   assert.ok(perRun.slice(60).every((n) => n <= 1), "after the first hour, at most one gateway request per run");
-  assert.deepEqual([...probesPerRecipe.values()], [23, 23, 23, 23, 23], "one probe per recipe per hour");
-  const documents = sim.state.gatewayCalls.filter((c) => c.method === "GET").length;
+  assert.deepEqual([...probesPerRecipe.values()], Array(10).fill(23), "one probe per recipe per hour");
+  const documents = sim.state.gatewayCalls.filter((c) => c.method === "GET" && !c.url.includes("/api/")).length;
   assert.equal(documents, 4 + 4, "four listing documents at start, then once a day on their phases");
 });

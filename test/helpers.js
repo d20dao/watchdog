@@ -215,6 +215,17 @@ export const EPOCH_RECIPE_REQUESTS = Object.freeze([
   '["latestFeeds",[["name","ETH/USD"]]]',
   '["jsonRpc",[["method","eth_call"],["network","base"],["params",[[["data","0x27e86d6e"],["to","0xcA11bde05977b3631167028862bE2a173976CA11"]],"latest"]]]]',
 ]);
+/**
+ * EpochEntropy.recipeRequest(recipe) for the passthrough recipes 6-10: the /api forms of recipes 0, 1, 2, 4 and 5 in
+ * that order, as the Arc Testnet registry holds them and the keeper's config/recipes/passthrough-*.json register them.
+ */
+export const PASSTHROUGH_RECIPE_REQUESTS = Object.freeze({
+  6: '["passthrough","POST","/info",[],"{\\"type\\":\\"metaAndAssetCtxs\\",\\"dex\\":\\"\\"}",[["symbol","/0/universe/0/name"],["value","/1/0/dayNtlVlm"]]]',
+  7: '["passthrough","POST","/ogrpc",[["network","ethereum"]],"{\\"jsonrpc\\":\\"2.0\\",\\"id\\":null,\\"method\\":\\"eth_call\\",\\"params\\":[{\\"to\\":\\"0xcA11bde05977b3631167028862bE2a173976CA11\\",\\"data\\":\\"0x27e86d6e\\"},\\"latest\\"]}"]',
+  8: '["passthrough","GET","/crypto/trade/last/BTCUSD",[],""]',
+  9: '["passthrough","GET","/feed/latest",[["name","ETH/USD"]],""]',
+  10: '["passthrough","POST","/ogrpc",[["network","base"]],"{\\"jsonrpc\\":\\"2.0\\",\\"id\\":null,\\"method\\":\\"eth_call\\",\\"params\\":[{\\"to\\":\\"0xcA11bde05977b3631167028862bE2a173976CA11\\",\\"data\\":\\"0x27e86d6e\\"},\\"latest\\"]}"]',
+});
 /** Listings with recipe files in the keeper repo that the registry does not build in; registering one appends a new id. */
 export const UNREGISTERED_RECIPE_REQUESTS = Object.freeze({
   "hyperliquid-sol-mid": '["allMids",[],[["mid","/SOL"]]]',
@@ -231,10 +242,20 @@ export function loadSamples() {
 }
 
 /**
- * A listing OpenAPI document in the gateway format: x-airnode.address plus one POST / schema alternative per
- * operation. `operations` = [{operation, parameters: [names], required?: [names], projection?: bool}].
+ * Real signed passthrough (/api) replies, two per built-in listing, collected 2026-09-28 by the keeper's
+ * scripts/collect-passthrough-samples.ts: {recipes: [{name, builtinRecipe, canonicalRequest, requestHash, url,
+ * samples: [{airnode, requestHash, timestamp, data (the body exactly as received), signature, operation}]}]}.
  */
-export function listingDocument(address, operations) {
+export function loadPassthroughSamples() {
+  return JSON.parse(readFileSync(new URL("./fixtures/airnodehub-passthrough-samples-2026-09-28.json", import.meta.url), "utf8"));
+}
+
+/**
+ * A listing OpenAPI document in the gateway format: x-airnode.address plus one POST / schema alternative per
+ * operation. `operations` = [{operation, parameters: [names], required?: [names], projection?: bool}]. `routes`, when
+ * given, becomes x-airnode.passthrough.routes: {operation: {method, path, parameters, body?}}.
+ */
+export function listingDocument(address, operations, routes) {
   return {
     openapi: "3.1.0",
     info: { title: "test listing", version: "0.1.0" },
@@ -269,6 +290,6 @@ export function listingDocument(address, operations) {
         },
       },
     },
-    "x-airnode": { address, version: "0.1.0" },
+    "x-airnode": { address, version: "0.1.0", ...(routes ? { passthrough: { url: "https://airnode.example/api", routes } } : {}) },
   };
 }
