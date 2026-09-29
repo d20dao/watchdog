@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
+import { beaconWorstSubrequests } from "../src/beacon.js";
 import { AIRNODE_RECIPES, LIMITS, NETWORKS, NETWORK_NAMES, watchedAgentApi } from "../src/config.js";
 import { runCron } from "../src/cron.js";
 import {
@@ -20,10 +21,23 @@ import {
 import { buildStatus, renderHtml } from "../src/status.js";
 import { readAlerts, readProbeStates } from "../src/store.js";
 import { passthroughUrl } from "../src/listings.js";
-import { MAINNET, TESTNET, agentApiPoll, healthyRead, listingDocument, loadPassthroughSamples, loadSamples, memoryStorage, pageText } from "./helpers.js";
+import {
+  MAINNET,
+  TESTNET,
+  agentApiPoll,
+  healthyBeaconRun,
+  healthyRead,
+  listingDocument,
+  loadPassthroughSamples,
+  loadSamples,
+  memoryStorage,
+  pageText,
+} from "./helpers.js";
 
 // Agent API polls are covered in agentapi.test.js; here each answers healthy for its own network, without a fetch.
 const readAgentApiImpl = async (net) => agentApiPoll({}, net);
+// The drand beacon monitor is covered in beacon.test.js; here it finds nothing to report.
+const runBeaconImpl = async (plan) => healthyBeaconRun(plan);
 
 const SAMPLES = loadSamples();
 const byId = Object.fromEntries(AIRNODE_RECIPES.map((recipe) => [recipe.id, recipe]));
@@ -407,6 +421,7 @@ function harness(recipes, { env = TELEGRAM } = {}) {
       clock: () => state.clock * 1000,
       readChainImpl: async (net) => reads[net.name] ?? healthyRead(net),
       readAgentApiImpl,
+      runBeaconImpl,
       recipes,
     });
   };
@@ -524,6 +539,7 @@ test("a recipe removed from the configuration resolves its alerts and drops its 
     clock: () => (T0 + 120) * 1000,
     readChainImpl: async (net) => healthyRead(net),
     readAgentApiImpl,
+    runBeaconImpl,
     recipes: [BETA],
   });
   assert.ok(!JSON.stringify(summary.airnodehub.probes).includes("alpha"));
@@ -576,8 +592,8 @@ test("status JSON and HTML show each recipe's last probe, latency, status and re
 
 test("subrequest budget: at most 50 per run, and one probe per run once the schedule settles", async () => {
   // Static worst case: every RPC round falls back (3 rounds x 2 endpoints per network), one /health poll per network,
-  // 3 Telegram sends and a full set of probe tasks.
-  const worst = NETWORK_NAMES.length * (3 * 2 + 1) + LIMITS.telegramMaxSendsPerRun + LIMITS.probeMaxPerRun;
+  // 3 Telegram sends, a full set of probe tasks and the drand beacon's worst case (test/beacon-alerts.test.js runs it).
+  const worst = NETWORK_NAMES.length * (3 * 2 + 1) + LIMITS.telegramMaxSendsPerRun + LIMITS.probeMaxPerRun + beaconWorstSubrequests(NETWORKS);
   assert.ok(worst <= 50, `worst case ${worst}`);
   const polled = NETWORK_NAMES.filter((name) => watchedAgentApi(NETWORKS[name])).length;
 
@@ -590,7 +606,7 @@ test("subrequest budget: at most 50 per run, and one probe per run once the sche
   };
   const fallbackReads = Object.fromEntries(NETWORK_NAMES.map((name) => [name, { ...healthyRead(name === "arc-mainnet" ? MAINNET : TESTNET), subrequests: 6, balanceWei: 1n }]));
   const runReal = (minutes) =>
-    runCron({ storage: real.storage, env: TELEGRAM, fetch: failing, clock: () => (T0 + minutes * 60) * 1000, readChainImpl: async (net) => fallbackReads[net.name], readAgentApiImpl });
+    runCron({ storage: real.storage, env: TELEGRAM, fetch: failing, clock: () => (T0 + minutes * 60) * 1000, readChainImpl: async (net) => fallbackReads[net.name], readAgentApiImpl, runBeaconImpl });
   const one = await runReal(0);
   assert.equal(real.state.gatewayCalls.length, LIMITS.probeMaxPerRun);
   assert.ok(real.state.gatewayCalls.every((c) => c.method === "POST"));

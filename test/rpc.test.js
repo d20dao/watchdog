@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { IMPLEMENTATION_SLOT, TOPICS } from "../src/config.js";
-import { readChain } from "../src/rpc.js";
+import { RpcSession, readChain } from "../src/rpc.js";
 import { MAINNET, TESTNET, addressWord, encodePending, encodeRequest, withAgentApi, word } from "./helpers.js";
 
 // Mainnet with its agent API watched and not watched, whatever src/config.js says today.
@@ -313,4 +313,26 @@ test("timeouts abort the request, fall back, and report a timeout code", async (
   assert.equal(read.error, "timeout");
   assert.equal(read.subrequests, 2);
   assert.ok(Date.now() - started < 2000);
+});
+
+test("a call that reverted is marked as such; other errors are not, and say nothing about the contract", async () => {
+  const fetch = async () =>
+    Response.json([
+      { jsonrpc: "2.0", id: 1, error: { code: 3, message: "execution reverted" } }, // the Arc RPC's answer for beaconOf before the upgrade
+      { jsonrpc: "2.0", id: 2, error: { code: -32000, message: "execution reverted: not registered" } },
+      { jsonrpc: "2.0", id: 3, error: { code: -32005, message: "rate limit exceeded" } },
+      { jsonrpc: "2.0", id: 4, error: { code: 3 } },
+      { jsonrpc: "2.0", id: 5, error: {} },
+      { jsonrpc: "2.0", id: 6, result: "0x1" },
+    ]);
+  const session = new RpcSession(["https://rpc.example"], { fetch });
+  const items = await session.batch(Array.from({ length: 6 }, () => ["eth_call", []]));
+  assert.deepEqual(items, [
+    { error: "rpc error 3", revert: true },
+    { error: "rpc error -32000", revert: true },
+    { error: "rpc error -32005" },
+    { error: "rpc error 3", revert: true },
+    { error: "rpc error unknown" },
+    { result: "0x1" },
+  ]);
 });

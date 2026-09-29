@@ -1,12 +1,24 @@
-// One watchdog run: read both chains, poll each watched x402 agent API and run any due AirnodeHub listing probes
-// (network I/O, no storage held), then evaluate and commit every state change in one synchronous transaction, then
-// deliver queued Telegram messages.
+// One watchdog run: read both chains, poll each watched x402 agent API, read the drand beacon's relays and registries
+// and run any due AirnodeHub listing probes (network I/O, no storage held), then evaluate and commit every state change
+// in one synchronous transaction, then deliver queued Telegram messages.
 
 import { applyAgentApiPoll, readAgentApi } from "./agentapi.js";
 import { alertKey, transition } from "./alerts.js";
 import {
+  applyGroupRun,
+  applyNetworkRun,
+  applyRelayRun,
+  failedBeaconRun,
+  groupStateKey,
+  infoPhase,
+  networkStateKey,
+  planBeacon,
+  runBeacon,
+} from "./beacon.js";
+import {
   evaluateAgentApiChecks,
   evaluateBackupReportChecks,
+  evaluateBeaconChecks,
   evaluateChainChecks,
   evaluateListingDocumentCheck,
   evaluateProbeCheck,
@@ -16,10 +28,11 @@ import {
   networkCheckNames,
   probeCheckName,
 } from "./checks.js";
-import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, watchedAgentApi } from "./config.js";
+import { AIRNODE_RECIPES, AIRNODE_SCOPE, BEACON_SCOPE, LIMITS, NETWORKS, watchedAgentApi } from "./config.js";
 import { applyDocumentResult, applyProbeResult, failedTaskResult, planProbeTasks } from "./listings.js";
 import { readChain } from "./rpc.js";
 import {
+  deleteBeaconState,
   deleteProbeState,
   enqueueMessage,
   expireMessages,
@@ -31,11 +44,13 @@ import {
   readAgentApiState,
   readAlerts,
   readBackupReportState,
+  readBeaconStates,
   readChainState,
   readProbeStates,
   readReportState,
   saveAlert,
   writeAgentApiState,
+  writeBeaconState,
   writeChainState,
   writeProbeState,
 } from "./store.js";
@@ -55,6 +70,16 @@ async function runProbes(tasks, { fetch, clock, loadProbes }) {
   }
 }
 
+/** Run the beacon plan. The run never throws, and a monitor that failed as a whole counts every relay as failed. */
+async function runBeaconChecks(plan, { fetch, clock, runBeaconImpl }) {
+  if (plan.groups.length === 0) return { subrequests: 0, groups: [] };
+  try {
+    return await runBeaconImpl(plan, { fetch, clock });
+  } catch {
+    return failedBeaconRun(plan, "internal error");
+  }
+}
+
 export async function runCron({
   storage,
   env,
@@ -62,6 +87,7 @@ export async function runCron({
   clock = () => Date.now(),
   readChainImpl = readChain,
   readAgentApiImpl = readAgentApi,
+  runBeaconImpl = runBeacon,
   networks: nets = NETWORKS,
   recipes = AIRNODE_RECIPES,
   loadProbes = loadProbeModule,
@@ -72,8 +98,9 @@ export async function runCron({
     return prev ? { logCursor: prev.logCursor, logSpan: prev.logSpan } : null;
   });
   const tasks = planProbeTasks(recipes, readProbeStates(storage), Math.floor(clock() / 1000));
+  const beaconPlan = planBeacon(nets, readBeaconStates(storage), Math.floor(clock() / 1000));
 
-  const [reads, polls, probeResults] = await Promise.all([
+  const [reads, polls, probeResults, beaconRun] = await Promise.all([
     Promise.all(
       names.map(async (name, i) => {
         try {
@@ -95,6 +122,8 @@ export async function runCron({
       }),
     ),
     runProbes(tasks, { fetch, clock, loadProbes }),
+    // The drand relays and each network's registry: shared work, read once however many networks list the beacon.
+    runBeaconChecks(beaconPlan, { fetch, clock, runBeaconImpl }),
   ]);
 
   // Reports may have arrived while the reads were in flight; everything below re-reads current state.
@@ -165,10 +194,13 @@ export async function runCron({
     });
     const airnodehub = commitProbes(storage, recipes, tasks, probeResults, now, deliverable);
     enqueued += airnodehub.messages.length;
+    // With no AirnodeHub recipe configured the catalog is drand alone: a drand outage stops the service.
+    const beacon = commitBeacon(storage, beaconPlan, beaconRun, now, deliverable, recipes.length === 0);
+    enqueued += beacon.messages.length;
     pruneReports(storage, now - LIMITS.reportRetentionSeconds);
     expireMessages(storage, now);
     if (enqueued > 0) pruneMessages(storage);
-    return { networks, airnodehub, enqueued };
+    return { networks, airnodehub, beacon, enqueued };
   });
 
   let delivered = 0;
@@ -203,11 +235,12 @@ export async function runCron({
     notifier: deliverable ? "configured" : "not configured",
     networks: outcome.networks,
     airnodehub: outcome.airnodehub,
+    beacon: outcome.beacon,
     messagesQueued: outcome.enqueued,
     messagesDelivered: delivered,
     deliveryError,
-    // Each probe task and each agent API poll is exactly one fetch.
-    subrequests: chainSubrequests + polls.filter(Boolean).length + tasks.length + telegramSubrequests,
+    // Each probe task and each agent API poll is exactly one fetch; the beacon run counts its own.
+    subrequests: chainSubrequests + polls.filter(Boolean).length + tasks.length + beaconRun.subrequests + telegramSubrequests,
   };
 }
 
@@ -256,6 +289,73 @@ function commitProbes(storage, recipes, tasks, results, now, deliverable) {
   }
   return {
     probes,
+    activeAlerts: [...conditions].filter(([, condition]) => condition).map(([check]) => check),
+    messages,
+  };
+}
+
+/**
+ * Store the beacon run's states, evaluate the beacon alerts and queue their messages. Runs inside the run's transaction.
+ * `drandOnly`: no other source is configured, so a drand outage stops the service (see evaluateBeaconFresh).
+ */
+function commitBeacon(storage, plan, run, now, deliverable, drandOnly) {
+  const stored = readBeaconStates(storage);
+  const states = new Map();
+  const relays = [];
+  const networks = [];
+  plan.groups.forEach((group, g) => {
+    const groupRun = run.groups[g];
+    const key = groupStateKey(group.preset);
+    const previous = stored.get(key) ?? null;
+    const relayStates = {};
+    group.relays.forEach((relay, i) => {
+      const r = groupRun.relays[i];
+      relayStates[relay.id] = applyRelayRun(previous?.relays?.[relay.id] ?? null, r, now, infoPhase(group, relay.id));
+      relays.push({
+        preset: group.preset.id,
+        relay: relay.id,
+        outcome: r.outcome,
+        round: r.round ?? null,
+        lagRounds: r.lagRounds ?? null,
+        reason: r.reason ?? null,
+        agreement: r.agreement?.outcome ?? null,
+        info: r.info?.outcome ?? null,
+        latencyMs: r.latencyMs ?? null,
+      });
+    });
+    states.set(key, { ...applyGroupRun(previous, groupRun, now), relays: relayStates });
+    group.networks.forEach((target, i) => {
+      const n = groupRun.networks[i];
+      states.set(networkStateKey(target.name), applyNetworkRun(stored.get(networkStateKey(target.name)) ?? null, n, now));
+      networks.push({
+        network: target.name,
+        read: n.ok,
+        registration: n.registration ?? null,
+        verify: n.verify?.outcome ?? null,
+        reason: n.reason ?? n.registrationReason ?? null,
+      });
+    });
+  });
+  for (const [key, state] of states) writeBeaconState(storage, key, now, state);
+  // A group or network no longer configured drops its state, and its alerts resolve below.
+  for (const key of stored.keys()) if (!states.has(key)) deleteBeaconState(storage, key);
+
+  const conditions = evaluateBeaconChecks(plan.groups, states, { drandOnly });
+  const existing = new Map(readAlerts(storage, BEACON_SCOPE).map((row) => [row.check, row]));
+  for (const check of existing.keys()) if (!conditions.has(check)) conditions.set(check, null);
+
+  const messages = [];
+  for (const [check, condition] of conditions) {
+    const step = transition(existing.get(check) ?? null, condition, now, BEACON_SCOPE, check);
+    if (step.write) saveAlert(storage, alertKey(BEACON_SCOPE, check), step.row);
+    if (step.message) {
+      enqueueMessage(storage, now, BEACON_SCOPE, step.message.severity, step.message.text, deliverable);
+      messages.push(step.message.text);
+    }
+  }
+  return {
+    relays,
+    networks,
     activeAlerts: [...conditions].filter(([, condition]) => condition).map(([check]) => check),
     messages,
   };

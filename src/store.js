@@ -89,6 +89,12 @@ const SCHEMA = [
      updated_at INTEGER NOT NULL,
      state_json TEXT NOT NULL
    ) WITHOUT ROWID`,
+  // drand beacon monitor state per group of relays and per network, as JSON (see src/beacon.js).
+  `CREATE TABLE IF NOT EXISTS beacon_state (
+     state_key TEXT PRIMARY KEY,
+     updated_at INTEGER NOT NULL,
+     state_json TEXT NOT NULL
+   ) WITHOUT ROWID`,
   // Backup (follower) keeper reports: the same shape as the primary's tables, kept apart so the two streams never
   // share report ids, duplicate and conflict counts, or health state.
   `CREATE TABLE IF NOT EXISTS backup_reports (
@@ -547,4 +553,31 @@ export function writeProbeState(storage, recipeId, now, state) {
 
 export function deleteProbeState(storage, recipeId) {
   storage.sql.exec("DELETE FROM probe_state WHERE recipe_id = ?", recipeId);
+}
+
+// ---------------------------------------------------------------------------------------------
+// drand beacon state
+
+/** Map of state key -> state object (see src/beacon.js). Unreadable rows are skipped. */
+export function readBeaconStates(storage) {
+  const states = new Map();
+  for (const r of rows(storage, "SELECT state_key, state_json FROM beacon_state")) {
+    const state = parseJson(r.state_json, null);
+    if (state && typeof state === "object") states.set(r.state_key, state);
+  }
+  return states;
+}
+
+export function writeBeaconState(storage, key, now, state) {
+  storage.sql.exec(
+    `INSERT INTO beacon_state (state_key, updated_at, state_json) VALUES (?, ?, ?)
+     ON CONFLICT (state_key) DO UPDATE SET updated_at = excluded.updated_at, state_json = excluded.state_json`,
+    key,
+    now,
+    JSON.stringify(state),
+  );
+}
+
+export function deleteBeaconState(storage, key) {
+  storage.sql.exec("DELETE FROM beacon_state WHERE state_key = ?", key);
 }

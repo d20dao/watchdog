@@ -14,12 +14,47 @@ export const SELECTORS = Object.freeze({
   getPendingRequestIds: "0xfdfe72e6",
   getRequest: "0xc58343ef",
   committer: "0x5bc8e8f9",
+  // EpochEntropy beacon functions, present once the registry is upgraded for the drand beacon.
+  beaconOf: "0x87533a48", // beaconOf(uint8)
+  slotSigner: "0xb42be3c1", // slotSigner(uint8)
+  verifyBeacon: "0x0ccd9ab2", // verifyBeacon(uint8,uint64,bytes)
 });
 
 export const TOPICS = Object.freeze({
   requestRefundedTo: "0x0f6107d218fea62a20553f3700dba7c94dcf653bd2027c0bf1ebe0832f42a506",
   randomnessFulfilled: "0x9c82683ee7932041c254d206bcce4241d66a811d53ee7191799cc120777b2b87",
 });
+
+/**
+ * A drand beacon the epoch registry can list (EpochEntropy.beaconOf). What the registry holds and what a relay serves
+ * must both equal it, and the registry's signer for the slot (slotSigner) is derived from it and the verifier contract.
+ *
+ *   id, name         stable key for state and alerts (lowercase letters, digits, dashes) and its name on the status page
+ *   scheme           drand schemeID: BLS on bn254, unchained, signatures on G1
+ *   chainHash        the chain's identity as drand publishes it: 32 bytes, lowercase hex without 0x; the relays' URL path
+ *   publicKey        the group public key: 128 bytes, lowercase hex without 0x
+ *   genesis, period  the chain's clock in seconds: round r is due at genesis + (r - 1) x period
+ *   signatureBytes   size of a round's signature
+ */
+export const DRAND_EVMNET = Object.freeze({
+  id: "drand-evmnet",
+  name: "drand evmnet",
+  scheme: "bls-bn254-unchained-on-g1",
+  chainHash: "04f1e9062b8a81f848fded9c12306733282b2727ecced50032187751166ec8c3",
+  publicKey:
+    "07e1d1d335df83fa98462005690372c643340060d205306a9aa8106b6bd0b3820557ec32c2ad488e4d4f6008f89a346f18492092ccc0d594610de2732c8b808f0095685ae3a85ba243747b1b2f426049010f6b73a0cf1d389351d5aaaa1047f6297d3a4f9749b33eb2d904c9d9ebf17224150ddd7abd7567a9bec6c74480ee0b",
+  genesis: 1727521075,
+  period: 3,
+  signatureBytes: 64,
+});
+
+// Relays serving the chain's public HTTP API: GET /<chainHash>/info, /public/latest and /public/<round>.
+export const DRAND_RELAYS = Object.freeze([
+  "https://api.drand.sh",
+  "https://api2.drand.sh",
+  "https://api3.drand.sh",
+  "https://drand.cloudflare.com",
+]);
 
 export const NETWORKS = Object.freeze({
   "arc-mainnet": Object.freeze({
@@ -34,7 +69,10 @@ export const NETWORKS = Object.freeze({
     // so a reviewed upgrade can be approved before it executes: the current implementation first, then the next.
     implementations: Object.freeze({
       coordinator: Object.freeze(["0xd20da0DADa4352A1a9722be43a2D85923443458c", "0xD20da000125643B4db5A6A36A3b853c17745DF44"]),
-      registry: "0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865",
+      // NEXT REGISTRY IMPLEMENTATION (the drand beacon upgrade): append its address here as a second entry BEFORE the
+      // upgrade executes, or the registry_impl check alarms the moment the proxy points to it. Once the upgrade has
+      // run, the old entry can go. The address is not known yet, so none is listed.
+      registry: Object.freeze(["0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865"]),
     }),
     feeCapWei: 2000n * GWEI,
     // Blockdaemon accepts batches from Cloudflare egress; the public endpoint rate-limits them.
@@ -49,6 +87,11 @@ export const NETWORKS = Object.freeze({
       url: "https://api.d20dao.org",
       relayer: "0x8B465645ed88F6d487d279003aD3681e7aF8e8B7",
     }),
+    // drand beacon the registry lists as `recipe`: its relays are read every run, its registration on chain every run.
+    // `verifier` is the beacon verifier contract the registry calls. It is unknown until that contract is deployed, so
+    // it stays null and only the rest of beaconOf() is pinned; slotSigner() is then derived from the verifier the
+    // registry reports. Set the address after the deployment to pin it as well.
+    beacon: Object.freeze({ recipe: 11, preset: DRAND_EVMNET, relays: DRAND_RELAYS, verifier: null }),
   }),
   "arc-testnet": Object.freeze({
     name: "arc-testnet",
@@ -61,7 +104,10 @@ export const NETWORKS = Object.freeze({
     // Recipe registry and per-submitter keeper share, upgraded on 2026-09-18.
     implementations: Object.freeze({
       coordinator: Object.freeze(["0xd20da0DADa4352A1a9722be43a2D85923443458c", "0xD20da000125643B4db5A6A36A3b853c17745DF44"]),
-      registry: "0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865",
+      // NEXT REGISTRY IMPLEMENTATION (the drand beacon upgrade): append its address here as a second entry BEFORE the
+      // upgrade executes, or the registry_impl check alarms the moment the proxy points to it. Once the upgrade has
+      // run, the old entry can go. The address is not known yet, so none is listed.
+      registry: Object.freeze(["0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865"]),
     }),
     feeCapWei: 100n * GWEI,
     rpcs: Object.freeze(["https://rpc.blockdaemon.testnet.arc.io", "https://rpc.testnet.arc.io"]),
@@ -73,6 +119,8 @@ export const NETWORKS = Object.freeze({
       url: "https://api-testnet.d20dao.org",
       relayer: "0xF6b446dC2F30e6A802DFB7bD4c222d84F6cd05C3",
     }),
+    // As on arc-mainnet: the verifier address is set after the verifier contract is deployed.
+    beacon: Object.freeze({ recipe: 11, preset: DRAND_EVMNET, relays: DRAND_RELAYS, verifier: null }),
   }),
 });
 
@@ -122,6 +170,17 @@ export const THRESHOLDS = Object.freeze({
   // after the block, so a reply outside this window could not be committed either.
   probeMaxSignedAgeSeconds: 240,
   probeMaxSignedAheadSeconds: 60,
+  // drand beacon monitor. A relay serves a fresh round when its /public/latest is at most this many rounds behind the
+  // chain's schedule: 3 rounds is 9 s at the evmnet period, and a relay's edge cache can trail by a round or two.
+  beaconMaxLagRounds: 3,
+  // A relay naming a round further ahead of the schedule than this is not following the configured chain's clock.
+  beaconMaxAheadRounds: 2,
+  // Consecutive runs (about a minute each) in which a relay is not fresh before it warns.
+  beaconRelayWarnRuns: 3,
+  // Consecutive runs in which no relay is fresh before the alarm: the registry cannot publish without a round.
+  beaconDownAlarmRuns: 2,
+  // Consecutive runs in which the registry rejected the round it was asked to verify before the alarm.
+  beaconVerifyAlarmRuns: 2,
 });
 
 export const LIMITS = Object.freeze({
@@ -158,6 +217,14 @@ export const LIMITS = Object.freeze({
   listingDocumentIntervalSeconds: 24 * 3600,
   listingDocumentRetrySeconds: 3600,
   listingDocumentMaxBytes: 1024 * 1024,
+  // drand beacon monitor (src/beacon.js). Each run reads every relay's latest round, then one earlier round from every
+  // fresh relay, then makes one JSON-RPC batch per network. A relay's /info is read once a day, one relay per run.
+  beaconTimeoutMs: 5000,
+  beaconMaxResponseBytes: 4 * 1024, // a round record is about 230 bytes and a chain info about 600
+  beaconConcurrency: 4, // relay fetches in flight at once, a bound of its own next to the chain readers and probes
+  beaconInfoIntervalSeconds: 24 * 3600,
+  beaconInfoRetrySeconds: 3600,
+  beaconInfoMaxPerRun: 1,
   // Agent API /health reads the relayer's Durable Object and the chain before it answers.
   agentApiTimeoutMs: 10_000,
   agentApiMaxResponseBytes: 16 * 1024,
@@ -167,6 +234,9 @@ export const DURABLE_OBJECT_NAME = "watchdog";
 
 // Alert and message scope of the AirnodeHub probes, shown as "[airnodehub]" in Telegram.
 export const AIRNODE_SCOPE = "airnodehub";
+
+// Alert and message scope of the drand beacon monitor, shown as "[beacon]" in Telegram.
+export const BEACON_SCOPE = "beacon";
 
 function deepFreeze(value) {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {

@@ -14,7 +14,7 @@ import {
 } from "../src/store.js";
 import { groupMessages } from "../src/telegram.js";
 import { readAgentApi } from "../src/agentapi.js";
-import { MAINNET, TESTNET, agentApiBody, agentApiPoll, healthyRead, memoryStorage, pageText, withAgentApi } from "./helpers.js";
+import { MAINNET, TESTNET, agentApiBody, agentApiPoll, healthyBeaconRun, healthyRead, memoryStorage, pageText, withAgentApi } from "./helpers.js";
 
 const T0 = 1789420000;
 const USDC = 10n ** 18n;
@@ -79,6 +79,7 @@ function harness(env = TELEGRAM) {
         if (poll instanceof Error) throw poll;
         return poll ?? readAgentApi(net, deps);
       },
+      runBeaconImpl: async (plan) => healthyBeaconRun(plan), // the drand beacon monitor is covered in beacon.test.js
       networks: state.networks,
       recipes: [], // AirnodeHub probes are covered in probe.test.js
     });

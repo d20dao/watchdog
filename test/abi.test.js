@@ -3,17 +3,23 @@ import { test } from "node:test";
 import {
   AbiError,
   decodeAddress,
+  decodeBeaconOf,
+  decodeBool,
   decodeCoordinatorLog,
   decodePendingRequestIds,
   decodeRequest,
   decodeUint256,
+  encodeBeaconOf,
   encodeGetPendingRequestIds,
   encodeGetRequest,
+  encodeSlotSigner,
+  encodeVerifyBeacon,
   hexToBigInt,
   hexToSafeNumber,
   toQuantity,
 } from "../src/abi.js";
 import { TOPICS } from "../src/config.js";
+import { ZERO_BEACON, encodeBeaconOfResult, registeredBeacon } from "./beacon-helpers.js";
 import { addressWord, bytes32, encodePending, encodeRequest, word } from "./helpers.js";
 
 test("calldata encoding matches the verified selectors", () => {
@@ -134,4 +140,64 @@ test("RequestRefundedTo and RandomnessFulfilled logs", () => {
       }),
     AbiError,
   );
+});
+
+test("beacon calldata: the recipe and round words, then the signature as a dynamic bytes argument", () => {
+  assert.equal(encodeBeaconOf(11), "0x87533a48" + word(11));
+  assert.equal(encodeSlotSigner(11), "0xb42be3c1" + word(11));
+  const signature = "ab".repeat(64);
+  assert.equal(
+    encodeVerifyBeacon(11, 21056967, "0x" + signature),
+    "0x0ccd9ab2" + word(11) + word(21056967) + word(96) + word(64) + signature,
+    "head: recipe, round, offset 3 words on; tail: length and the two words of data",
+  );
+  assert.equal(
+    encodeVerifyBeacon(1, 2, "0x" + "cd".repeat(5)),
+    "0x0ccd9ab2" + word(1) + word(2) + word(96) + word(5) + "cd".repeat(5) + "00".repeat(27),
+    "bytes are padded on the right to a whole word",
+  );
+  assert.equal(encodeVerifyBeacon(1, 2, "0x"), "0x0ccd9ab2" + word(1) + word(2) + word(96) + word(0));
+  assert.throws(() => encodeBeaconOf(256), AbiError, "a uint8");
+  assert.throws(() => encodeSlotSigner(-1), AbiError);
+  assert.throws(() => encodeVerifyBeacon(11, 1n << 64n, "0x00"), AbiError, "a uint64");
+  assert.throws(() => encodeVerifyBeacon(11, 5, "0xabc"), AbiError, "half a byte");
+  assert.throws(() => encodeVerifyBeacon(11, 5, "abcd"), AbiError, "no 0x");
+});
+
+test("verifyBeacon return value is a bool", () => {
+  assert.equal(decodeBool("0x" + word(1)), true);
+  assert.equal(decodeBool("0x" + word(0)), false);
+  assert.throws(() => decodeBool("0x" + word(2)), AbiError);
+  assert.throws(() => decodeBool("0x"), AbiError);
+  assert.throws(() => decodeBool("0x" + word(1) + word(1)), AbiError);
+});
+
+test("beaconOf return data: a dynamic tuple, and the zero tuple for a recipe that is no beacon", () => {
+  const registered = registeredBeacon();
+  const data = encodeBeaconOfResult(registered);
+  assert.equal((data.length - 2) / 64, 1 + 5 + 1 + 4, "offset, five head words, the key's length and its four words");
+  assert.deepEqual(decodeBeaconOf(data), registered);
+  assert.deepEqual(decodeBeaconOf(encodeBeaconOfResult(ZERO_BEACON)), ZERO_BEACON);
+  assert.equal(decodeBeaconOf(encodeBeaconOfResult(ZERO_BEACON)).publicKey, "0x", "an empty key");
+  // The verifier comes back lowercase like every address.
+  assert.equal(decodeBeaconOf(encodeBeaconOfResult(registeredBeacon({ verifier: "0xABABABABABABABABABABABABABABABABABABABAB" }))).verifier, "0x" + "ab".repeat(20));
+
+  const words = data.slice(2).match(/.{64}/g);
+  const build = (edit) => "0x" + edit([...words]).join("");
+  assert.throws(() => decodeBeaconOf("0x"), AbiError, "no data");
+  assert.throws(() => decodeBeaconOf("0x" + words.slice(0, 6).join("")), AbiError, "too short");
+  assert.throws(() => decodeBeaconOf("0x" + words.slice(0, -1).join("")), AbiError, "the key is cut short");
+  assert.throws(() => decodeBeaconOf(build((w) => ((w[0] = word(33)), w))), AbiError, "misaligned tuple offset");
+  assert.throws(() => decodeBeaconOf(build((w) => ((w[0] = word(0x2000)), w))), AbiError, "tuple offset past the data");
+  assert.throws(() => decodeBeaconOf(build((w) => ((w[5] = word(0x2000)), w))), AbiError, "key offset past the data");
+  assert.throws(() => decodeBeaconOf(build((w) => ((w[5] = word(161)), w))), AbiError, "misaligned key offset");
+  assert.throws(() => decodeBeaconOf(build((w) => ((w[6] = word(129)), w))), AbiError, "a length that runs past the data");
+  assert.throws(() => decodeBeaconOf(data, 64), AbiError, "a key longer than the limit");
+  assert.throws(() => decodeBeaconOf(build((w) => ((w[1] = "01" + w[1].slice(2)), w))), AbiError, "an address with dirty high bits");
+  assert.throws(() => decodeBeaconOf(build((w) => ((w[2] = word(1n << 64n)), w))), AbiError, "genesis is a uint64");
+  assert.throws(() => decodeBeaconOf(build((w) => ((w[3] = word(2n ** 60n)), w))), AbiError, "period beyond a safe integer");
+  // Padding after the key's last byte must be zero.
+  const short = encodeBeaconOfResult(registeredBeacon({ publicKey: "0x" + "ab".repeat(5) }));
+  assert.equal(decodeBeaconOf(short).publicKey, "0x" + "ab".repeat(5));
+  assert.throws(() => decodeBeaconOf(short.slice(0, -2) + "01"), AbiError, "padding is not zero");
 });

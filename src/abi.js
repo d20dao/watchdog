@@ -102,6 +102,80 @@ export function decodeAddress(hex) {
   return wordToAddress(words[0]);
 }
 
+/** Decode a single bool return value (e.g. verifyBeacon). */
+export function decodeBool(hex) {
+  const words = toWords(hex);
+  if (words.length !== 1) throw new AbiError("expected one word");
+  return wordToBool(words[0]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// EpochEntropy beacon functions
+
+function encodeRecipe(recipe) {
+  const id = BigInt(recipe);
+  if (id < 0n || id > 255n) throw new AbiError("recipe is not a uint8");
+  return id;
+}
+
+/** beaconOf(uint8 recipe) */
+export function encodeBeaconOf(recipe) {
+  return encodeCall(SELECTORS.beaconOf, encodeRecipe(recipe));
+}
+
+/** slotSigner(uint8 recipe) */
+export function encodeSlotSigner(recipe) {
+  return encodeCall(SELECTORS.slotSigner, encodeRecipe(recipe));
+}
+
+/** verifyBeacon(uint8 recipe, uint64 round, bytes signature), the signature as 0x-prefixed hex of whole bytes. */
+export function encodeVerifyBeacon(recipe, round, signature) {
+  const id = encodeRecipe(recipe);
+  const r = BigInt(round);
+  if (r < 0n || r >= 1n << 64n) throw new AbiError("round is not a uint64");
+  const data = strip(signature);
+  if (data.length % 2 !== 0) throw new AbiError("signature is not whole bytes");
+  // Three head words (recipe, round, offset of the bytes), then the bytes' length and the data padded to whole words.
+  const padded = data.padEnd(Math.ceil(data.length / WORD) * WORD, "0");
+  return encodeCall(SELECTORS.verifyBeacon, id, r, 3n * 32n, BigInt(data.length / 2)) + padded;
+}
+
+/** A byte offset word, relative to word `base`, as an index into `limit` words. */
+function offsetToIndex(word, base, limit, what) {
+  const offset = wordToBigInt(word);
+  if (offset % 32n !== 0n || offset > BigInt(limit) * 32n) throw new AbiError(`${what} is misaligned or out of bounds`);
+  const index = base + Number(offset / 32n);
+  if (index >= limit) throw new AbiError(`${what} is out of bounds`);
+  return index;
+}
+
+/**
+ * beaconOf(uint8) -> (address verifier, uint64 genesis, uint64 period, bytes32 chainHash, bytes publicKey). The tuple
+ * is dynamic, so the return data is its offset, its five head words and the key's length and bytes. A recipe that is
+ * not a beacon returns the zero tuple with an empty key.
+ */
+export function decodeBeaconOf(hex, maxKeyBytes = 256) {
+  const w = toWords(hex);
+  if (w.length < 7) throw new AbiError("beacon data too short");
+  const start = offsetToIndex(w[0], 0, w.length, "tuple offset");
+  if (start + 5 > w.length) throw new AbiError("beacon tuple exceeds data");
+  const at = offsetToIndex(w[start + 4], start, w.length, "key offset");
+  const length = wordToBigInt(w[at]);
+  if (length > BigInt(maxKeyBytes)) throw new AbiError("key too long");
+  const size = Number(length);
+  const end = at + 1 + Math.ceil(size / 32);
+  if (end > w.length) throw new AbiError("key exceeds data");
+  const body = w.slice(at + 1, end).join("");
+  if (/[^0]/.test(body.slice(size * 2))) throw new AbiError("key padding is not zero");
+  return {
+    verifier: wordToAddress(w[start]),
+    genesis: wordToSmallNumber(w[start + 1], 64),
+    period: wordToSmallNumber(w[start + 2], 64),
+    chainHash: "0x" + w[start + 3],
+    publicKey: "0x" + body.slice(0, size * 2),
+  };
+}
+
 /** getPendingRequestIds(uint256,uint256) -> (uint256[] ids, uint256 nextCursor) */
 export function decodePendingRequestIds(hex, maxLength = 256) {
   const words = toWords(hex);

@@ -6,6 +6,7 @@
 // reported once per occurrence and auto-resolve silently on the next run without new occurrences.
 
 import { storedCalls } from "./agentapi.js";
+import { groupStateKey, networkStateKey } from "./beacon.js";
 import { LIMITS, THRESHOLDS, watchedAgentApi } from "./config.js";
 import { formatDuration, formatGwei, formatUsdc, listWithMore, requestLink, shortAddress } from "./format.js";
 
@@ -418,4 +419,112 @@ export function evaluateListingDocumentCheck(recipe, state) {
   if (!doc || !doc.verdict || doc.verdict === "ok") return null;
   const title = doc.verdict === "signer" ? "listing document signer mismatch" : "operation missing from listing document";
   return alarm(`${recipe.name} ${title}`, doc.verdictReason ?? "");
+}
+
+// ---------------------------------------------------------------------------------------------
+// drand beacon monitor (scope BEACON_SCOPE). `states` is readBeaconStates(): the stored state of each group, which holds
+// its relays' states, and of each network (see src/beacon.js). A group is `{preset, relays: [{id, url}], networks}` as
+// beaconGroups() builds it from the configuration.
+
+/** Alert check names: one per beacon, one per relay for each concern, one per network for each concern. */
+export const beaconFreshCheckName = (preset) => `fresh:${preset.id}`;
+export const beaconRelayCheckName = (preset, relay) => `relay:${preset.id}:${relay.id}`;
+export const beaconAgreementCheckName = (preset, relay) => `agree:${preset.id}:${relay.id}`;
+export const beaconInfoCheckName = (preset, relay) => `info:${preset.id}:${relay.id}`;
+export const beaconRegistrationCheckName = (network) => `registration:${network}`;
+export const beaconVerifyCheckName = (network) => `verify:${network}`;
+
+/**
+ * No relay serves a fresh round: the alarm of the monitor. The registry cannot publish an epoch without a round, and
+ * once the catalog lists the drand beacon alone (`drandOnly`: no AirnodeHub recipe is configured any more) nothing
+ * else can, so the alarm says the service is stopping. It waits for beaconDownAlarmRuns runs in a row.
+ */
+export function evaluateBeaconFresh(group, state, drandOnly) {
+  if (!state || (state.downRuns ?? 0) < THRESHOLDS.beaconDownAlarmRuns) return null;
+  const reasons = group.relays.map((relay) => `${relay.id}: ${state.relays?.[relay.id]?.reason ?? "not checked"}`).join(", ");
+  return drandOnly
+    ? alarm(
+        "drand beacon down, service stopping",
+        `no relay serves a fresh round (${reasons}); the catalog lists only the drand beacon, so epoch publication stops and requests cannot be served until one does`,
+      )
+    : alarm("drand beacon down", `no relay serves a fresh round (${reasons}); epochs that select the drand recipe cannot publish until one does`);
+}
+
+/** One relay failing or lagging while others serve: a warning after beaconRelayWarnRuns runs in a row. */
+export function evaluateBeaconRelay(relay, state) {
+  const runs = state?.badRuns ?? 0;
+  if (runs < THRESHOLDS.beaconRelayWarnRuns) return null;
+  return warning(`drand relay ${relay.id} not serving fresh rounds`, `${runs} consecutive checks not fresh (last: ${state.reason ?? "unknown"})`);
+}
+
+/** A relay whose signature for the common round differs from the other relays'; stays until a comparison agrees. */
+export function evaluateBeaconAgreement(relay, state) {
+  const agreement = state?.agreement;
+  return agreement?.verdict === "differs" ? warning(`drand relay ${relay.id} disagrees with the other relays`, agreement.verdictReason ?? "") : null;
+}
+
+/** A relay whose daily chain info differs from the configured beacon; stays until a read matches. */
+export function evaluateBeaconInfo(relay, state) {
+  const info = state?.info;
+  return info?.verdict === "drift" ? warning(`drand relay ${relay.id} chain info differs from the configured beacon`, info.verdictReason ?? "") : null;
+}
+
+/**
+ * The registry's registration of the beacon against the configuration. Before the registry is upgraded and the beacon
+ * registered (beaconOf reverts or names no verifier) there is nothing to compare and nothing is raised; once it has been
+ * seen registered, losing the registration is a fault. Unknown while the registry could not be read.
+ */
+export function evaluateBeaconRegistration(target, state) {
+  if (!state || state.readOk === false || !state.registration) return undefined;
+  if (state.registration === "registered") {
+    return state.verdict === "mismatch" ? warning(`${target.name} registry beacon registration mismatch`, state.verdictReason ?? "") : null;
+  }
+  return state.everRegistered
+    ? warning(
+        `${target.name} registry beacon no longer registered`,
+        `${state.registrationReason ?? "not registered"}; the beacon was registered before`,
+      )
+    : null;
+}
+
+/**
+ * The registry rejecting the round it was asked to verify (verifyBeacon false or reverting) for beaconVerifyAlarmRuns
+ * runs in a row, while its beacon is registered and the relays agree on the round: it cannot verify a real round,
+ * so it cannot publish one either.
+ */
+export function evaluateBeaconVerify(target, state) {
+  if (!state || state.readOk === false || !state.registration) return undefined;
+  if (state.registration !== "registered") return null;
+  const failures = state.verify?.failures ?? 0;
+  if (failures < THRESHOLDS.beaconVerifyAlarmRuns) return null;
+  return alarm(
+    `${target.name} registry rejects drand rounds`,
+    `verifyBeacon(${target.beacon.recipe}) rejected round ${state.verify.rejectedRound} in ${failures} consecutive runs (${state.verify.rejectedReason ?? "unknown"}): the registry cannot verify a real round`,
+  );
+}
+
+/**
+ * Every beacon condition of a run, as a Map from check name to condition (undefined, null or {severity, ...} as at the top
+ * of this file). While no relay is fresh the relays' own warnings are unknown: the alarm covers them.
+ */
+export function evaluateBeaconChecks(groups, states, { drandOnly = false } = {}) {
+  const conditions = new Map();
+  for (const group of groups) {
+    const { preset } = group;
+    const state = states.get(groupStateKey(preset)) ?? null;
+    conditions.set(beaconFreshCheckName(preset), evaluateBeaconFresh(group, state, drandOnly));
+    const down = state !== null && state.fresh === 0;
+    for (const relay of group.relays) {
+      const relayState = state?.relays?.[relay.id] ?? null;
+      conditions.set(beaconRelayCheckName(preset, relay), down ? undefined : evaluateBeaconRelay(relay, relayState));
+      conditions.set(beaconAgreementCheckName(preset, relay), evaluateBeaconAgreement(relay, relayState));
+      conditions.set(beaconInfoCheckName(preset, relay), evaluateBeaconInfo(relay, relayState));
+    }
+    for (const target of group.networks) {
+      const networkState = states.get(networkStateKey(target.name)) ?? null;
+      conditions.set(beaconRegistrationCheckName(target.name), evaluateBeaconRegistration(target, networkState));
+      conditions.set(beaconVerifyCheckName(target.name), evaluateBeaconVerify(target, networkState));
+    }
+  }
+  return conditions;
 }

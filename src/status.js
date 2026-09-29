@@ -2,8 +2,19 @@
 // Never includes secrets, raw report bodies or report ids.
 
 import { storedCalls } from "./agentapi.js";
-import { evaluateListingDocumentCheck, evaluateProbeCheck, isAgentApiCheck } from "./checks.js";
-import { AIRNODE_RECIPES, AIRNODE_SCOPE, LIMITS, NETWORKS, THRESHOLDS, watchedAgentApi } from "./config.js";
+import { beaconGroups, groupStateKey, networkStateKey } from "./beacon.js";
+import {
+  evaluateBeaconAgreement,
+  evaluateBeaconFresh,
+  evaluateBeaconInfo,
+  evaluateBeaconRegistration,
+  evaluateBeaconRelay,
+  evaluateBeaconVerify,
+  evaluateListingDocumentCheck,
+  evaluateProbeCheck,
+  isAgentApiCheck,
+} from "./checks.js";
+import { AIRNODE_RECIPES, AIRNODE_SCOPE, BEACON_SCOPE, LIMITS, NETWORKS, THRESHOLDS, watchedAgentApi } from "./config.js";
 import { formatDuration, formatGwei, formatUsdc, shortAddress } from "./format.js";
 import { ICONS } from "./icons.js";
 import { describeShape } from "./listings.js";
@@ -11,6 +22,7 @@ import {
   readAgentApiState,
   readAlerts,
   readBackupReportState,
+  readBeaconStates,
   readChainState,
   readProbeStates,
   readReportState,
@@ -157,6 +169,131 @@ function agentApiView(name, net, storage, c, now, alerts) {
   };
 }
 
+/** The registration of one network's beacon as the page words it (see evaluateBeaconRegistration). */
+function registrationState(n) {
+  if (!n) return "not checked";
+  if (!n.registration) return "unknown";
+  if (n.registration === "registered") return n.verdict === "mismatch" ? "mismatch" : "registered";
+  return n.everRegistered ? "no longer registered" : "not registered yet";
+}
+
+/**
+ * The drand beacon of the configured networks: each relay's last check and each network's registration, or null when no
+ * network lists a beacon. Reasons are short texts built by the monitor, never reply bodies. `drandOnly`: no AirnodeHub
+ * recipe is configured, so the catalog holds the drand beacon alone.
+ */
+function beaconStatus(storage, now, nets, drandOnly) {
+  const groups = beaconGroups(nets);
+  if (groups.length === 0) return null;
+  const states = readBeaconStates(storage);
+  const chains = [];
+  const relays = [];
+  const networks = {};
+  for (const group of groups) {
+    const { preset } = group;
+    const g = states.get(groupStateKey(preset)) ?? null;
+    const down = evaluateBeaconFresh(group, g, drandOnly);
+    chains.push({
+      preset: preset.id,
+      name: preset.name,
+      scheme: preset.scheme,
+      chainHash: preset.chainHash,
+      periodSeconds: preset.period,
+      genesis: preset.genesis,
+      status: !g ? "not checked" : down ? "alarm" : g.fresh === 0 ? "warning" : "ok",
+      checkedAt: g?.checkedAt ?? null,
+      checkedAgeSeconds: age(now, g?.checkedAt),
+      freshRelays: g?.fresh ?? null,
+      totalRelays: group.relays.length,
+      latestRound: g?.latestRound ?? null,
+      commonRound: g?.commonRound ?? null,
+      consecutiveRunsWithoutFreshRelay: g?.downRuns ?? 0,
+      lastFreshAt: g?.lastFreshAt ?? null,
+      lastFreshAgeSeconds: age(now, g?.lastFreshAt),
+    });
+    for (const relay of group.relays) {
+      const s = g?.relays?.[relay.id] ?? null;
+      const agreement = evaluateBeaconAgreement(relay, s);
+      const info = evaluateBeaconInfo(relay, s);
+      relays.push({
+        preset: preset.id,
+        id: relay.id,
+        url: relay.url,
+        status: !s ? "not checked" : evaluateBeaconRelay(relay, s) || agreement || info ? "warning" : "ok",
+        lastOutcome: s?.outcome ?? null,
+        reason: s?.reason ?? null,
+        latestRound: s?.round ?? null,
+        lagRounds: s?.lagRounds ?? null,
+        lagSeconds: s?.lagRounds == null ? null : s.lagRounds * preset.period,
+        latencyMs: s?.latencyMs ?? null,
+        lastCheckedAt: s?.checkedAt ?? null,
+        lastCheckedAgeSeconds: age(now, s?.checkedAt),
+        consecutiveNotFresh: s?.badRuns ?? 0,
+        lastOkAt: s?.lastOkAt ?? null,
+        lastOkAgeSeconds: age(now, s?.lastOkAt),
+        // Signature at the common round against the other relays'; null until the relay was compared.
+        agreement: s?.agreement
+          ? {
+              status: agreement ? "warning" : s.agreement.verdict === "ok" ? "ok" : "unknown",
+              round: s.agreement.round,
+              checkedAt: s.agreement.checkedAt,
+              checkedAgeSeconds: age(now, s.agreement.checkedAt),
+              lastOutcome: s.agreement.outcome,
+              reason: s.agreement.reason,
+            }
+          : null,
+        // The daily /info read against the configured beacon.
+        chainInfo: s?.info
+          ? {
+              status: info ? "warning" : s.info.verdict === "ok" ? "ok" : "unknown",
+              checkedAt: s.info.checkedAt,
+              checkedAgeSeconds: age(now, s.info.checkedAt),
+              lastOutcome: s.info.outcome,
+              reason: s.info.reason,
+              nextCheckAt: s.info.nextCheckAt,
+            }
+          : null,
+      });
+    }
+    for (const target of group.networks) {
+      const n = states.get(networkStateKey(target.name)) ?? null;
+      const rejected = evaluateBeaconVerify(target, n);
+      const v = n?.verify ?? null;
+      networks[target.name] = {
+        preset: preset.id,
+        recipe: target.beacon.recipe,
+        registry: target.net.registry,
+        registration: registrationState(n),
+        reason: n?.readOk === false ? `not read: ${n.readReason}` : n?.registration === "registered" ? n.verdictReason ?? null : n?.registrationReason ?? null,
+        expectedVerifier: target.beacon.verifier ?? null,
+        verifier: n?.verifier ?? null,
+        slotSigner: n?.slotSigner ?? null,
+        checkedAt: n?.checkedAt ?? null,
+        checkedAgeSeconds: age(now, n?.checkedAt),
+        verification: v
+          ? {
+              status: rejected ? "alarm" : v.outcome === "ok" ? "ok" : "not verified",
+              lastOutcome: v.outcome,
+              round: v.round ?? null,
+              reason: v.reason ?? null,
+              consecutiveRejections: v.failures ?? 0,
+              lastOkAt: v.lastOkAt ?? null,
+              lastOkAgeSeconds: age(now, v.lastOkAt),
+            }
+          : null,
+      };
+    }
+  }
+  return {
+    catalogDrandOnly: drandOnly,
+    maxLagRounds: THRESHOLDS.beaconMaxLagRounds,
+    chains,
+    relays,
+    networks,
+    alerts: readAlerts(storage, BEACON_SCOPE).map(alertView(now)),
+  };
+}
+
 export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets = NETWORKS) {
   const networks = {};
   for (const name of Object.keys(nets)) {
@@ -215,12 +352,15 @@ export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets =
       alerts: alerts.filter((a) => !isAgentApiCheck(a.check)),
     };
   }
+  const beacon = beaconStatus(storage, now, nets, recipes.length === 0);
   return {
     service: "d20dao-watchdog",
     generatedAt: now,
     notifier: notifierConfigured(env) ? "configured" : "not configured",
     networks,
-    airnodehub: listingStatus(storage, now, recipes),
+    // Each section is there while it is configured: a network's beacon, and any AirnodeHub recipe.
+    ...(beacon ? { beacon } : {}),
+    ...(recipes.length > 0 ? { airnodehub: listingStatus(storage, now, recipes) } : {}),
     recentMessages: recentMessages(storage, 10).map((m) => ({
       at: m.created_at,
       network: m.network,
@@ -465,6 +605,76 @@ function listingsSection(listings) {
   );
 }
 
+const REGISTRATION_VIEW = {
+  registered: ["Registered", "ok"],
+  "not registered yet": ["Not registered yet", "muted"],
+  mismatch: ["MISMATCH", "warning"],
+  "no longer registered": ["No longer registered", "warning"],
+  unknown: ["Unknown", "muted"],
+  "not checked": ["—", "muted"],
+};
+
+const plural = (n, one) => `${n} ${n === 1 ? one : `${one}s`}`;
+
+function beaconRelayRow(r) {
+  const checked = r.status !== "not checked";
+  const status = checked ? state(r.status, label(r.status)) : `<span class="muted">not checked yet</span>`;
+  const lag = r.lagRounds == null ? "—" : `${plural(r.lagRounds, "round")} (${r.lagSeconds}s)`;
+  const agreement =
+    r.agreement?.status === "ok" ? "agree" : r.agreement?.status === "warning" ? `<span class="warning">differs</span>` : "—";
+  const chainInfo =
+    r.chainInfo?.status === "ok" ? "info ok" : r.chainInfo?.status === "warning" ? `<span class="warning">info differs</span>` : "info —";
+  const notes = [];
+  if (r.reason) notes.push(r.consecutiveNotFresh > 0 ? `${r.reason} (${r.consecutiveNotFresh} not fresh in a row)` : r.reason);
+  if (r.agreement?.status === "warning" && r.agreement.reason) notes.push(r.agreement.reason);
+  if (r.chainInfo?.status === "warning" && r.chainInfo.reason) notes.push(r.chainInfo.reason);
+  else if (r.chainInfo?.lastOutcome === "failure" && r.chainInfo.reason) notes.push(`chain info: ${r.chainInfo.reason}`);
+  return (
+    `<tbody><tr><th scope="row">${escapeHtml(r.id)}<small>${escapeHtml(r.preset)}</small></th>` +
+    `<td>${status}</td><td>${r.latestRound == null ? "—" : `#${escapeHtml(r.latestRound)}`}</td><td>${escapeHtml(lag)}</td>` +
+    `<td>${checked ? escapeHtml(ago(r.lastOkAgeSeconds)) : "—"}</td><td>${agreement} · ${chainInfo}</td></tr>` +
+    (notes.length ? `<tr class="note"><td colspan="6">${notes.map(escapeHtml).join("<br>")}</td></tr>` : "") +
+    `</tbody>`
+  );
+}
+
+function beaconSection(beacon) {
+  const tones = { ok: "ok", warning: "warning", alarm: "alarm" };
+  const stats = beacon.chains.map((c) => {
+    const figure = c.status === "not checked" ? "—" : `${c.freshRelays} of ${c.totalRelays}`;
+    const caption =
+      c.status === "not checked" ? "not checked yet" : c.latestRound == null ? "no fresh round" : `latest round #${c.latestRound}`;
+    return stat(beacon.chains.length > 1 ? `Relays · ${c.name}` : "Relays fresh", figure, caption, pick(tones, c.status) ?? "muted");
+  });
+  for (const [name, n] of Object.entries(beacon.networks)) {
+    const [text, tone] = pick(REGISTRATION_VIEW, n.registration) ?? [String(n.registration), "muted"];
+    const v = n.verification;
+    const checked = [
+      `recipe ${n.recipe}`,
+      v?.status === "ok" ? `round #${v.round} verified` : v?.status === "alarm" ? `round #${v.round} rejected` : null,
+      n.checkedAgeSeconds == null ? null : `checked ${ago(n.checkedAgeSeconds)}`,
+    ];
+    stats.push(stat(`Registry · ${name}`, text, checked.filter(Boolean).join(" · "), v?.status === "alarm" ? "alarm" : tone));
+  }
+  // Whether an outage is a service-stopping one: the catalog lists the beacon alone once the AirnodeHub probes are retired.
+  stats.push(
+    beacon.catalogDrandOnly
+      ? stat("Catalog", "drand only", "no fallback source", "muted")
+      : stat("Catalog", "AirnodeHub + drand", "AirnodeHub still probed", "muted"),
+  );
+  const first = beacon.chains[0];
+  const caption = `Read every minute · fresh means within ${plural(beacon.maxLagRounds, "round")} (${beacon.maxLagRounds * first.periodSeconds}s) of the schedule`;
+  return (
+    `<section class="section">` +
+    sectionHead("drand beacon", beacon.alerts, { caption }) +
+    `<dl class="stats">${stats.join("")}</dl>` +
+    `<div class="scroll" tabindex="0" role="region" aria-label="drand relays"><table class="table">` +
+    `<thead><tr><th scope="col">Relay</th><th scope="col">Status</th><th scope="col">Latest round</th><th scope="col">Lag</th><th scope="col">Last fresh</th><th scope="col">Checks</th></tr></thead>` +
+    beacon.relays.map(beaconRelayRow).join("") +
+    `</table></div></section>`
+  );
+}
+
 // D20DAO lockup from the site's brand mark (src/components/brand-mark.tsx in the web repo).
 const BRAND_MARK =
   `<svg role="img" aria-label="D20DAO" height="26" width="137.7" viewBox="0 -5 1112.29 210" xmlns="http://www.w3.org/2000/svg"><title>D20DAO</title>` +
@@ -479,20 +689,25 @@ const BRAND_MARK =
 // share image and X handle, and its icon set (served by this Worker, see icons.js). Indexable, like the site.
 const PAGE_URL = "https://watchdog.d20dao.org";
 const TITLE = "Arc VRF status | D20DAO";
-const DESCRIPTION = "Live health of the D20DAO VRF keepers, agent API and AirnodeHub listings on Arc.";
+const DESCRIPTION_PARTS = { beacon: "drand beacon", airnodehub: "AirnodeHub listings" };
+/** "Live health of the D20DAO VRF keepers, agent API, drand beacon and AirnodeHub listings on Arc.", for the sections shown. */
+function describe(status) {
+  const parts = ["VRF keepers", "agent API", ...Object.keys(DESCRIPTION_PARTS).filter((key) => status[key]).map((key) => DESCRIPTION_PARTS[key])];
+  return `Live health of the D20DAO ${parts.slice(0, -1).join(", ")} and ${parts.at(-1)} on Arc.`;
+}
 const SHARE_IMAGE = "https://d20dao.org/opengraph-image.png";
 const SHARE_IMAGE_ALT = "D20DAO logo — verifiable randomness.";
 const iconHref = (path) => `${path}?v=${ICONS[path].v}`;
-const HEAD_META = [
+const headMeta = (description) => [
   `<title>${TITLE}</title>`,
-  `<meta name="description" content="${DESCRIPTION}">`,
+  `<meta name="description" content="${description}">`,
   `<meta name="robots" content="index, follow">`,
   `<link rel="canonical" href="${PAGE_URL}">`,
   `<link rel="icon" href="${iconHref("/icon.svg")}" type="image/svg+xml" sizes="any">`,
   `<link rel="icon" href="${iconHref("/favicon.ico")}" type="image/x-icon" sizes="48x48">`,
   `<link rel="apple-touch-icon" href="${iconHref("/apple-touch-icon.png")}" type="image/png" sizes="180x180">`,
   `<meta property="og:title" content="${TITLE}">`,
-  `<meta property="og:description" content="${DESCRIPTION}">`,
+  `<meta property="og:description" content="${description}">`,
   `<meta property="og:url" content="${PAGE_URL}">`,
   `<meta property="og:site_name" content="D20DAO">`,
   `<meta property="og:type" content="website">`,
@@ -504,7 +719,7 @@ const HEAD_META = [
   `<meta name="twitter:card" content="summary_large_image">`,
   `<meta name="twitter:site" content="@d20dao">`,
   `<meta name="twitter:title" content="${TITLE}">`,
-  `<meta name="twitter:description" content="${DESCRIPTION}">`,
+  `<meta name="twitter:description" content="${description}">`,
   `<meta name="twitter:image" content="${SHARE_IMAGE}">`,
   `<meta name="twitter:image:alt" content="${SHARE_IMAGE_ALT}">`,
 ].join("\n");
@@ -584,9 +799,10 @@ export function renderHtml(status) {
   const sections =
     Object.entries(status.networks)
       .map(([name, n]) => networkSection(name, n) + (n.agentApi?.enabled ? agentApiSection(name, n.agentApi) : ""))
-      .join("") + (status.airnodehub ? listingsSection(status.airnodehub) : "");
+      .join("") + (status.beacon ? beaconSection(status.beacon) : "") + (status.airnodehub ? listingsSection(status.airnodehub) : "");
   const alerts = [
     ...Object.values(status.networks).flatMap((n) => [...n.alerts, ...(n.agentApi?.alerts ?? [])]),
+    ...(status.beacon?.alerts ?? []),
     ...(status.airnodehub?.alerts ?? []),
   ];
   const overall = worstOf(alerts);
@@ -597,7 +813,7 @@ export function renderHtml(status) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <meta http-equiv="refresh" content="60">
-${HEAD_META}
+${headMeta(describe(status))}
 <style>${STYLE}</style>
 </head>
 <body>

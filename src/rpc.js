@@ -21,6 +21,9 @@ import {
 import { IMPLEMENTATION_SLOT, LIMITS, SELECTORS, TOPICS, watchedAgentApi } from "./config.js";
 import { FetchTimeoutError, fetchText } from "./net.js";
 
+// An eth_call that reverted: code 3 on geth and reth, or another code with a message that says so.
+const isRevert = (error) => error?.code === 3 || (typeof error?.message === "string" && /revert/i.test(error.message));
+
 export class RpcSession {
   constructor(urls, { fetch, timeoutMs = LIMITS.rpcTimeoutMs }) {
     this.urls = urls;
@@ -42,7 +45,8 @@ export class RpcSession {
   /**
    * Send one batch. `validate(items)` may return an error code to reject a response
    * (e.g. wrong chain) and move on to the next endpoint.
-   * Returns an array of {result} | {error} in call order, or null when every endpoint failed.
+   * Returns an array of {result} | {error, revert?} in call order, or null when every endpoint failed. `revert: true`
+   * marks a call that reverted, which is an answer about the contract rather than a fault of the endpoint.
    */
   async batch(calls, validate) {
     const payload = JSON.stringify(
@@ -93,7 +97,10 @@ export class RpcSession {
       const i = entry.id - 1;
       if (i < 0 || i >= count || items[i]) continue;
       items[i] = "error" in entry && entry.error != null
-        ? { error: `rpc error ${Number.isInteger(entry.error?.code) ? entry.error.code : "unknown"}` }
+        ? {
+            error: `rpc error ${Number.isInteger(entry.error?.code) ? entry.error.code : "unknown"}`,
+            ...(isRevert(entry.error) ? { revert: true } : {}),
+          }
         : { result: entry.result };
     }
     for (let i = 0; i < count; i++) if (!items[i]) return { error: "incomplete batch" };

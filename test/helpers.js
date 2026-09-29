@@ -204,6 +204,38 @@ export function agentApiPoll(overrides = {}, net = TESTNET) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// drand beacon fixtures
+
+/**
+ * A runBeacon() result for `plan` in which every relay is fresh and no registry lists a beacon yet (as before the
+ * registry is upgraded), so it raises nothing. It stands in for the monitor in the tests that are about something else;
+ * test/beacon.test.js runs the real one.
+ */
+export function healthyBeaconRun(plan) {
+  return {
+    subrequests: 0,
+    groups: plan.groups.map((group) => ({
+      preset: group.preset.id,
+      commonRound: null,
+      sampleRound: null,
+      relays: group.relays.map((relay) => ({ id: relay.id, outcome: "fresh", reason: null, round: 1000, lagRounds: 0, latencyMs: 10, agreement: null, info: null })),
+      networks: group.networks.map((target) => ({
+        name: target.name,
+        ok: true,
+        reason: null,
+        registration: "unregistered",
+        registrationReason: "beaconOf reverted",
+        verifier: null,
+        slotSigner: null,
+        verdict: null,
+        verdictReason: null,
+        verify: { outcome: "skipped", round: null, reason: "beacon not registered" },
+      })),
+    })),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
 // AirnodeHub fixtures
 
 /** EpochEntropy.recipeRequest(recipe) for the built-in recipes 0-5, as the Arc Mainnet and Testnet registries return them. */
