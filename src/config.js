@@ -177,8 +177,10 @@ export const THRESHOLDS = Object.freeze({
   beaconMaxLagRounds: 3,
   // A relay naming a round further ahead of the schedule than this is not following the configured chain's clock.
   beaconMaxAheadRounds: 2,
-  // Consecutive runs (about a minute each) in which a relay is not fresh before it warns.
-  beaconRelayWarnRuns: 3,
+  // Consecutive runs (about a minute each) in which a relay is not fresh before it warns. One relay lagging while the
+  // others serve delays nothing (the keepers ask every relay at once), and drand.cloudflare.com serves a cached 404
+  // for a few minutes at a time, so only a streak of about ten minutes is worth a warning.
+  beaconRelayWarnRuns: 10,
   // Consecutive runs in which no relay is fresh before the alarm: the registry cannot publish without a round.
   beaconDownAlarmRuns: 2,
   // Consecutive runs in which the registry rejected the round it was asked to verify before the alarm. Only a rejection

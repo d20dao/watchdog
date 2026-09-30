@@ -296,7 +296,7 @@ test("a catalog that cannot be read leaves an outage as serious as the beacon be
   assert.equal(readAlerts(registered.storage, "beacon")[0].severity, "warning");
 });
 
-test("one relay failing or lagging warns after three runs in a row, once, and resolves when it serves again", async () => {
+test("one relay failing or lagging warns after ten runs in a row, once, and resolves when it serves again", async () => {
   const h = harness();
   await h.run(0);
   h.world.relays[API2].status = 503;
@@ -305,22 +305,23 @@ test("one relay failing or lagging warns after three runs in a row, once, and re
   await h.run(2);
   assert.deepEqual(h.texts(), [], "a relay that fails now and then is not worth a message");
 
+  // Nine runs in a row raise nothing, though with the failed run at minute 1 that is ten in all: the fresh run reset the streak.
   h.world.relays[API2].status = 503;
-  for (const minute of [3, 4]) await h.run(minute);
+  for (let minute = 3; minute < 12; minute++) await h.run(minute);
   assert.deepEqual(h.texts(), []);
-  await h.run(5);
-  assert.deepEqual(h.texts(), ["[beacon] WARNING drand relay api2.drand.sh not serving fresh rounds: 3 consecutive checks not fresh (last: http 503)"]);
-  for (const minute of [6, 7, 40]) await h.run(minute);
+  await h.run(12);
+  assert.deepEqual(h.texts(), ["[beacon] WARNING drand relay api2.drand.sh not serving fresh rounds: 10 consecutive checks not fresh (last: http 503)"]);
+  for (const minute of [13, 14, 40]) await h.run(minute);
   assert.equal(h.texts().length, 1, "warnings never repeat");
   h.world.relays[API2].status = undefined;
   await h.run(41);
-  assert.equal(h.texts()[1], "[beacon] RESOLVED drand relay api2.drand.sh not serving fresh rounds after 36 min");
+  assert.equal(h.texts()[1], "[beacon] RESOLVED drand relay api2.drand.sh not serving fresh rounds after 29 min");
 
   // Lagging is the same alert, with the lag as its reason.
   h.world.relays[API3].lag = 4;
-  for (const minute of [42, 43, 44]) await h.run(minute);
+  for (let minute = 42; minute < 52; minute++) await h.run(minute);
   const round = currentRound(PRESET, h.world.now) - 4;
-  assert.equal(h.texts()[2], `[beacon] WARNING drand relay api3.drand.sh not serving fresh rounds: 3 consecutive checks not fresh (last: latest round ${round} is 4 rounds (12s) behind the schedule)`);
+  assert.equal(h.texts()[2], `[beacon] WARNING drand relay api3.drand.sh not serving fresh rounds: 10 consecutive checks not fresh (last: latest round ${round} is 4 rounds (12s) behind the schedule)`);
   assert.deepEqual(beaconAlerts(h), ["relay:drand-evmnet:api3.drand.sh"]);
 });
 
@@ -967,14 +968,14 @@ async function troubled() {
   h.registries["arc-mainnet"].beaconOf = registeredBeacon({ period: 9 });
   h.world.relays[API2].status = 503;
   h.world.relays[API3].salt = "forked";
-  for (let minute = 0; minute < 5; minute++) await h.run(minute);
+  for (let minute = 0; minute < 10; minute++) await h.run(minute);
   return h;
 }
 
 test("status JSON: the chain, each relay's last check, each network's registration and catalog, and the beacon's own alerts", async () => {
   const h = await troubled();
-  const round = currentRound(PRESET, NOW + 4 * 60);
-  const status = h.status(4);
+  const round = currentRound(PRESET, NOW + 9 * 60);
+  const status = h.status(9);
   const beacon = status.beacon;
   assert.equal(beacon.catalogDrandOnly, true, "read from the chain's catalog");
   assert.equal(beacon.maxLagRounds, 3);
@@ -987,14 +988,14 @@ test("status JSON: the chain, each relay's last check, each network's registrati
       periodSeconds: 3,
       genesis: 1727521075,
       status: "ok",
-      checkedAt: NOW + 240,
+      checkedAt: NOW + 540,
       checkedAgeSeconds: 0,
       freshRelays: 3,
       totalRelays: 4,
       latestRound: round,
       commonRound: round - 1,
       consecutiveRunsWithoutFreshRelay: 0,
-      lastFreshAt: NOW + 240,
+      lastFreshAt: NOW + 540,
       lastFreshAgeSeconds: 0,
     },
   ]);
@@ -1004,7 +1005,7 @@ test("status JSON: the chain, each relay's last check, each network's registrati
     beacon.relays.map((r) => [r.id, r.status, r.lastOutcome, r.latestRound, r.lagRounds, r.consecutiveNotFresh]),
     [
       [API, "ok", "fresh", round, 0, 0],
-      [API2, "warning", "failure", null, null, 5],
+      [API2, "warning", "failure", null, null, 10],
       [API3, "warning", "fresh", round, 0, 0],
       [CLOUDFLARE, "ok", "fresh", round, 0, 0],
     ],
@@ -1043,18 +1044,18 @@ test("status JSON: the chain, each relay's last check, each network's registrati
 
 test("status HTML: a drand beacon section with the relays, the registries and the alerts; the tone follows the severity", async () => {
   const h = await troubled();
-  const html = renderHtml(h.status(4));
+  const html = renderHtml(h.status(9));
   const text = pageText(html);
   assert.ok(text.includes("drand beacon WARNING Read every minute · fresh means within 3 rounds (9s) of the schedule"));
-  const round = currentRound(PRESET, NOW + 4 * 60);
+  const round = currentRound(PRESET, NOW + 9 * 60);
   assert.ok(text.includes(`Relays fresh 3 of 4 latest round #${round}`));
   assert.ok(text.includes("Registry · arc-mainnet MISMATCH recipe 11 · catalog: drand only · round #" + (round - 1) + " verified · checked 0s ago"));
   assert.ok(text.includes("Registry · arc-testnet Not registered yet recipe 11 · catalog: drand only · checked 0s ago"));
-  assert.ok(text.includes("WARNING drand relay api2.drand.sh not serving fresh rounds 5 consecutive checks not fresh (last: http 503)"));
+  assert.ok(text.includes("WARNING drand relay api2.drand.sh not serving fresh rounds 10 consecutive checks not fresh (last: http 503)"));
   assert.ok(text.includes("WARNING arc-mainnet registry beacon registration mismatch"));
   assert.ok(text.includes("Relay Status Latest round Lag Last fresh Checks"));
   assert.ok(text.includes(`api.drand.sh drand-evmnet OK #${round} 0 rounds (0s) 0s ago agree · info ok`));
-  assert.ok(text.includes("api2.drand.sh drand-evmnet WARNING — — never — · info — http 503 (5 not fresh in a row) chain info: http 503"));
+  assert.ok(text.includes("api2.drand.sh drand-evmnet WARNING — — never — · info — http 503 (10 not fresh in a row) chain info: http 503"));
   assert.ok(text.includes(`api3.drand.sh drand-evmnet WARNING #${round} 0 rounds (0s) 0s ago differs · info ok`));
   assert.ok(text.includes(`round ${round - 1}: signature `));
   assert.match(html, /<p class="pill warning">/);
@@ -1193,7 +1194,7 @@ test("the beacon keeps three rows a run: one for its relays and one for each net
   await h.run(0);
   const before = h.storage.db.prepare("SELECT COUNT(*) AS n FROM beacon_state").get().n;
   assert.equal(before, 3);
-  assert.equal(THRESHOLDS.beaconRelayWarnRuns, 3);
+  assert.equal(THRESHOLDS.beaconRelayWarnRuns, 10);
   await h.run(1);
   assert.equal(h.storage.db.prepare("SELECT COUNT(*) AS n FROM beacon_state").get().n, 3, "rewritten, not added to");
 });

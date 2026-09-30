@@ -371,14 +371,14 @@ const [MAINNET_TARGET] = GROUP.networks;
 const group = (overrides = {}) => ({ fresh: 4, downRuns: 0, relays: {}, ...overrides });
 const NO_USE = { only: [], mixed: [] };
 
-test("beacon relay: a warning once it has not been fresh for 3 runs in a row", () => {
-  assert.equal(THRESHOLDS.beaconRelayWarnRuns, 3);
+test("beacon relay: a warning once it has not been fresh for 10 runs in a row", () => {
+  assert.equal(THRESHOLDS.beaconRelayWarnRuns, 10);
   const at = (badRuns) => evaluateBeaconRelay(RELAY, { badRuns, reason: "http 503" });
   assert.equal(severity(at(0)), "clear");
-  assert.equal(severity(at(2)), "clear");
-  assert.equal(severity(at(3)), "warning");
-  assert.equal(at(7).title, "drand relay api.drand.sh not serving fresh rounds");
-  assert.equal(at(7).detail, "7 consecutive checks not fresh (last: http 503)");
+  assert.equal(severity(at(9)), "clear");
+  assert.equal(severity(at(10)), "warning");
+  assert.equal(at(12).title, "drand relay api.drand.sh not serving fresh rounds");
+  assert.equal(at(12).detail, "12 consecutive checks not fresh (last: http 503)");
   assert.equal(severity(evaluateBeaconRelay(RELAY, null)), "clear", "never checked");
 });
 
@@ -520,7 +520,7 @@ test("beacon monitor: a warning while any part of the last run failed on an erro
 });
 
 test("beacon checks: every relay and network has its own, and the relays' warnings are unknown while none is fresh", () => {
-  const relayStates = Object.fromEntries(GROUP.relays.map((r) => [r.id, { badRuns: 9, reason: "http 503" }]));
+  const relayStates = Object.fromEntries(GROUP.relays.map((r) => [r.id, { badRuns: 12, reason: "http 503" }]));
   const states = (fresh, networks = {}) =>
     new Map([["group:drand-evmnet", group({ fresh, downRuns: fresh === 0 ? 4 : 0, relays: relayStates })], ...Object.entries(networks)]);
   const conditions = evaluateBeaconChecks([GROUP], states(0));

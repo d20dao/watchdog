@@ -134,7 +134,7 @@ Alerts use the scope `beacon` (messages read `[beacon] ALARM drand beacon down: 
 | Check (key) | Warning | Alarm |
 | --- | --- | --- |
 | `fresh:<beacon>`: no relay serves a fresh round, 2 runs in a row | while no catalog in force lists the beacon | when one does: `drand beacon down`, and `drand beacon down, service stopping` when one lists it alone |
-| `relay:<beacon>:<host>`: a relay fails (unreachable, HTTP error, unusable or oversize reply, wrong round) or lags | 3 runs in a row; unknown while no relay is fresh, the alarm covers it | — |
+| `relay:<beacon>:<host>`: a relay fails (unreachable, HTTP error, unusable or oversize reply, wrong round) or lags | 10 runs in a row; unknown while no relay is fresh, the alarm covers it | — |
 | `agree:<beacon>:<host>`: a relay's signature differs from the majority's, or from the one a registry accepts, or is the only one and every registry rejects it | at once; stays until a comparison agrees or a registry accepts it (a failed read does not clear it) | — |
 | `info:<beacon>:<host>`: a relay's `/info` differs from the preset | at once; stays until a read matches | — |
 | `registration:<network>`: `beaconOf` or `slotSigner` differs from the configuration, the recipe is no beacon, or a registration seen before is gone | at once (a lost registration: 2 runs in a row) | — |
