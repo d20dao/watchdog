@@ -5,11 +5,15 @@ import {
   decodeAddress,
   decodeBeaconOf,
   decodeBool,
+  decodeCatalogAt,
   decodeCoordinatorLog,
   decodePendingRequestIds,
   decodeRequest,
   decodeUint256,
+  decodeUint64,
   encodeBeaconOf,
+  encodeCatalogAt,
+  encodeEpochForBlock,
   encodeGetPendingRequestIds,
   encodeGetRequest,
   encodeSlotSigner,
@@ -19,7 +23,7 @@ import {
   toQuantity,
 } from "../src/abi.js";
 import { TOPICS } from "../src/config.js";
-import { ZERO_BEACON, encodeBeaconOfResult, registeredBeacon } from "./beacon-helpers.js";
+import { ZERO_BEACON, encodeBeaconOfResult, encodeCatalogAtResult, registeredBeacon } from "./beacon-helpers.js";
 import { addressWord, bytes32, encodePending, encodeRequest, word } from "./helpers.js";
 
 test("calldata encoding matches the verified selectors", () => {
@@ -200,4 +204,48 @@ test("beaconOf return data: a dynamic tuple, and the zero tuple for a recipe tha
   const short = encodeBeaconOfResult(registeredBeacon({ publicKey: "0x" + "ab".repeat(5) }));
   assert.equal(decodeBeaconOf(short).publicKey, "0x" + "ab".repeat(5));
   assert.throws(() => decodeBeaconOf(short.slice(0, -2) + "01"), AbiError, "padding is not zero");
+});
+
+test("beaconOf return data is read lowercase, whatever case the node wrote it in", () => {
+  const shouting = "0x" + encodeBeaconOfResult(registeredBeacon()).slice(2).toUpperCase();
+  assert.deepEqual(decodeBeaconOf(shouting), registeredBeacon());
+  const tuple = decodeBeaconOf(shouting);
+  assert.equal(tuple.chainHash, tuple.chainHash.toLowerCase());
+  assert.equal(tuple.publicKey, tuple.publicKey.toLowerCase());
+});
+
+test("epochForBlock and catalogAt: calldata, a uint64 answer and a catalog of recipes and signers", () => {
+  assert.equal(encodeEpochForBlock(1234), "0x7018ebb1" + word(1234));
+  assert.equal(encodeCatalogAt(7), "0xec993599" + word(7));
+  assert.equal(encodeCatalogAt(2n ** 64n - 1n), "0xec993599" + "f".repeat(16).padStart(64, "0"));
+  assert.throws(() => encodeCatalogAt(1n << 64n), AbiError, "a uint64");
+  assert.throws(() => encodeCatalogAt(-1), AbiError);
+  assert.equal(decodeUint64("0x" + word(7)), 7);
+  assert.throws(() => decodeUint64("0x" + word(1n << 64n)), AbiError, "a uint64");
+  assert.throws(() => decodeUint64("0x" + word(2n ** 60n)), AbiError, "beyond a safe integer");
+  assert.throws(() => decodeUint64("0x"), AbiError);
+  assert.throws(() => decodeUint64("0x" + word(1) + word(1)), AbiError);
+
+  const signers = ["0x" + "11".repeat(20), "0x" + "22".repeat(20), "0x" + "33".repeat(20)];
+  const catalog = { hash: "0x" + "ab".repeat(32), recipes: [0, 3, 11], signers };
+  const data = encodeCatalogAtResult(catalog);
+  assert.equal((data.length - 2) / 64, 3 + 1 + 3 + 1 + 3, "hash and two offsets, then each array's length and words");
+  assert.deepEqual(decodeCatalogAt(data), catalog);
+  assert.deepEqual(decodeCatalogAt(encodeCatalogAtResult({ recipes: [11] })).recipes, [11]);
+  assert.deepEqual(decodeCatalogAt(encodeCatalogAtResult({ recipes: [], signers: [] })), { hash: "0x" + "c1".repeat(32), recipes: [], signers: [] });
+  assert.equal(decodeCatalogAt("0x" + "AB".repeat(32) + data.slice(66)).hash, "0x" + "ab".repeat(32), "lowercase");
+  // The two arrays need not be as long as one another.
+  assert.deepEqual(decodeCatalogAt(encodeCatalogAtResult({ recipes: [1, 2], signers: [signers[0]] })).signers, [signers[0]]);
+
+  const words = data.slice(2).match(/.{64}/g);
+  const build = (edit) => "0x" + edit([...words]).join("");
+  assert.throws(() => decodeCatalogAt("0x"), AbiError, "no data");
+  assert.throws(() => decodeCatalogAt("0x" + words.slice(0, 4).join("")), AbiError, "too short");
+  assert.throws(() => decodeCatalogAt("0x" + words.slice(0, -1).join("")), AbiError, "the signers are cut short");
+  assert.throws(() => decodeCatalogAt(build((w) => ((w[1] = word(97)), w))), AbiError, "misaligned recipes offset");
+  assert.throws(() => decodeCatalogAt(build((w) => ((w[2] = word(0x2000)), w))), AbiError, "signers offset past the data");
+  assert.throws(() => decodeCatalogAt(data, 2), AbiError, "more slots than the limit");
+  assert.throws(() => decodeCatalogAt(build((w) => ((w[3] = word(200)), w))), AbiError, "a length that runs past the data");
+  assert.throws(() => decodeCatalogAt(build((w) => ((w[4] = word(256)), w))), AbiError, "a recipe is a uint8");
+  assert.throws(() => decodeCatalogAt(build((w) => ((w[8] = "01" + w[8].slice(2)), w))), AbiError, "a signer with dirty high bits");
 });

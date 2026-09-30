@@ -81,6 +81,7 @@ export function drandWorld({ now = NOW } = {}) {
 
 const ZERO_ADDRESS = "0x" + "0".repeat(40);
 export const VERIFIER = "0x" + "ab".repeat(20); // a made-up verifier contract: none is deployed yet
+export const BEACON_RECIPE = 11; // the recipe id the configuration monitors
 
 /** The tuple beaconOf returns for a beacon registered as the configuration says. */
 export const registeredBeacon = (overrides = {}) => ({
@@ -101,6 +102,24 @@ export function encodeBeaconOfResult({ verifier, genesis, period, chainHash, pub
   const padded = key.padEnd(Math.ceil(key.length / 64) * 64, "0");
   return "0x" + word(32) + addressWord(verifier) + word(genesis) + word(period) + chainHash.replace(/^0x/, "") + word(160) + word(key.length / 2) + padded;
 }
+
+/** The catalog before the switch: four signed sources and no beacon. */
+export const PRE_SWITCH_CATALOG = Object.freeze({ recipes: [0, 1, 2, 3] });
+/** The catalog after the switch: the beacon alone, no fallback source. */
+export const DRAND_ONLY_CATALOG = Object.freeze({ recipes: [BEACON_RECIPE] });
+
+/** abi.encode of (bytes32 hash, uint8[] recipes, address[] signers), as the return data of catalogAt. */
+export function encodeCatalogAtResult({ hash = "0x" + "c1".repeat(32), recipes, signers = recipes.map(() => "0x" + "22".repeat(20)) }) {
+  return (
+    "0x" + hash.replace(/^0x/, "") + word(96) + word(96 + 32 * (1 + recipes.length)) + word(recipes.length) + recipes.map(word).join("") + word(signers.length) + signers.map(addressWord).join("")
+  );
+}
+
+/** The signature the beacon really signed round `round` with: the one relays serve unless they are set to disagree. */
+export const realSignature = (round) => roundRecord(round).signature;
+
+/** What a verifier that checks the pairing does: accept the real signature of a round and no other. */
+export const acceptsReal = ({ round, signature }) => signature === realSignature(round);
 
 /**
  * The signer the registry derives for a beacon slot, written out here on its own with Buffers:
@@ -128,44 +147,81 @@ export function slotSignerFor({ verifier, chainHash, publicKey, genesis, period 
 
 /**
  * The registry of `net` answering JSON-RPC batches. `registry` steers it:
- *   beaconOf    "revert" | a tuple (see registeredBeacon, ZERO_BEACON) | "0x" for empty return data
- *   slotSigner  "revert" | an address; by default the signer derived from beaconOf's tuple
- *   verify      true | false | "revert"
+ *   beaconOf    for recipe BEACON_RECIPE: "revert" | a tuple (see registeredBeacon, ZERO_BEACON) | "0x" for empty return data.
+ *               Recipes 0 to 10 are signed recipes that exist (a zero verifier); any other recipe reverts.
+ *   beacons     {recipe: "revert" | a tuple}: beaconOf of another recipe
+ *   slotSigner  "revert" | an address; by default the signer derived from the recipe's tuple
+ *   verify      true | false | "revert" | ({recipe, round, signature}) => true | false | "revert". By default a signature is
+ *               accepted when it is the real one for its round, as a verifier that checks the pairing would
+ *   catalog     {recipes, signers?, hash?} | "revert" | (epoch) => either: catalogAt's answer, PRE_SWITCH_CATALOG by default
+ *   epoch       a number | "revert" | (block) => epoch: epochForBlock's answer, a block's number / 200 by default
  *   error       a JSON-RPC error object answered for every call but eth_chainId, instead
  *   chainId     the chain id to answer with, when not the network's
  *   down        answer every request with this HTTP status
- * `registry.calls` records the calls as {method, recipe?, round?, signature?}.
+ * `registry.calls` records the calls as {method, recipe?, round?, signature?, block?, epoch?}.
  */
 export function registryOf(net) {
-  const registry = { beaconOf: "revert", verify: true, calls: [] };
+  const registry = {
+    beaconOf: "revert",
+    beacons: {},
+    verify: acceptsReal,
+    catalog: PRE_SWITCH_CATALOG,
+    epoch: (block) => Math.floor(block / 200),
+    calls: [],
+  };
+  // What both Arc RPC endpoints answered for beaconOf on the registry before the upgrade, 2026-09-29.
+  const revert = { error: { code: 3, message: "execution reverted" } };
+  const tupleOf = (recipe) => {
+    if (recipe in registry.beacons) return registry.beacons[recipe];
+    if (recipe === BEACON_RECIPE) return registry.beaconOf;
+    return recipe < BEACON_RECIPE ? ZERO_BEACON : "revert";
+  };
+  const isBeacon = (tuple) => tuple !== "revert" && tuple !== "0x" && tuple.verifier !== ZERO_ADDRESS;
   registry.answer = (item) => {
     if (item.method === "eth_chainId") return { result: "0x" + BigInt(registry.chainId ?? net.chainId).toString(16) };
     if (registry.error) return { error: registry.error };
     const { to, data } = item.params[0];
     if (to.toLowerCase() !== net.registry.toLowerCase()) throw new Error(`call to ${to}, not the registry`);
-    // What both Arc RPC endpoints answered for beaconOf on the registry before the upgrade, 2026-09-29.
-    const revert = { error: { code: 3, message: "execution reverted" } };
     const selector = data.slice(0, 10);
+    const arg = (n) => BigInt("0x" + data.slice(10 + 64 * n, 10 + 64 * (n + 1)));
     if (selector === "0x87533a48") {
-      registry.calls.push({ method: "beaconOf", recipe: Number(BigInt("0x" + data.slice(10))) });
-      return registry.beaconOf === "revert" ? revert : { result: registry.beaconOf === "0x" ? "0x" : encodeBeaconOfResult(registry.beaconOf) };
+      const recipe = Number(arg(0));
+      registry.calls.push({ method: "beaconOf", recipe });
+      const tuple = tupleOf(recipe);
+      return tuple === "revert" ? revert : { result: tuple === "0x" ? "0x" : encodeBeaconOfResult(tuple) };
     }
     if (selector === "0xb42be3c1") {
-      registry.calls.push({ method: "slotSigner", recipe: Number(BigInt("0x" + data.slice(10))) });
-      if (registry.slotSigner === "revert" || registry.beaconOf === "revert" || registry.beaconOf === "0x") return revert;
-      return { result: "0x" + addressWord(registry.slotSigner ?? slotSignerFor(registry.beaconOf)) };
+      const recipe = Number(arg(0));
+      registry.calls.push({ method: "slotSigner", recipe });
+      const tuple = tupleOf(recipe);
+      if (registry.slotSigner === "revert" || !isBeacon(tuple)) return revert;
+      return { result: "0x" + addressWord(registry.slotSigner ?? slotSignerFor(tuple)) };
     }
     if (selector === "0x0ccd9ab2") {
       const args = data.slice(10);
       const length = Number(BigInt("0x" + args.slice(192, 256)));
-      registry.calls.push({
+      const call = {
         method: "verifyBeacon",
         recipe: Number(BigInt("0x" + args.slice(0, 64))),
         round: Number(BigInt("0x" + args.slice(64, 128))),
         offset: Number(BigInt("0x" + args.slice(128, 192))),
         signature: args.slice(256, 256 + length * 2),
-      });
-      return registry.verify === "revert" ? revert : { result: "0x" + word(registry.verify ? 1 : 0) };
+      };
+      registry.calls.push(call);
+      const verdict = typeof registry.verify === "function" ? registry.verify(call) : registry.verify;
+      return verdict === "revert" || !isBeacon(tupleOf(call.recipe)) ? revert : { result: "0x" + word(verdict ? 1 : 0) };
+    }
+    if (selector === "0x7018ebb1") {
+      const block = Number(arg(0));
+      registry.calls.push({ method: "epochForBlock", block });
+      if (registry.epoch === "revert") return revert;
+      return { result: "0x" + word(typeof registry.epoch === "function" ? registry.epoch(block) : registry.epoch) };
+    }
+    if (selector === "0xec993599") {
+      const epoch = Number(arg(0));
+      registry.calls.push({ method: "catalogAt", epoch });
+      const catalog = typeof registry.catalog === "function" ? registry.catalog(epoch) : registry.catalog;
+      return catalog === "revert" ? revert : { result: encodeCatalogAtResult(catalog) };
     }
     throw new Error("unexpected call " + data);
   };

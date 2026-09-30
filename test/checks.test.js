@@ -5,13 +5,17 @@ import {
   AGENT_API_CHECK_NAMES,
   CHECK_NAMES,
   backupBalanceCheckName,
+  beaconMonitorFailure,
+  beaconUsage,
   evaluateBackupReportChecks,
   evaluateBeaconAgreement,
   evaluateBeaconChecks,
   evaluateBeaconFresh,
   evaluateBeaconInfo,
+  evaluateBeaconMonitor,
   evaluateBeaconRegistration,
   evaluateBeaconRelay,
+  evaluateBeaconVerifier,
   evaluateBeaconVerify,
   evaluateChainChecks,
   evaluateReportChecks,
@@ -365,6 +369,7 @@ const GROUP = beaconGroups(NETWORKS)[0];
 const RELAY = GROUP.relays[0];
 const [MAINNET_TARGET] = GROUP.networks;
 const group = (overrides = {}) => ({ fresh: 4, downRuns: 0, relays: {}, ...overrides });
+const NO_USE = { only: [], mixed: [] };
 
 test("beacon relay: a warning once it has not been fresh for 3 runs in a row", () => {
   assert.equal(THRESHOLDS.beaconRelayWarnRuns, 3);
@@ -377,21 +382,48 @@ test("beacon relay: a warning once it has not been fresh for 3 runs in a row", (
   assert.equal(severity(evaluateBeaconRelay(RELAY, null)), "clear", "never checked");
 });
 
-test("beacon down: an alarm once no relay has been fresh for 2 runs in a row; service-stopping when drand is the only source", () => {
+test("how the catalogs in force use the beacon, from the networks' states: alone, among other sources, or not at all", () => {
+  const states = (mainnet, testnet) => new Map([["network:arc-mainnet", mainnet], ["network:arc-testnet", testnet]].filter(([, s]) => s !== undefined));
+  const use = (u, registration = "unregistered") => ({ registration, catalog: u === null ? null : { use: u } });
+  assert.deepEqual(beaconUsage(GROUP, states(use("only"), use("none"))), { only: ["arc-mainnet"], mixed: [] });
+  assert.deepEqual(beaconUsage(GROUP, states(use("only"), use("mixed"))), { only: ["arc-mainnet"], mixed: ["arc-testnet"] });
+  assert.deepEqual(beaconUsage(GROUP, states(use("none"), use("none"))), NO_USE);
+  // Not read yet: as serious as the beacon being registered makes it, since it might be in use, and otherwise nothing depends on it.
+  assert.deepEqual(beaconUsage(GROUP, states(use(null, "registered"), use(null))), { only: [], mixed: ["arc-mainnet"] });
+  assert.deepEqual(beaconUsage(GROUP, new Map()), NO_USE);
+  assert.deepEqual(beaconUsage(GROUP, states({ readOk: false }, undefined)), NO_USE, "a state that has not been read at all");
+});
+
+test("beacon down: an alarm once no relay has been fresh for 2 runs in a row; how serious it is comes from the catalogs in force", () => {
   assert.equal(THRESHOLDS.beaconDownAlarmRuns, 2);
   const relays = Object.fromEntries(GROUP.relays.map((r) => [r.id, { reason: "timeout" }]));
   relays["api2.drand.sh"] = { reason: `latest round 5 is 9 rounds (27s) behind the schedule` };
-  const at = (downRuns, drandOnly) => evaluateBeaconFresh(GROUP, group({ fresh: 0, downRuns, relays }), drandOnly);
-  assert.equal(severity(at(0, true)), "clear");
-  assert.equal(severity(at(1, true)), "clear");
-  assert.equal(severity(at(2, false)), "alarm");
-  assert.equal(severity(at(2, true)), "alarm");
-  assert.equal(at(2, true).title, "drand beacon down, service stopping");
-  assert.equal(at(2, false).title, "drand beacon down");
-  assert.match(at(2, true).detail, /^no relay serves a fresh round \(api\.drand\.sh: timeout, api2\.drand\.sh: latest round 5 is 9 rounds \(27s\) behind the schedule, api3\.drand\.sh: timeout, drand\.cloudflare\.com: timeout\); the catalog lists only the drand beacon, so epoch publication stops/);
-  assert.match(at(2, false).detail, /; epochs that select the drand recipe cannot publish until one does$/);
-  assert.equal(evaluateBeaconFresh(GROUP, group({ fresh: 0, downRuns: 9, relays: {} }), true).detail.includes("api.drand.sh: not checked"), true);
-  assert.equal(severity(evaluateBeaconFresh(GROUP, null, true)), "clear");
+  const at = (downRuns, usage) => evaluateBeaconFresh(GROUP, group({ fresh: 0, downRuns, relays }), usage);
+  const reasons = "api.drand.sh: timeout, api2.drand.sh: latest round 5 is 9 rounds (27s) behind the schedule, api3.drand.sh: timeout, drand.cloudflare.com: timeout";
+  for (const usage of [NO_USE, { only: ["arc-mainnet"], mixed: [] }, { only: [], mixed: ["arc-mainnet"] }]) {
+    assert.equal(severity(at(0, usage)), "clear");
+    assert.equal(severity(at(1, usage)), "clear");
+  }
+  // The beacon alone in a catalog in force: no fallback source, so the service is stopping.
+  const only = at(2, { only: ["arc-mainnet", "arc-testnet"], mixed: [] });
+  assert.deepEqual([only.severity, only.title], ["alarm", "drand beacon down, service stopping"]);
+  assert.equal(
+    only.detail,
+    `no relay serves a fresh round (${reasons}); the catalog in force on arc-mainnet and arc-testnet lists only the drand beacon, so epoch publication stops there and requests cannot be served until one does`,
+  );
+  // On one network only, it names that one; the beacon alone anywhere outranks the beacon among other sources elsewhere.
+  assert.match(at(2, { only: ["arc-testnet"], mixed: ["arc-mainnet"] }).detail, /the catalog in force on arc-testnet lists only/);
+  // Among other sources: the epochs that select it cannot publish.
+  const mixed = at(2, { only: [], mixed: ["arc-mainnet"] });
+  assert.deepEqual([mixed.severity, mixed.title], ["alarm", "drand beacon down"]);
+  assert.equal(mixed.detail, `no relay serves a fresh round (${reasons}); epochs on arc-mainnet that select the drand recipe cannot publish until one does`);
+  // No catalog in force lists it: nothing depends on it yet, so a warning.
+  const none = at(2, NO_USE);
+  assert.deepEqual([none.severity, none.title], ["warning", "drand beacon down"]);
+  assert.equal(none.detail, `no relay serves a fresh round (${reasons}); no catalog in force lists the drand beacon yet, so nothing depends on it`);
+  assert.equal(at(2, undefined).severity, "warning", "no usage given is none");
+  assert.equal(evaluateBeaconFresh(GROUP, group({ fresh: 0, downRuns: 9, relays: {} }), NO_USE).detail.includes("api.drand.sh: not checked"), true);
+  assert.equal(severity(evaluateBeaconFresh(GROUP, null, NO_USE)), "clear");
 });
 
 test("beacon disagreement and chain info: a verdict that stays until a conclusive check says otherwise", () => {
@@ -400,31 +432,44 @@ test("beacon disagreement and chain info: a verdict that stays until a conclusiv
   assert.equal(severity(evaluateBeaconAgreement(RELAY, state(undefined))), "clear");
   const differs = evaluateBeaconAgreement(RELAY, state({ verdict: "differs", verdictReason: "round 5: no majority" }));
   assert.deepEqual([differs.severity, differs.title, differs.detail], ["warning", "drand relay api.drand.sh disagrees with the other relays", "round 5: no majority"]);
+  // The only relay to return a signature that every registry rejects is named for it, not for disagreeing with anyone.
+  const rejected = evaluateBeaconAgreement(RELAY, state({ verdict: "rejected", verdictReason: "round 5: signature 1111111111...1111 is rejected by the arc-mainnet registry and no other relay returned it" }));
+  assert.deepEqual([rejected.severity, rejected.title], ["warning", "drand relay api.drand.sh serves a signature the registry rejects"]);
+  assert.match(rejected.detail, /is rejected by the arc-mainnet registry and no other relay returned it$/);
   assert.equal(severity(evaluateBeaconInfo(RELAY, state(undefined, { verdict: "ok" }))), "clear");
   const drift = evaluateBeaconInfo(RELAY, state(undefined, { verdict: "drift", verdictReason: "chain info differs from the drand-evmnet preset: period 5 (expected 3)" }));
   assert.deepEqual([drift.severity, drift.title], ["warning", "drand relay api.drand.sh chain info differs from the configured beacon"]);
   assert.equal(severity(evaluateBeaconInfo(RELAY, null)), "clear");
 });
 
-test("beacon registration: nothing before it is registered, a mismatch warns, losing it warns, an unread registry is unknown", () => {
+test("beacon registration: nothing before it is registered, a mismatch warns, a recipe that is no beacon warns, a lost registration warns, an unread registry is unknown", () => {
   const registered = { readOk: true, registration: "registered", everRegistered: true, verdict: "ok" };
   assert.equal(severity(evaluateBeaconRegistration(MAINNET_TARGET, null)), "unknown", "not read yet");
   assert.equal(severity(evaluateBeaconRegistration(MAINNET_TARGET, registered)), "clear");
   const mismatch = evaluateBeaconRegistration(MAINNET_TARGET, { ...registered, verdict: "mismatch", verdictReason: "beaconOf(11) differs: period 9 (expected 3)" });
   assert.deepEqual([mismatch.severity, mismatch.title, mismatch.detail], ["warning", "arc-mainnet registry beacon registration mismatch", "beaconOf(11) differs: period 9 (expected 3)"]);
 
-  // Before the upgrade and the registration: skipped without a word, however it answers.
-  for (const registrationReason of ["beaconOf reverted", "zero verifier"]) {
-    const early = { readOk: true, registration: "unregistered", registrationReason, everRegistered: false };
-    assert.equal(severity(evaluateBeaconRegistration(MAINNET_TARGET, early)), "clear", registrationReason);
-    const lost = evaluateBeaconRegistration(MAINNET_TARGET, { ...early, everRegistered: true });
-    assert.deepEqual([lost.severity, lost.title, lost.detail], ["warning", "arc-mainnet registry beacon no longer registered", `${registrationReason}; the beacon was registered before`]);
+  // Before the upgrade and the registration: skipped without a word, whatever the reason.
+  const early = { readOk: true, registration: "unregistered", registrationReason: "beaconOf reverted", everRegistered: false };
+  assert.equal(severity(evaluateBeaconRegistration(MAINNET_TARGET, early)), "clear");
+  const lost = evaluateBeaconRegistration(MAINNET_TARGET, { ...early, everRegistered: true });
+  assert.deepEqual([lost.severity, lost.title, lost.detail], ["warning", "arc-mainnet registry beacon no longer registered", "beaconOf reverted; the beacon was registered before"]);
+
+  // A recipe that exists but is no beacon (a zero verifier) is a distinct warning, with or without a registration before: the
+  // configured id is what to check.
+  for (const everRegistered of [false, true]) {
+    const notBeacon = evaluateBeaconRegistration(MAINNET_TARGET, { readOk: true, registration: "notbeacon", registrationReason: "zero verifier", everRegistered, recipe: 11 });
+    assert.deepEqual(
+      [notBeacon.severity, notBeacon.title, notBeacon.detail],
+      ["warning", "arc-mainnet registry beacon recipe misconfigured", "recipe 11 exists but is not a beacon; check the configured id"],
+    );
   }
+  assert.match(evaluateBeaconRegistration(MAINNET_TARGET, { readOk: true, registration: "notbeacon" }).detail, /^recipe 11 exists/, "the configured recipe when the state holds none");
   assert.equal(severity(evaluateBeaconRegistration(MAINNET_TARGET, { ...registered, readOk: false })), "unknown");
   assert.equal(severity(evaluateBeaconRegistration(MAINNET_TARGET, { readOk: false })), "unknown", "never read");
 });
 
-test("beacon verification: an alarm once the registry has rejected the round in 2 runs in a row", () => {
+test("beacon verification: an alarm once the registry has rejected the round in 2 runs in a row, with the recipe monitored", () => {
   assert.equal(THRESHOLDS.beaconVerifyAlarmRuns, 2);
   const state = (failures, extra = {}) => ({ readOk: true, registration: "registered", verify: { failures, rejectedRound: 42, rejectedReason: "verifyBeacon returned false" }, ...extra });
   assert.equal(severity(evaluateBeaconVerify(MAINNET_TARGET, state(0))), "clear");
@@ -432,30 +477,83 @@ test("beacon verification: an alarm once the registry has rejected the round in 
   const alarmed = evaluateBeaconVerify(MAINNET_TARGET, state(2));
   assert.deepEqual([alarmed.severity, alarmed.title], ["alarm", "arc-mainnet registry rejects drand rounds"]);
   assert.equal(alarmed.detail, "verifyBeacon(11) rejected round 42 in 2 consecutive runs (verifyBeacon returned false): the registry cannot verify a real round");
+  assert.match(evaluateBeaconVerify(MAINNET_TARGET, state(2, { recipe: 12 })).detail, /^verifyBeacon\(12\) rejected round 42/, "the recipe monitored, when it is not the configured one");
   assert.equal(severity(evaluateBeaconVerify(MAINNET_TARGET, state(5, { registration: "unregistered" }))), "clear", "nothing to verify against");
   assert.equal(severity(evaluateBeaconVerify(MAINNET_TARGET, state(5, { readOk: false }))), "unknown");
   assert.equal(severity(evaluateBeaconVerify(MAINNET_TARGET, null)), "unknown");
 });
 
+test("beacon verifier: an alarm at once when the registered verifier accepted a signature with its last byte flipped", () => {
+  const state = (verdict, extra = {}) => ({ readOk: true, registration: "registered", verifier: "0x" + "ab".repeat(20), negative: { verdict, round: 42 }, ...extra });
+  assert.equal(severity(evaluateBeaconVerifier(MAINNET_TARGET, state("ok"))), "clear");
+  assert.equal(severity(evaluateBeaconVerifier(MAINNET_TARGET, state(undefined, { negative: undefined }))), "clear", "never checked");
+  const accepts = evaluateBeaconVerifier(MAINNET_TARGET, state("accepts"));
+  assert.deepEqual([accepts.severity, accepts.title], ["alarm", "arc-mainnet registered verifier accepts an invalid signature"]);
+  assert.equal(
+    accepts.detail,
+    `verifyBeacon(11) returned true for round 42 with the last byte of its signature flipped: verifier 0x${"ab".repeat(20)} would accept a forged round`,
+  );
+  assert.match(evaluateBeaconVerifier(MAINNET_TARGET, state("accepts", { recipe: 12 })).detail, /^verifyBeacon\(12\) returned true/);
+  assert.equal(severity(evaluateBeaconVerifier(MAINNET_TARGET, state("accepts", { registration: "unregistered" }))), "clear", "nothing registered");
+  assert.equal(severity(evaluateBeaconVerifier(MAINNET_TARGET, state("accepts", { readOk: false }))), "unknown", "an alarm is kept, not resolved, by a run that read nothing");
+  assert.equal(severity(evaluateBeaconVerifier(MAINNET_TARGET, null)), "unknown");
+});
+
+test("beacon monitor: a warning while any part of the last run failed on an error of the watchdog's own", () => {
+  const states = (entries) => new Map(Object.entries(entries));
+  const failed = { monitor: { at: NOW, reason: "internal error" } };
+  assert.equal(severity(evaluateBeaconMonitor([GROUP], new Map())), "clear", "nothing has run yet");
+  assert.equal(severity(evaluateBeaconMonitor([GROUP], states({ "group:drand-evmnet": { monitor: null }, "network:arc-mainnet": { monitor: null } }))), "clear");
+  const relays = evaluateBeaconMonitor([GROUP], states({ "group:drand-evmnet": failed }));
+  assert.deepEqual([relays.severity, relays.title], ["warning", "drand monitor failed internally"]);
+  assert.equal(
+    relays.detail,
+    "the drand-evmnet relay reads failed on an error in the watchdog itself, not in a relay or a registry; what it could not check is unknown until it runs again",
+  );
+  assert.match(evaluateBeaconMonitor([GROUP], states({ "network:arc-testnet": failed })).detail, /^the arc-testnet registry read failed on an error/);
+  assert.match(
+    evaluateBeaconMonitor([GROUP], states({ "group:drand-evmnet": failed, "network:arc-mainnet": failed, "network:arc-testnet": failed })).detail,
+    /^the drand-evmnet relay reads, the arc-mainnet registry read and the arc-testnet registry read failed on an error/,
+  );
+  // The condition of a run whose results could not be recorded says so in its own words.
+  assert.equal(beaconMonitorFailure("x").detail, "x; what it could not check is unknown until it runs again");
+});
+
 test("beacon checks: every relay and network has its own, and the relays' warnings are unknown while none is fresh", () => {
   const relayStates = Object.fromEntries(GROUP.relays.map((r) => [r.id, { badRuns: 9, reason: "http 503" }]));
-  const states = (fresh) => new Map([["group:drand-evmnet", group({ fresh, downRuns: fresh === 0 ? 4 : 0, relays: relayStates })]]);
-  const conditions = evaluateBeaconChecks([GROUP], states(0), { drandOnly: true });
+  const states = (fresh, networks = {}) =>
+    new Map([["group:drand-evmnet", group({ fresh, downRuns: fresh === 0 ? 4 : 0, relays: relayStates })], ...Object.entries(networks)]);
+  const conditions = evaluateBeaconChecks([GROUP], states(0));
   assert.deepEqual([...conditions.keys()], [
     "fresh:drand-evmnet",
     ...GROUP.relays.flatMap((r) => [`relay:drand-evmnet:${r.id}`, `agree:drand-evmnet:${r.id}`, `info:drand-evmnet:${r.id}`]),
     "registration:arc-mainnet",
     "verify:arc-mainnet",
+    "verifier:arc-mainnet",
     "registration:arc-testnet",
     "verify:arc-testnet",
+    "verifier:arc-testnet",
+    "monitor",
   ]);
-  assert.equal(conditions.get("fresh:drand-evmnet").severity, "alarm");
-  assert.ok(GROUP.relays.every((r) => conditions.get(`relay:drand-evmnet:${r.id}`) === undefined), "covered by the alarm");
+  // No catalog read, and no beacon registered: nothing depends on it, so the outage is a warning.
+  assert.equal(conditions.get("fresh:drand-evmnet").severity, "warning");
+  assert.ok(GROUP.relays.every((r) => conditions.get(`relay:drand-evmnet:${r.id}`) === undefined), "covered by the alert above");
   assert.equal(conditions.get("registration:arc-mainnet"), undefined, "no network state yet");
+  assert.equal(conditions.get("verifier:arc-mainnet"), undefined);
+  assert.equal(conditions.get("monitor"), null);
 
-  const one = evaluateBeaconChecks([GROUP], states(1), { drandOnly: true });
+  // The catalog in force decides the level, network by network.
+  const only = evaluateBeaconChecks([GROUP], states(0, { "network:arc-testnet": { readOk: true, registration: "unregistered", catalog: { use: "only" } } }));
+  assert.deepEqual([only.get("fresh:drand-evmnet").severity, only.get("fresh:drand-evmnet").title], ["alarm", "drand beacon down, service stopping"]);
+  assert.match(only.get("fresh:drand-evmnet").detail, /the catalog in force on arc-testnet lists only/);
+
+  const one = evaluateBeaconChecks([GROUP], states(1));
   assert.equal(one.get("fresh:drand-evmnet"), null);
   assert.ok(GROUP.relays.every((r) => one.get(`relay:drand-evmnet:${r.id}`).severity === "warning"));
+  // The monitor's own failure is one check for the whole monitor, and is not there without a beacon to watch.
+  const failing = evaluateBeaconChecks([GROUP], states(1, { "network:arc-mainnet": { monitor: { at: NOW, reason: "internal error" } } }));
+  assert.equal(failing.get("monitor").severity, "warning");
+  assert.equal(evaluateBeaconChecks([], new Map()).size, 0);
   // Nothing stored yet: nothing to raise.
-  assert.ok([...evaluateBeaconChecks([GROUP], new Map(), {}).values()].every((c) => c === null || c === undefined));
+  assert.ok([...evaluateBeaconChecks([GROUP], new Map()).values()].every((c) => c === null || c === undefined));
 });

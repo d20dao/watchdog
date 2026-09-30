@@ -19,16 +19,18 @@ import {
   toQuantity,
 } from "./abi.js";
 import { IMPLEMENTATION_SLOT, LIMITS, SELECTORS, TOPICS, watchedAgentApi } from "./config.js";
-import { FetchTimeoutError, fetchText } from "./net.js";
+import { FetchTimeoutError, ResponseTooLargeError, fetchText } from "./net.js";
 
 // An eth_call that reverted: code 3 on geth and reth, or another code with a message that says so.
 const isRevert = (error) => error?.code === 3 || (typeof error?.message === "string" && /revert/i.test(error.message));
 
 export class RpcSession {
-  constructor(urls, { fetch, timeoutMs = LIMITS.rpcTimeoutMs }) {
+  /** `maxBytes` bounds one endpoint's reply: a longer one fails that endpoint. The chain reader sets none. */
+  constructor(urls, { fetch, timeoutMs = LIMITS.rpcTimeoutMs, maxBytes }) {
     this.urls = urls;
     this.fetch = fetch;
     this.timeoutMs = timeoutMs;
+    this.maxBytes = maxBytes;
     this.index = 0;
     this.subrequests = 0;
     this.lastError = null;
@@ -79,9 +81,10 @@ export class RpcSession {
           body: payload,
         },
         this.timeoutMs,
+        this.maxBytes === undefined ? {} : { maxBytes: this.maxBytes },
       );
     } catch (err) {
-      return { error: err instanceof FetchTimeoutError ? "timeout" : "network error" };
+      return { error: err instanceof FetchTimeoutError ? "timeout" : err instanceof ResponseTooLargeError ? "reply too large" : "network error" };
     }
     if (!response.ok) return { error: `http ${response.status}` };
     let parsed;

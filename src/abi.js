@@ -109,8 +109,27 @@ export function decodeBool(hex) {
   return wordToBool(words[0]);
 }
 
+/** Decode a single uint64 return value that fits a safe integer (e.g. epochForBlock). */
+export function decodeUint64(hex) {
+  const words = toWords(hex);
+  if (words.length !== 1) throw new AbiError("expected one word");
+  return wordToSmallNumber(words[0], 64);
+}
+
 // ---------------------------------------------------------------------------------------------
 // EpochEntropy beacon functions
+
+/** epochForBlock(uint256 blockNumber) -> uint64 epochId */
+export function encodeEpochForBlock(block) {
+  return encodeCall(SELECTORS.epochForBlock, block);
+}
+
+/** catalogAt(uint64 epochId) -> (bytes32 hash, uint8[] recipes, address[] signers) */
+export function encodeCatalogAt(epochId) {
+  const id = BigInt(epochId);
+  if (id < 0n || id >= 1n << 64n) throw new AbiError("epoch is not a uint64");
+  return encodeCall(SELECTORS.catalogAt, id);
+}
 
 function encodeRecipe(recipe) {
   const id = BigInt(recipe);
@@ -167,13 +186,34 @@ export function decodeBeaconOf(hex, maxKeyBytes = 256) {
   if (end > w.length) throw new AbiError("key exceeds data");
   const body = w.slice(at + 1, end).join("");
   if (/[^0]/.test(body.slice(size * 2))) throw new AbiError("key padding is not zero");
+  // Hex as the node wrote it may be upper case: everything is returned lowercase, like the address.
   return {
     verifier: wordToAddress(w[start]),
     genesis: wordToSmallNumber(w[start + 1], 64),
     period: wordToSmallNumber(w[start + 2], 64),
-    chainHash: "0x" + w[start + 3],
-    publicKey: "0x" + body.slice(0, size * 2),
+    chainHash: "0x" + w[start + 3].toLowerCase(),
+    publicKey: "0x" + body.slice(0, size * 2).toLowerCase(),
   };
+}
+
+/**
+ * catalogAt(uint64) -> (bytes32 hash, uint8[] recipes, address[] signers): the sources an epoch selects from, one slot per
+ * entry. The head is the hash and the offsets of the two arrays; each array is its length and one word per entry.
+ */
+export function decodeCatalogAt(hex, maxSlots = 64) {
+  const w = toWords(hex);
+  if (w.length < 5) throw new AbiError("catalog data too short");
+  const array = (offsetWord, what) => {
+    const at = offsetToIndex(offsetWord, 0, w.length, `${what} offset`);
+    const length = wordToBigInt(w[at]);
+    if (length > BigInt(maxSlots)) throw new AbiError(`${what} too long`);
+    const size = Number(length);
+    if (at + 1 + size > w.length) throw new AbiError(`${what} exceed data`);
+    return w.slice(at + 1, at + 1 + size);
+  };
+  const recipes = array(w[1], "recipes").map((word) => wordToSmallNumber(word, 8));
+  const signers = array(w[2], "signers").map(wordToAddress);
+  return { hash: "0x" + w[0].toLowerCase(), recipes, signers };
 }
 
 /** getPendingRequestIds(uint256,uint256) -> (uint256[] ids, uint256 nextCursor) */

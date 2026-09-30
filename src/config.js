@@ -14,10 +14,12 @@ export const SELECTORS = Object.freeze({
   getPendingRequestIds: "0xfdfe72e6",
   getRequest: "0xc58343ef",
   committer: "0x5bc8e8f9",
-  // EpochEntropy beacon functions, present once the registry is upgraded for the drand beacon.
+  // EpochEntropy views the drand beacon monitor reads. The beacon ones exist once the registry is upgraded for it.
   beaconOf: "0x87533a48", // beaconOf(uint8)
   slotSigner: "0xb42be3c1", // slotSigner(uint8)
   verifyBeacon: "0x0ccd9ab2", // verifyBeacon(uint8,uint64,bytes)
+  epochForBlock: "0x7018ebb1", // epochForBlock(uint256) -> uint64
+  catalogAt: "0xec993599", // catalogAt(uint64) -> (bytes32 hash, uint8[] recipes, address[] signers)
 });
 
 export const TOPICS = Object.freeze({
@@ -87,10 +89,12 @@ export const NETWORKS = Object.freeze({
       url: "https://api.d20dao.org",
       relayer: "0x8B465645ed88F6d487d279003aD3681e7aF8e8B7",
     }),
-    // drand beacon the registry lists as `recipe`: its relays are read every run, its registration on chain every run.
+    // drand beacon the registry lists as `recipe` (the recipe monitored follows the catalog in force if the beacon is
+    // registered under another id): its relays are read every run, its registration on chain every run.
     // `verifier` is the beacon verifier contract the registry calls. It is unknown until that contract is deployed, so
     // it stays null and only the rest of beaconOf() is pinned; slotSigner() is then derived from the verifier the
-    // registry reports. Set the address after the deployment to pin it as well.
+    // registry reports, so it proves nothing about the verifier, and only the check that a signature with its last byte
+    // flipped is rejected covers it. Set the address after the deployment, BEFORE the switch, to pin it as well.
     beacon: Object.freeze({ recipe: 11, preset: DRAND_EVMNET, relays: DRAND_RELAYS, verifier: null }),
   }),
   "arc-testnet": Object.freeze({
@@ -119,7 +123,7 @@ export const NETWORKS = Object.freeze({
       url: "https://api-testnet.d20dao.org",
       relayer: "0xF6b446dC2F30e6A802DFB7bD4c222d84F6cd05C3",
     }),
-    // As on arc-mainnet: the verifier address is set after the verifier contract is deployed.
+    // As on arc-mainnet: the verifier address is set after the verifier contract is deployed, before the switch.
     beacon: Object.freeze({ recipe: 11, preset: DRAND_EVMNET, relays: DRAND_RELAYS, verifier: null }),
   }),
 });
@@ -179,8 +183,12 @@ export const THRESHOLDS = Object.freeze({
   beaconRelayWarnRuns: 3,
   // Consecutive runs in which no relay is fresh before the alarm: the registry cannot publish without a round.
   beaconDownAlarmRuns: 2,
-  // Consecutive runs in which the registry rejected the round it was asked to verify before the alarm.
+  // Consecutive runs in which the registry rejected the round it was asked to verify before the alarm. Only a rejection
+  // of a signature that at least two relays returned, or that another network's registry accepted, counts.
   beaconVerifyAlarmRuns: 2,
+  // Consecutive runs in which beaconOf must revert, after the beacon was seen registered, before "no longer registered"
+  // warns: one read from an RPC node that is behind, or a rollback that is quickly undone, is not a lost registration.
+  beaconUnregisteredRuns: 2,
 });
 
 export const LIMITS = Object.freeze({
@@ -222,7 +230,14 @@ export const LIMITS = Object.freeze({
   beaconTimeoutMs: 5000,
   beaconMaxResponseBytes: 4 * 1024, // a round record is about 230 bytes and a chain info about 600
   beaconConcurrency: 4, // relay fetches in flight at once, a bound of its own next to the chain readers and probes
+  // A registry batch holds beaconOf for the monitored recipe and the catalog's, slotSigner, verifyBeacon for each distinct
+  // signature of the compared round and for one with its last byte flipped, epochForBlock and two catalogAt: 18 calls at
+  // the most, and about 10 KB of answers with the catalog's four slots.
+  beaconMaxSignatures: 4, // distinct signatures of the compared round that go to verifyBeacon
+  beaconMaxRecipes: 8, // recipe ids one batch asks beaconOf about
+  beaconRpcMaxResponseBytes: 32 * 1024,
   beaconInfoIntervalSeconds: 24 * 3600,
+  // A /info read that failed or differed from the preset is repeated after this long, not a day later.
   beaconInfoRetrySeconds: 3600,
   beaconInfoMaxPerRun: 1,
   // Agent API /health reads the relayer's Durable Object and the chain before it answers.

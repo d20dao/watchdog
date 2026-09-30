@@ -336,3 +336,27 @@ test("a call that reverted is marked as such; other errors are not, and say noth
     { result: "0x1" },
   ]);
 });
+
+test("a session with a bound refuses a longer reply as 'reply too large' and tries the next endpoint; without one nothing is bounded", async () => {
+  const seen = [];
+  const fetch = async (url) => {
+    seen.push(url);
+    if (seen.length === 1) return new Response(JSON.stringify([{ jsonrpc: "2.0", id: 1, result: "0x" + "ab".repeat(100) }]));
+    return Response.json([{ jsonrpc: "2.0", id: 1, result: "0x1" }]);
+  };
+  const session = new RpcSession(["https://a.example", "https://b.example"], { fetch, maxBytes: 64 });
+  assert.deepEqual(await session.batch([["eth_chainId", []]]), [{ result: "0x1" }]);
+  assert.deepEqual([seen, session.subrequests], [["https://a.example", "https://b.example"], 2]);
+
+  // A longer reply fails the endpoint whether its length is declared or found out while reading it.
+  const declared = () => new Response("x", { headers: { "content-length": "5000" } });
+  for (const answer of [() => new Response("x".repeat(200)), declared]) {
+    const only = new RpcSession(["https://a.example"], { fetch: async () => answer(), maxBytes: 64 });
+    assert.equal(await only.batch([["eth_chainId", []]]), null);
+    assert.equal(only.lastError, "reply too large");
+  }
+  // The chain reader sets no bound: a long reply (a thousand logs) is read whole.
+  const unbounded = new RpcSession(["https://a.example"], { fetch: async () => Response.json([{ jsonrpc: "2.0", id: 1, result: "0x" + "ab".repeat(100000) }]) });
+  assert.equal((await unbounded.batch([["eth_chainId", []]]))[0].result.length, 200002);
+  assert.equal(unbounded.maxBytes, undefined);
+});

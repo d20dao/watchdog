@@ -4,11 +4,13 @@
 import { storedCalls } from "./agentapi.js";
 import { beaconGroups, groupStateKey, networkStateKey } from "./beacon.js";
 import {
+  beaconUsage,
   evaluateBeaconAgreement,
   evaluateBeaconFresh,
   evaluateBeaconInfo,
   evaluateBeaconRegistration,
   evaluateBeaconRelay,
+  evaluateBeaconVerifier,
   evaluateBeaconVerify,
   evaluateListingDocumentCheck,
   evaluateProbeCheck,
@@ -174,25 +176,29 @@ function registrationState(n) {
   if (!n) return "not checked";
   if (!n.registration) return "unknown";
   if (n.registration === "registered") return n.verdict === "mismatch" ? "mismatch" : "registered";
+  if (n.registration === "notbeacon") return "not a beacon";
   return n.everRegistered ? "no longer registered" : "not registered yet";
 }
 
 /**
  * The drand beacon of the configured networks: each relay's last check and each network's registration, or null when no
- * network lists a beacon. Reasons are short texts built by the monitor, never reply bodies. `drandOnly`: no AirnodeHub
- * recipe is configured, so the catalog holds the drand beacon alone.
+ * network lists a beacon. Reasons are short texts built by the monitor, never reply bodies. `catalogDrandOnly`: the catalog
+ * in force on some network lists the beacon alone (read from the chain, see beaconUsage).
  */
-function beaconStatus(storage, now, nets, drandOnly) {
+function beaconStatus(storage, now, nets) {
   const groups = beaconGroups(nets);
   if (groups.length === 0) return null;
   const states = readBeaconStates(storage);
   const chains = [];
   const relays = [];
   const networks = {};
+  let drandOnly = false;
   for (const group of groups) {
     const { preset } = group;
     const g = states.get(groupStateKey(preset)) ?? null;
-    const down = evaluateBeaconFresh(group, g, drandOnly);
+    const usage = beaconUsage(group, states);
+    if (usage.only.length > 0) drandOnly = true;
+    const down = evaluateBeaconFresh(group, g, usage);
     chains.push({
       preset: preset.id,
       name: preset.name,
@@ -200,7 +206,7 @@ function beaconStatus(storage, now, nets, drandOnly) {
       chainHash: preset.chainHash,
       periodSeconds: preset.period,
       genesis: preset.genesis,
-      status: !g ? "not checked" : down ? "alarm" : g.fresh === 0 ? "warning" : "ok",
+      status: !g ? "not checked" : down ? down.severity : g.fresh == null ? "unknown" : g.fresh === 0 ? "warning" : "ok",
       checkedAt: g?.checkedAt ?? null,
       checkedAgeSeconds: age(now, g?.checkedAt),
       freshRelays: g?.fresh ?? null,
@@ -219,7 +225,7 @@ function beaconStatus(storage, now, nets, drandOnly) {
         preset: preset.id,
         id: relay.id,
         url: relay.url,
-        status: !s ? "not checked" : evaluateBeaconRelay(relay, s) || agreement || info ? "warning" : "ok",
+        status: !s ? "not checked" : s.outcome === "unknown" ? "unknown" : evaluateBeaconRelay(relay, s) || agreement || info ? "warning" : "ok",
         lastOutcome: s?.outcome ?? null,
         reason: s?.reason ?? null,
         latestRound: s?.round ?? null,
@@ -231,10 +237,13 @@ function beaconStatus(storage, now, nets, drandOnly) {
         consecutiveNotFresh: s?.badRuns ?? 0,
         lastOkAt: s?.lastOkAt ?? null,
         lastOkAgeSeconds: age(now, s?.lastOkAt),
-        // Signature at the common round against the other relays'; null until the relay was compared.
+        // Signature at the common round against the other relays' and the registries'; null until the relay was compared.
+        // `verdict` is the latest conclusive one: "ok", "differs" (from the others, or from the one a registry accepts) or
+        // "rejected" (the only relay to return it, and every registry rejects it).
         agreement: s?.agreement
           ? {
               status: agreement ? "warning" : s.agreement.verdict === "ok" ? "ok" : "unknown",
+              verdict: s.agreement.verdict ?? null,
               round: s.agreement.round,
               checkedAt: s.agreement.checkedAt,
               checkedAgeSeconds: age(now, s.agreement.checkedAt),
@@ -258,10 +267,15 @@ function beaconStatus(storage, now, nets, drandOnly) {
     for (const target of group.networks) {
       const n = states.get(networkStateKey(target.name)) ?? null;
       const rejected = evaluateBeaconVerify(target, n);
+      const forged = evaluateBeaconVerifier(target, n);
       const v = n?.verify ?? null;
+      const c = n?.catalog ?? null;
+      const neg = n?.negative ?? null;
       networks[target.name] = {
         preset: preset.id,
-        recipe: target.beacon.recipe,
+        // The recipe monitored: the configured one unless the catalog in force lists the beacon under another id.
+        recipe: n?.recipe ?? target.beacon.recipe,
+        configuredRecipe: target.beacon.recipe,
         registry: target.net.registry,
         registration: registrationState(n),
         reason: n?.readOk === false ? `not read: ${n.readReason}` : n?.registration === "registered" ? n.verdictReason ?? null : n?.registrationReason ?? null,
@@ -270,15 +284,37 @@ function beaconStatus(storage, now, nets, drandOnly) {
         slotSigner: n?.slotSigner ?? null,
         checkedAt: n?.checkedAt ?? null,
         checkedAgeSeconds: age(now, n?.checkedAt),
+        // The catalog of the head's epoch (see src/beacon.js): `use` is "only" (the beacon alone), "mixed" (among other
+        // sources) or "none"; null until it has been read.
+        catalog: c
+          ? {
+              use: c.use ?? null,
+              epochId: c.epochId ?? null,
+              recipes: c.recipes ?? [],
+              checkedAt: c.checkedAt,
+              checkedAgeSeconds: age(now, c.checkedAt),
+            }
+          : null,
         verification: v
           ? {
               status: rejected ? "alarm" : v.outcome === "ok" ? "ok" : "not verified",
               lastOutcome: v.outcome,
               round: v.round ?? null,
+              rejectedRound: v.rejectedRound ?? null,
               reason: v.reason ?? null,
               consecutiveRejections: v.failures ?? 0,
               lastOkAt: v.lastOkAt ?? null,
               lastOkAgeSeconds: age(now, v.lastOkAt),
+            }
+          : null,
+        // A signature with its last byte flipped must be rejected by the registered verifier.
+        invalidSignatureCheck: neg
+          ? {
+              status: forged ? "alarm" : neg.verdict === "ok" ? "ok" : "not verified",
+              lastOutcome: neg.outcome,
+              round: neg.round ?? null,
+              checkedAt: neg.checkedAt,
+              checkedAgeSeconds: age(now, neg.checkedAt),
             }
           : null,
       };
@@ -352,7 +388,7 @@ export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets =
       alerts: alerts.filter((a) => !isAgentApiCheck(a.check)),
     };
   }
-  const beacon = beaconStatus(storage, now, nets, recipes.length === 0);
+  const beacon = beaconStatus(storage, now, nets);
   return {
     service: "d20dao-watchdog",
     generatedAt: now,
@@ -610,9 +646,13 @@ const REGISTRATION_VIEW = {
   "not registered yet": ["Not registered yet", "muted"],
   mismatch: ["MISMATCH", "warning"],
   "no longer registered": ["No longer registered", "warning"],
+  "not a beacon": ["Not a beacon", "warning"],
   unknown: ["Unknown", "muted"],
   "not checked": ["—", "muted"],
 };
+
+// The catalog in force as the registry's caption words it.
+const CATALOG_VIEW = { only: "catalog: drand only", mixed: "catalog: drand and others", none: "catalog: no drand" };
 
 const plural = (n, one) => `${n} ${n === 1 ? one : `${one}s`}`;
 
@@ -621,7 +661,11 @@ function beaconRelayRow(r) {
   const status = checked ? state(r.status, label(r.status)) : `<span class="muted">not checked yet</span>`;
   const lag = r.lagRounds == null ? "—" : `${plural(r.lagRounds, "round")} (${r.lagSeconds}s)`;
   const agreement =
-    r.agreement?.status === "ok" ? "agree" : r.agreement?.status === "warning" ? `<span class="warning">differs</span>` : "—";
+    r.agreement?.status === "ok"
+      ? "agree"
+      : r.agreement?.status === "warning"
+        ? `<span class="warning">${r.agreement.verdict === "rejected" ? "rejected" : "differs"}</span>`
+        : "—";
   const chainInfo =
     r.chainInfo?.status === "ok" ? "info ok" : r.chainInfo?.status === "warning" ? `<span class="warning">info differs</span>` : "info —";
   const notes = [];
@@ -641,27 +685,26 @@ function beaconRelayRow(r) {
 function beaconSection(beacon) {
   const tones = { ok: "ok", warning: "warning", alarm: "alarm" };
   const stats = beacon.chains.map((c) => {
-    const figure = c.status === "not checked" ? "—" : `${c.freshRelays} of ${c.totalRelays}`;
-    const caption =
-      c.status === "not checked" ? "not checked yet" : c.latestRound == null ? "no fresh round" : `latest round #${c.latestRound}`;
-    return stat(beacon.chains.length > 1 ? `Relays · ${c.name}` : "Relays fresh", figure, caption, pick(tones, c.status) ?? "muted");
+    const known = c.status !== "not checked" && c.freshRelays != null;
+    const caption = !known
+      ? c.status === "unknown" ? "not known: the monitor failed" : "not checked yet"
+      : c.latestRound == null ? "no fresh round" : `latest round #${c.latestRound}`;
+    return stat(beacon.chains.length > 1 ? `Relays · ${c.name}` : "Relays fresh", known ? `${c.freshRelays} of ${c.totalRelays}` : "—", caption, pick(tones, c.status) ?? "muted");
   });
   for (const [name, n] of Object.entries(beacon.networks)) {
     const [text, tone] = pick(REGISTRATION_VIEW, n.registration) ?? [String(n.registration), "muted"];
     const v = n.verification;
+    const forged = n.invalidSignatureCheck?.status === "alarm";
     const checked = [
       `recipe ${n.recipe}`,
-      v?.status === "ok" ? `round #${v.round} verified` : v?.status === "alarm" ? `round #${v.round} rejected` : null,
+      // The catalog in force says how serious a drand outage is there: the beacon alone is a service-stopping one.
+      pick(CATALOG_VIEW, n.catalog?.use),
+      v?.status === "ok" ? `round #${v.round} verified` : v?.status === "alarm" ? `round #${v.rejectedRound} rejected` : null,
+      forged ? "verifier accepts an invalid signature" : null,
       n.checkedAgeSeconds == null ? null : `checked ${ago(n.checkedAgeSeconds)}`,
     ];
-    stats.push(stat(`Registry · ${name}`, text, checked.filter(Boolean).join(" · "), v?.status === "alarm" ? "alarm" : tone));
+    stats.push(stat(`Registry · ${name}`, text, checked.filter(Boolean).join(" · "), v?.status === "alarm" || forged ? "alarm" : tone));
   }
-  // Whether an outage is a service-stopping one: the catalog lists the beacon alone once the AirnodeHub probes are retired.
-  stats.push(
-    beacon.catalogDrandOnly
-      ? stat("Catalog", "drand only", "no fallback source", "muted")
-      : stat("Catalog", "AirnodeHub + drand", "AirnodeHub still probed", "muted"),
-  );
   const first = beacon.chains[0];
   const caption = `Read every minute · fresh means within ${plural(beacon.maxLagRounds, "round")} (${beacon.maxLagRounds * first.periodSeconds}s) of the schedule`;
   return (

@@ -16,6 +16,8 @@ import {
   runBeacon,
 } from "./beacon.js";
 import {
+  BEACON_MONITOR_CHECK,
+  beaconMonitorFailure,
   evaluateAgentApiChecks,
   evaluateBackupReportChecks,
   evaluateBeaconChecks,
@@ -70,11 +72,26 @@ async function runProbes(tasks, { fetch, clock, loadProbes }) {
   }
 }
 
-/** Run the beacon plan. The run never throws, and a monitor that failed as a whole counts every relay as failed. */
-async function runBeaconChecks(plan, { fetch, clock, runBeaconImpl }) {
+/**
+ * The beacon's plan. A configuration or stored state it cannot plan from leaves the run without the beacon (`failed`), never
+ * without the rest of the run.
+ */
+function planBeaconChecks(nets, storage, nowSec) {
+  try {
+    return planBeacon(nets, readBeaconStates(storage), nowSec);
+  } catch {
+    return { groups: [], failed: true };
+  }
+}
+
+/**
+ * Run the beacon plan. The run never throws, and a monitor that failed as a whole leaves every relay unknown, not down.
+ * `headOf(name)` is a network's head block from this run's chain read.
+ */
+async function runBeaconChecks(plan, { fetch, clock, runBeaconImpl, headOf }) {
   if (plan.groups.length === 0) return { subrequests: 0, groups: [] };
   try {
-    return await runBeaconImpl(plan, { fetch, clock });
+    return await runBeaconImpl(plan, { fetch, clock, headOf });
   } catch {
     return failedBeaconRun(plan, "internal error");
   }
@@ -98,18 +115,24 @@ export async function runCron({
     return prev ? { logCursor: prev.logCursor, logSpan: prev.logSpan } : null;
   });
   const tasks = planProbeTasks(recipes, readProbeStates(storage), Math.floor(clock() / 1000));
-  const beaconPlan = planBeacon(nets, readBeaconStates(storage), Math.floor(clock() / 1000));
+  const beaconPlan = planBeaconChecks(nets, storage, Math.floor(clock() / 1000));
+
+  // Every chain read starts at once. The beacon's registry batch needs its network's head block and waits for that read only
+  // when the beacon's relay steps have finished before it.
+  const chainReads = names.map(async (name, i) => {
+    try {
+      return await readChainImpl(nets[name], cursors[i], { fetch });
+    } catch {
+      return { ok: false, complete: false, error: "internal error", errors: [], subrequests: 0 };
+    }
+  });
+  const headOf = async (name) => {
+    const read = await chainReads[names.indexOf(name)];
+    return read?.ok && read.block ? read.block.number : null;
+  };
 
   const [reads, polls, probeResults, beaconRun] = await Promise.all([
-    Promise.all(
-      names.map(async (name, i) => {
-        try {
-          return await readChainImpl(nets[name], cursors[i], { fetch });
-        } catch {
-          return { ok: false, complete: false, error: "internal error", errors: [], subrequests: 0 };
-        }
-      }),
-    ),
+    Promise.all(chainReads),
     // One /health GET per watched agent API; null for a network whose agent API is not watched.
     Promise.all(
       names.map(async (name) => {
@@ -123,7 +146,7 @@ export async function runCron({
     ),
     runProbes(tasks, { fetch, clock, loadProbes }),
     // The drand relays and each network's registry: shared work, read once however many networks list the beacon.
-    runBeaconChecks(beaconPlan, { fetch, clock, runBeaconImpl }),
+    runBeaconChecks(beaconPlan, { fetch, clock, runBeaconImpl, headOf }),
   ]);
 
   // Reports may have arrived while the reads were in flight; everything below re-reads current state.
@@ -194,8 +217,7 @@ export async function runCron({
     });
     const airnodehub = commitProbes(storage, recipes, tasks, probeResults, now, deliverable);
     enqueued += airnodehub.messages.length;
-    // With no AirnodeHub recipe configured the catalog is drand alone: a drand outage stops the service.
-    const beacon = commitBeacon(storage, beaconPlan, beaconRun, now, deliverable, recipes.length === 0);
+    const beacon = commitBeacon(storage, beaconPlan, beaconRun, now, deliverable);
     enqueued += beacon.messages.length;
     pruneReports(storage, now - LIMITS.reportRetentionSeconds);
     expireMessages(storage, now);
@@ -295,10 +317,10 @@ function commitProbes(storage, recipes, tasks, results, now, deliverable) {
 }
 
 /**
- * Store the beacon run's states, evaluate the beacon alerts and queue their messages. Runs inside the run's transaction.
- * `drandOnly`: no other source is configured, so a drand outage stops the service (see evaluateBeaconFresh).
+ * Work out the beacon run's states, alerts and messages from the stored states and the run, without writing anything.
+ * `run` is runBeacon()'s result for `plan`; a run that does not match the plan throws.
  */
-function commitBeacon(storage, plan, run, now, deliverable, drandOnly) {
+function evaluateBeaconRun(storage, plan, run, now) {
   const stored = readBeaconStates(storage);
   const states = new Map();
   const relays = [];
@@ -336,27 +358,71 @@ function commitBeacon(storage, plan, run, now, deliverable, drandOnly) {
       });
     });
   });
-  for (const [key, state] of states) writeBeaconState(storage, key, now, state);
   // A group or network no longer configured drops its state, and its alerts resolve below.
-  for (const key of stored.keys()) if (!states.has(key)) deleteBeaconState(storage, key);
+  const dropped = [...stored.keys()].filter((key) => !states.has(key));
 
-  const conditions = evaluateBeaconChecks(plan.groups, states, { drandOnly });
+  const conditions = evaluateBeaconChecks(plan.groups, states);
   const existing = new Map(readAlerts(storage, BEACON_SCOPE).map((row) => [row.check, row]));
   for (const check of existing.keys()) if (!conditions.has(check)) conditions.set(check, null);
+  const steps = [];
+  for (const [check, condition] of conditions) steps.push({ check, step: transition(existing.get(check) ?? null, condition, now, BEACON_SCOPE, check) });
+  return {
+    states,
+    dropped,
+    steps,
+    relays,
+    networks,
+    activeAlerts: [...conditions].filter(([, condition]) => condition).map(([check]) => check),
+    messages: steps.filter(({ step }) => step.message).map(({ step }) => step.message.text),
+  };
+}
 
+/**
+ * Store the beacon run's states, evaluate the beacon alerts and queue their messages. Runs inside the run's transaction, and
+ * a fault in the beacon stays in the beacon: everything is worked out first without writing, so a fault leaves the beacon's
+ * rows and alerts as they were, raises the monitor's own warning (see recordMonitorFailure), and never rolls back the rest of
+ * the run's state and alerts.
+ */
+function commitBeacon(storage, plan, run, now, deliverable) {
+  let result;
+  try {
+    if (plan.failed) throw new Error("the beacon could not be planned");
+    result = evaluateBeaconRun(storage, plan, run, now);
+  } catch {
+    return recordMonitorFailure(storage, now, deliverable);
+  }
+  try {
+    for (const [key, state] of result.states) writeBeaconState(storage, key, now, state);
+    for (const key of result.dropped) deleteBeaconState(storage, key);
+    for (const { check, step } of result.steps) {
+      if (step.write) saveAlert(storage, alertKey(BEACON_SCOPE, check), step.row);
+      if (step.message) enqueueMessage(storage, now, BEACON_SCOPE, step.message.severity, step.message.text, deliverable);
+    }
+  } catch {
+    // A row that could not be written is worked out again next run; nothing else in the run is touched.
+  }
+  return { relays: result.relays, networks: result.networks, activeAlerts: result.activeAlerts, messages: result.messages };
+}
+
+/**
+ * The beacon's run could not be planned, evaluated or recorded: its rows and alerts stay as they were, and the monitor's own
+ * warning is raised, if even that can be done. A warning is not repeated while it lasts.
+ */
+function recordMonitorFailure(storage, now, deliverable) {
   const messages = [];
-  for (const [check, condition] of conditions) {
-    const step = transition(existing.get(check) ?? null, condition, now, BEACON_SCOPE, check);
-    if (step.write) saveAlert(storage, alertKey(BEACON_SCOPE, check), step.row);
+  const activeAlerts = [];
+  try {
+    const existing = readAlerts(storage, BEACON_SCOPE).find((row) => row.check === BEACON_MONITOR_CHECK) ?? null;
+    const condition = beaconMonitorFailure("the beacon's results could not be worked out or recorded this run");
+    const step = transition(existing, condition, now, BEACON_SCOPE, BEACON_MONITOR_CHECK);
+    if (step.write) saveAlert(storage, alertKey(BEACON_SCOPE, BEACON_MONITOR_CHECK), step.row);
     if (step.message) {
       enqueueMessage(storage, now, BEACON_SCOPE, step.message.severity, step.message.text, deliverable);
       messages.push(step.message.text);
     }
+    activeAlerts.push(BEACON_MONITOR_CHECK);
+  } catch {
+    // Nothing more can be said about it.
   }
-  return {
-    relays,
-    networks,
-    activeAlerts: [...conditions].filter(([, condition]) => condition).map(([check]) => check),
-    messages,
-  };
+  return { relays: [], networks: [], activeAlerts, messages, error: "internal error" };
 }

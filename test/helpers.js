@@ -218,11 +218,13 @@ export function healthyBeaconRun(plan) {
       preset: group.preset.id,
       commonRound: null,
       sampleRound: null,
+      internal: false,
       relays: group.relays.map((relay) => ({ id: relay.id, outcome: "fresh", reason: null, round: 1000, lagRounds: 0, latencyMs: 10, agreement: null, info: null })),
       networks: group.networks.map((target) => ({
         name: target.name,
         ok: true,
         reason: null,
+        recipe: target.beacon.recipe,
         registration: "unregistered",
         registrationReason: "beaconOf reverted",
         verifier: null,
@@ -230,6 +232,9 @@ export function healthyBeaconRun(plan) {
         verdict: null,
         verdictReason: null,
         verify: { outcome: "skipped", round: null, reason: "beacon not registered" },
+        negative: { outcome: "skipped", round: null, reason: "beacon not registered" },
+        epoch: null,
+        catalog: null,
       })),
     })),
   };
