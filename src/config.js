@@ -108,10 +108,8 @@ export const NETWORKS = Object.freeze({
     // Recipe registry and per-submitter keeper share, upgraded on 2026-09-18.
     implementations: Object.freeze({
       coordinator: Object.freeze(["0xd20da0DADa4352A1a9722be43a2D85923443458c", "0xD20da000125643B4db5A6A36A3b853c17745DF44"]),
-      // NEXT REGISTRY IMPLEMENTATION (the drand beacon upgrade): append its address here as a second entry BEFORE the
-      // upgrade executes, or the registry_impl check alarms the moment the proxy points to it. Once the upgrade has
-      // run, the old entry can go. The address is not known yet, so none is listed.
-      registry: Object.freeze(["0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865"]),
+      // The drand beacon implementation is approved before its upgrade executes; once it has run, the old entry can go.
+      registry: Object.freeze(["0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865", "0xD20dA0853a6f894c0cdc9018fD4F8F67Eac15704"]),
     }),
     feeCapWei: 100n * GWEI,
     rpcs: Object.freeze(["https://rpc.blockdaemon.testnet.arc.io", "https://rpc.testnet.arc.io"]),
@@ -123,8 +121,8 @@ export const NETWORKS = Object.freeze({
       url: "https://api-testnet.d20dao.org",
       relayer: "0xF6b446dC2F30e6A802DFB7bD4c222d84F6cd05C3",
     }),
-    // As on arc-mainnet: the verifier address is set after the verifier contract is deployed, before the switch.
-    beacon: Object.freeze({ recipe: 11, preset: DRAND_EVMNET, relays: DRAND_RELAYS, verifier: null }),
+    // The beacon verifier deployed on Arc Testnet (CREATE2; the same address is planned on mainnet).
+    beacon: Object.freeze({ recipe: 11, preset: DRAND_EVMNET, relays: DRAND_RELAYS, verifier: "0xd20dA01Aa16AeD6b77Cd8DDb869151802599100a" }),
   }),
 });
 

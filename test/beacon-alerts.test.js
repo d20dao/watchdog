@@ -11,6 +11,7 @@ import {
   NOW,
   PRE_SWITCH_CATALOG,
   PRESET,
+  UNPINNED,
   VERIFIER,
   ZERO_BEACON,
   acceptsReal,
@@ -20,6 +21,7 @@ import {
   registryOf,
   roundRecord,
   slotSignerFor,
+  withVerifier,
 } from "./beacon-helpers.js";
 import { MAINNET, TESTNET, agentApiPoll, healthyRead, memoryStorage, pageText } from "./helpers.js";
 
@@ -52,7 +54,9 @@ const withAirnodeConfigured = (storage) =>
  * `catalog` is what both registries' catalogAt answers. The first run of a real watchdog only reads the epoch, and the catalog of
  * that epoch on the next; the epoch of a run before is stored here, so the catalog is read from the first run on
  * (`seedEpoch: false` leaves the states empty). `recipes: [AIRNODE]` configures an AirnodeHub recipe, which the beacon does not
- * look at. `state.cut` is a set of what the watchdog's network cannot reach: "relays" and/or "rpc".
+ * look at. `state.cut` is a set of what the watchdog's network cannot reach: "relays" and/or "rpc". `networks` are the networks watched
+ * (`state.networks`, changeable between runs): UNPINNED by default, the configured ones with no verifier pinned, since the fake registries
+ * report a made-up verifier whatever the configuration pins.
  */
 function harness({ recipes = [], env = TELEGRAM, networks, catalog = PRE_SWITCH_CATALOG, seedEpoch = true } = {}) {
   const storage = memoryStorage();
@@ -89,12 +93,12 @@ function harness({ recipes = [], env = TELEGRAM, networks, catalog = PRE_SWITCH_
       readChainImpl: (net, cursor, deps) => state.readChainImpl(net, cursor, deps),
       readAgentApiImpl: async (net) => agentApiPoll({}, net),
       runBeaconImpl: state.runBeaconImpl,
-      networks: state.networks,
+      networks: state.networks ?? UNPINNED,
       recipes: state.recipes,
     });
   };
   const texts = () => telegram.flatMap((m) => m.text.split("\n\n"));
-  const status = (minutes = 0) => buildStatus(storage, env, NOW + minutes * 60, state.recipes, state.networks);
+  const status = (minutes = 0) => buildStatus(storage, env, NOW + minutes * 60, state.recipes, state.networks ?? UNPINNED);
   const setCatalog = (value) => {
     for (const registry of Object.values(registries)) registry.catalog = value;
   };
@@ -647,6 +651,32 @@ test("registration: as configured raises nothing, a mismatch warns until it is f
   assert.deepEqual(beaconAlerts(h), []);
 });
 
+test("a verifier the configuration pins and the registry does not report is a registration mismatch on that network alone, warned until it is fixed", async () => {
+  // Both registries report VERIFIER. arc-testnet pins another verifier, as a network does once its verifier is deployed; arc-mainnet pins none.
+  const pinned = "0x" + "12".repeat(20);
+  const h = harness({ networks: { ...UNPINNED, "arc-testnet": withVerifier(TESTNET, pinned) } });
+  h.register();
+  await h.run(0);
+  assert.deepEqual(h.texts(), [
+    "[beacon] WARNING arc-testnet registry beacon registration mismatch: beaconOf(11) differs from the configured drand-evmnet beacon: " +
+      `verifier ${VERIFIER} (expected ${pinned}); slotSigner ${slotSignerFor(registeredBeacon())} (expected ${slotSignerFor(registeredBeacon({ verifier: pinned }))})`,
+  ]);
+  await h.run(1);
+  assert.equal(h.texts().length, 1, "warnings never repeat");
+  assert.deepEqual(beaconAlerts(h), ["registration:arc-testnet"]);
+  const { "arc-mainnet": mainnet, "arc-testnet": testnet } = h.status(1).beacon.networks;
+  assert.deepEqual([testnet.registration, testnet.verifier, testnet.expectedVerifier], ["mismatch", VERIFIER, pinned]);
+  assert.deepEqual([mainnet.registration, mainnet.verifier, mainnet.expectedVerifier], ["registered", VERIFIER, null], "the same verifier where none is pinned is no finding");
+  assert.equal(testnet.verification.status, "ok", "the round still verifies: a mismatch is a finding of its own");
+
+  // The registry reports the pinned verifier, and the slot signer derived from it: the warning resolves.
+  h.registries["arc-testnet"].beaconOf = registeredBeacon({ verifier: pinned });
+  await h.run(2);
+  assert.equal(h.texts()[1], "[beacon] RESOLVED arc-testnet registry beacon registration mismatch after 2 min");
+  assert.equal(h.status(2).beacon.networks["arc-testnet"].registration, "registered");
+  assert.deepEqual(beaconAlerts(h), []);
+});
+
 test("a registry that rejects the round alarms after two runs in a row, and a run with no round to verify leaves it as it is", async () => {
   const h = harness();
   h.registries["arc-mainnet"].beaconOf = registeredBeacon();
@@ -697,7 +727,7 @@ test("a beacon, a network or a relay removed from the configuration resolves its
 
   // One relay less: its alert goes with it.
   const fewer = (url) => !url.includes("api3");
-  h.state.networks = Object.fromEntries(Object.entries(NETWORKS).map(([name, net]) => [name, { ...net, beacon: { ...net.beacon, relays: net.beacon.relays.filter(fewer) } }]));
+  h.state.networks = Object.fromEntries(Object.entries(UNPINNED).map(([name, net]) => [name, { ...net, beacon: { ...net.beacon, relays: net.beacon.relays.filter(fewer) } }]));
   await h.run(1);
   assert.equal(h.texts().at(-1), "[beacon] RESOLVED drand relay api3.drand.sh disagrees with the other relays after 1 min");
   assert.deepEqual(Object.keys(readBeaconStates(h.storage).get("group:drand-evmnet").relays), [API, API2, CLOUDFLARE]);
@@ -883,7 +913,7 @@ test("a beacon that cannot be planned leaves the run without the beacon, not wit
   await h.run(2);
   const before = JSON.stringify([...readBeaconStates(h.storage)]);
   // A beacon block that cannot be read (its relays are no list): planning throws before anything is fetched.
-  h.state.networks = { ...NETWORKS, "arc-mainnet": { ...MAINNET, beacon: { ...MAINNET.beacon, relays: 5 } } };
+  h.state.networks = { ...UNPINNED, "arc-mainnet": { ...UNPINNED["arc-mainnet"], beacon: { ...UNPINNED["arc-mainnet"].beacon, relays: 5 } } };
   h.state.readChainImpl = async (net) => healthyRead(net, { balanceWei: 10n ** 18n });
   const calls = h.world.calls.length;
   const summary = await h.run(3);

@@ -80,10 +80,20 @@ export function drandWorld({ now = NOW } = {}) {
 // A fake registry
 
 const ZERO_ADDRESS = "0x" + "0".repeat(40);
-export const VERIFIER = "0x" + "ab".repeat(20); // a made-up verifier contract: none is deployed yet
+export const VERIFIER = "0x" + "ab".repeat(20); // a made-up verifier contract: the one every fake registry reports, on every network
 export const BEACON_RECIPE = 11; // the recipe id the configuration monitors
 
-/** The tuple beaconOf returns for a beacon registered as the configuration says. */
+/** A copy of `net` whose beacon pins `verifier` (null: none), whatever the configuration says. */
+export const withVerifier = (net, verifier) => Object.freeze({ ...net, beacon: Object.freeze({ ...net.beacon, verifier }) });
+
+/**
+ * The configured networks with no verifier pinned. The fake registries report the made-up VERIFIER, so what the configuration
+ * pins (arc-testnet its deployed verifier, arc-mainnet none yet) must not decide a test: the runs are planned from this copy,
+ * and a test of pinning pins a verifier itself, with withVerifier.
+ */
+export const UNPINNED = Object.freeze(Object.fromEntries(Object.entries(NETWORKS).map(([name, net]) => [name, withVerifier(net, null)])));
+
+/** The tuple beaconOf returns for a beacon registered as the configuration says (its chain, key, genesis and period) on VERIFIER. */
 export const registeredBeacon = (overrides = {}) => ({
   verifier: VERIFIER,
   genesis: PRESET.genesis,

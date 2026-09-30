@@ -39,6 +39,7 @@ import {
   NOW,
   PRESET,
   PRE_SWITCH_CATALOG,
+  UNPINNED,
   VERIFIER,
   ZERO_BEACON,
   beaconFetch,
@@ -50,6 +51,7 @@ import {
   registryOf,
   roundRecord,
   slotSignerFor,
+  withVerifier,
 } from "./beacon-helpers.js";
 import { MAINNET, TESTNET, addressWord, word } from "./helpers.js";
 
@@ -600,8 +602,9 @@ const COMMON = LAST_REAL_ROUND - 1; // the round before the lowest latest round:
 /**
  * The world, one registry per network, and a run of the plan for `nets` at the world's clock. `head` is every network's head
  * block, as this run's chain read gives it (none by default); `options.states` are the stored states the plan is made from.
+ * `nets` are UNPINNED by default: the fake registries report a made-up verifier, whatever the configuration pins.
  */
-function setup({ nets = NETWORKS, head = null } = {}) {
+function setup({ nets = UNPINNED, head = null } = {}) {
   const world = drandWorld();
   const registries = Object.fromEntries(Object.values(nets).map((net) => [net.name, registryOf(net)]));
   const { fetch, rpcCalls } = beaconFetch(world, registries);
@@ -646,7 +649,7 @@ test("every request is a bounded GET of the relay's own path, and the RPC client
     seen.push({ url, init });
     return fetch(url, init);
   };
-  await runBeacon(planBeacon(NETWORKS, new Map(), NOW), { fetch: spy, clock: () => NOW * 1000 });
+  await runBeacon(planBeacon(UNPINNED, new Map(), NOW), { fetch: spy, clock: () => NOW * 1000 });
   const relays = seen.filter((r) => !r.init.body);
   assert.equal(relays.length, 9);
   for (const { init } of relays) {
@@ -864,7 +867,7 @@ test("a registration that differs from the configuration is a mismatch, with the
 
 test("a configured verifier is pinned: the registry's must equal it, and the slot signer is derived from the configured one", async () => {
   const pinned = "0x" + "12".repeat(20);
-  const nets = { "arc-mainnet": { ...MAINNET, beacon: { ...MAINNET.beacon, verifier: pinned } } };
+  const nets = { "arc-mainnet": withVerifier(MAINNET, pinned) };
   const { registries, run } = setup({ nets });
   registries["arc-mainnet"].beaconOf = registeredBeacon();
   const [mainnet] = (await run()).groups[0].networks;
@@ -1197,7 +1200,7 @@ test("the registered verifier must reject a signature with its last byte flipped
     last.error = { code: -32005, message: "rate limit" };
     return Response.json(items);
   };
-  const unsure = await runBeacon(planBeacon(NETWORKS, new Map(), world.now), { fetch: tampered, clock: () => world.now * 1000 });
+  const unsure = await runBeacon(planBeacon(UNPINNED, new Map(), world.now), { fetch: tampered, clock: () => world.now * 1000 });
   assert.deepEqual(unsure.groups[0].networks[0].negative, { outcome: "unknown", round: COMMON, reason: "verifyBeacon: rpc error -32005" });
 });
 
@@ -1354,7 +1357,7 @@ test("relay fetches are bounded: at most beaconConcurrency in flight, every repl
     open--;
     return fetch(url, init);
   };
-  await runBeacon(planBeacon(NETWORKS, new Map(), NOW), { fetch: slow, clock: () => NOW * 1000 });
+  await runBeacon(planBeacon(UNPINNED, new Map(), NOW), { fetch: slow, clock: () => NOW * 1000 });
   assert.equal(LIMITS.beaconConcurrency, 4);
   assert.equal(peak, 4, "four latest reads and the chain info are five tasks; the registries add two more calls after them");
   assert.equal(LIMITS.beaconMaxResponseBytes, 4096);
@@ -1375,7 +1378,7 @@ test("an RPC session can be injected: the registry calls go through it, and its 
       return items;
     },
   });
-  const result = await runBeacon(planBeacon(NETWORKS, new Map(), NOW), { fetch: world.answer, clock: () => NOW * 1000, createSession });
+  const result = await runBeacon(planBeacon(UNPINNED, new Map(), NOW), { fetch: world.answer, clock: () => NOW * 1000, createSession });
   assert.deepEqual(seen.map((s) => s.network), ["arc-mainnet", "arc-testnet"]);
   assert.deepEqual(seen[0].methods, ["eth_chainId", "eth_call", "eth_call", "eth_call", "eth_call"]);
   assert.deepEqual(seen[0].data, [SELECTORS.beaconOf, SELECTORS.slotSigner, SELECTORS.verifyBeacon, SELECTORS.verifyBeacon]);
@@ -1383,7 +1386,7 @@ test("an RPC session can be injected: the registry calls go through it, and its 
   assert.ok(result.groups[0].networks.every((n) => n.registration === "unregistered"));
 
   // A session that cannot be made, or that throws, fails that network's read only.
-  const broken = await runBeacon(planBeacon(NETWORKS, new Map(), NOW), {
+  const broken = await runBeacon(planBeacon(UNPINNED, new Map(), NOW), {
     fetch: world.answer,
     clock: () => NOW * 1000,
     createSession: (net) => {
@@ -1406,13 +1409,13 @@ test("the default RPC session bounds a registry's reply: a longer one fails that
   registries["arc-mainnet"].beaconOf = registeredBeacon();
   const oversize = () => new Response(JSON.stringify([{ jsonrpc: "2.0", id: 1, result: "0x" + "ab".repeat(LIMITS.beaconRpcMaxResponseBytes) }]));
   const first = async (url, init) => (url === MAINNET.rpcs[0] ? oversize() : fetch(url, init));
-  const result = await runBeacon(planBeacon(NETWORKS, new Map(), NOW), { fetch: first, clock: () => NOW * 1000 });
+  const result = await runBeacon(planBeacon(UNPINNED, new Map(), NOW), { fetch: first, clock: () => NOW * 1000 });
   const [mainnet] = result.groups[0].networks;
   assert.deepEqual([mainnet.ok, mainnet.registration], [true, "registered"], "the second endpoint answered");
   assert.equal(result.subrequests, 4 + 4 + 1 + 3, "the mainnet registry took its second endpoint");
   // With every endpoint answering too much the registry is not read, for that reason.
   const all = async (url, init) => (MAINNET.rpcs.includes(url) ? oversize() : fetch(url, init));
-  const none = await runBeacon(planBeacon(NETWORKS, new Map(), NOW), { fetch: all, clock: () => NOW * 1000 });
+  const none = await runBeacon(planBeacon(UNPINNED, new Map(), NOW), { fetch: all, clock: () => NOW * 1000 });
   assert.deepEqual(none.groups[0].networks[0], { name: "arc-mainnet", ok: false, reason: "reply too large" });
   assert.equal(none.groups[0].networks[1].ok, true);
 });
@@ -1420,7 +1423,7 @@ test("the default RPC session bounds a registry's reply: a longer one fails that
 test("a plan without groups is an empty run, and a monitor that fails as a whole never throws", async () => {
   const empty = await runBeacon({ groups: [] }, { fetch: async () => assert.fail("nothing to fetch") });
   assert.deepEqual(empty, { subrequests: 0, groups: [] });
-  const plan = planBeacon(NETWORKS, new Map(), NOW);
+  const plan = planBeacon(UNPINNED, new Map(), NOW);
   // A clock that throws is a bug in the run itself: it says nothing about the relays, so they are unknown, not down.
   const result = await runBeacon(plan, { fetch: async () => new Response("{}"), clock: () => { throw new Error("boom"); } });
   assert.ok(result.groups[0].relays.every((r) => r.outcome === "unknown" && r.reason === "internal error"));
