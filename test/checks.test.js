@@ -355,7 +355,7 @@ test("a listed registry implementation is accepted, so the upgrade for the beaco
   const other = evaluateChainChecks(net, healthyRead(net, { registryImpl: "0x00000000000000000000000000000000000000d3" }));
   assert.equal(other.registry_impl.severity, "alarm");
   assert.equal(other.registry_impl.detail, `ERC-1967 slot is 0x00000000000000000000000000000000000000d3, expected ${current} or ${next}`);
-  // As configured, the next implementation is not listed yet: the current one alone is expected.
+  // As configured, each registry implementation is a list, and an address that is not listed alarms.
   for (const configured of [MAINNET, TESTNET]) {
     assert.ok(Array.isArray(configured.implementations.registry));
     assert.equal(severity(evaluateChainChecks(configured, healthyRead(configured, { registryImpl: next })).registry_impl), "alarm");

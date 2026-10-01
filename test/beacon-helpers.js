@@ -88,7 +88,7 @@ export const withVerifier = (net, verifier) => Object.freeze({ ...net, beacon: O
 
 /**
  * The configured networks with no verifier pinned. The fake registries report the made-up VERIFIER, so what the configuration
- * pins (arc-testnet its deployed verifier, arc-mainnet none yet) must not decide a test: the runs are planned from this copy,
+ * pins (each network its deployed verifier) must not decide a test: the runs are planned from this copy,
  * and a test of pinning pins a verifier itself, with withVerifier.
  */
 export const UNPINNED = Object.freeze(Object.fromEntries(Object.entries(NETWORKS).map(([name, net]) => [name, withVerifier(net, null)])));
