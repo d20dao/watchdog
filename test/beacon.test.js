@@ -1448,7 +1448,7 @@ test("the worst case of one run does happen: relays up, chain info due and every
   assert.equal(result.subrequests, 13);
   assert.equal(world.calls.length, 9);
   assert.ok(result.groups[0].networks.every((n) => n.ok === false && n.reason === "http 503"));
-  assert.ok(22 + result.subrequests <= 50, "on top of the chain reads, agent API polls, Telegram sends and AirnodeHub probes of a worst-case run");
+  assert.ok(17 + result.subrequests <= 50, "on top of the chain reads, agent API polls and Telegram sends of a worst-case run");
 });
 
 // ---------------------------------------------------------------------------------------------

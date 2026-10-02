@@ -81,7 +81,6 @@ function harness(env = TELEGRAM) {
       },
       runBeaconImpl: async (plan) => healthyBeaconRun(plan), // the drand beacon monitor is covered in beacon.test.js
       networks: state.networks,
-      recipes: [], // AirnodeHub probes are covered in probe.test.js
     });
   };
   return { storage, state, run };
@@ -275,7 +274,7 @@ test("status JSON and HTML show backup keeper balances next to the keeper's", as
   await h.run(1);
   assert.deepEqual(buildStatus(h.storage, TELEGRAM, T0 + 65).networks["arc-mainnet"].chain.backupKeeperBalances, [{ address: BACKUP, balanceUsdc: "12.5" }]);
   const added = "0x00000000000000000000000000000000000000c4";
-  const later = buildStatus(h.storage, TELEGRAM, T0 + 65, [], { "arc-mainnet": { ...MAINNET, backupKeepers: [BACKUP, added] } });
+  const later = buildStatus(h.storage, TELEGRAM, T0 + 65, { "arc-mainnet": { ...MAINNET, backupKeepers: [BACKUP, added] } });
   assert.deepEqual(later.networks["arc-mainnet"].chain.backupKeeperBalances, [
     { address: BACKUP, balanceUsdc: "12.5" },
     { address: added, balanceUsdc: null },
@@ -291,7 +290,7 @@ test("a network without backup keepers: no backup checks, empty status lists, no
   const summary = await h.run(0);
   assert.deepEqual(summary.networks["arc-testnet"].activeAlerts, ["balance"]);
   assert.deepEqual(readChainState(h.storage, "arc-testnet").backupBalances, {});
-  const status = buildStatus(h.storage, TELEGRAM, T0 + 5, [], h.state.networks);
+  const status = buildStatus(h.storage, TELEGRAM, T0 + 5, h.state.networks);
   assert.deepEqual(Object.keys(status.networks), ["arc-testnet"]);
   assert.deepEqual(status.networks["arc-testnet"].backupKeepers, []);
   assert.deepEqual(status.networks["arc-testnet"].chain.backupKeeperBalances, []);
@@ -565,7 +564,7 @@ test("each network's messages go to its own chat when one is configured", async 
   const env = { ...TELEGRAM, TELEGRAM_CHAT_ID: "-100default", TELEGRAM_CHAT_ID_ARC_TESTNET: "-100testnet" };
   assert.equal(chatIdFor(env, "arc-testnet"), "-100testnet");
   assert.equal(chatIdFor(env, "arc-mainnet"), "-100default", "a network without its own chat uses the default");
-  assert.equal(chatIdFor(env, "airnodehub"), "-100default");
+  assert.equal(chatIdFor(env, "beacon"), "-100default", "a scope that is no network uses the default too");
   assert.equal(chatIdFor(env, null), "-100default");
   assert.equal(chatIdFor({ TELEGRAM_CHAT_ID: "  " }, "arc-testnet"), null, "blank chat ids do not count");
 
@@ -663,7 +662,7 @@ test("an agent API that is not watched: not polled, not read, no checks, no sect
   assert.equal(summary.networks["arc-testnet"].agentApi.reachable, true);
   assert.equal(summary.subrequests, 2 + 2 + 1, "two chain batches per network and one /health poll");
   assert.equal(readChainState(h.storage, "arc-mainnet").agentRelayerBalanceWei, null, "relayer balance not read");
-  let status = buildStatus(h.storage, TELEGRAM, T0 + 5, [], h.state.networks);
+  let status = buildStatus(h.storage, TELEGRAM, T0 + 5, h.state.networks);
   assert.deepEqual(status.networks["arc-mainnet"].agentApi, { enabled: false });
   assert.ok(!pageText(renderHtml(status)).includes("Agent API · arc-mainnet"));
 
@@ -677,7 +676,7 @@ test("an agent API that is not watched: not polled, not read, no checks, no sect
   assert.deepEqual(h.state.telegram.map((m) => m.text), [
     "[arc-mainnet] WARNING agent API relayer balance low: relayer 0x8B465645ed88F6d487d279003aD3681e7aF8e8B7 holds 3 USDC (warning below 4, alarm below 1); top it up before sales stop at 3 calls' cost",
   ]);
-  status = buildStatus(h.storage, TELEGRAM, T0 + 65, [], h.state.networks);
+  status = buildStatus(h.storage, TELEGRAM, T0 + 65, h.state.networks);
   assert.equal(status.networks["arc-mainnet"].agentApi.url, "https://api.d20dao.org");
   assert.ok(pageText(renderHtml(status)).includes("Agent API · arc-mainnet"));
 
@@ -686,7 +685,7 @@ test("an agent API that is not watched: not polled, not read, no checks, no sect
   await h.run(2);
   assert.equal(h.state.telegram.at(-1).text, "[arc-mainnet] RESOLVED agent API relayer balance low after 1 min");
   assert.deepEqual(h.state.polled.slice(3), ["arc-testnet"]);
-  status = buildStatus(h.storage, TELEGRAM, T0 + 125, [], h.state.networks);
+  status = buildStatus(h.storage, TELEGRAM, T0 + 125, h.state.networks);
   assert.deepEqual(status.networks["arc-mainnet"].agentApi, { enabled: false });
 });
 
@@ -736,4 +735,116 @@ test("migrate creates the agent API state table on an existing database", () => 
   migrate(storage);
   const tables = storage.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((t) => t.name);
   assert.ok(tables.includes("agent_api_state"));
+});
+
+// ---------------------------------------------------------------------------------------------
+// State left by the retired AirnodeHub probes
+
+const MISMATCH = "gateway signed 0xabababab...abab, recipe expects 0xabe6d1ad...abda";
+const UNREACHABLE = "[airnodehub] ALARM Nodary ETH/USD (/api) listing unreachable: 4 consecutive probes failed (last: timeout)";
+const tableNames = (storage) => storage.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map((t) => t.name);
+
+/**
+ * What a Durable Object that ran the AirnodeHub probes holds, as the old Worker wrote it: the probe results (one JSON per recipe,
+ * with the listing document check inside), three alerts in the scope "airnodehub" (a mismatch, a listing document and an
+ * unreachable listing), a notice that was sent and one still waiting for Telegram.
+ */
+function leaveProbeState(storage) {
+  storage.db.exec(`CREATE TABLE probe_state (
+     recipe_id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, state_json TEXT NOT NULL
+   ) WITHOUT ROWID`);
+  const results = {
+    "tickerlayer-btcusd": {
+      probedAt: T0 - 300, latencyMs: 812, outcome: "request_hash", reason: MISMATCH, failures: 0,
+      verdict: "request_hash", verdictReason: MISMATCH, verdictAt: T0 - 300, lastOkAt: T0 - 7200, signedLagSeconds: 3, nextProbeAt: T0 + 3300,
+      document: { checkedAt: T0 - 600, latencyMs: 90, outcome: "operation", reason: null, verdict: "operation", verdictReason: "lastTrade is no longer offered", nextCheckAt: T0 + 80000 },
+    },
+    "nodary-eth-usd-api": {
+      probedAt: T0 - 60, latencyMs: 15000, outcome: "failure", reason: "timeout", failures: 4,
+      verdict: "ok", verdictReason: null, verdictAt: T0 - 7200, lastOkAt: T0 - 7200, signedLagSeconds: 2, nextProbeAt: T0 + 540,
+    },
+  };
+  for (const [id, state] of Object.entries(results)) {
+    storage.db.prepare("INSERT INTO probe_state (recipe_id, updated_at, state_json) VALUES (?, ?, ?)").run(id, state.probedAt, JSON.stringify(state));
+  }
+  const alerts = [
+    ["probe:tickerlayer-btcusd", "TickerLayer BTCUSD last trade request hash mismatch", MISMATCH],
+    ["listing:tickerlayer-btcusd", "TickerLayer BTCUSD last trade operation missing from listing document", "lastTrade is no longer offered"],
+    ["probe:nodary-eth-usd-api", "Nodary ETH/USD (/api) listing unreachable", "4 consecutive probes failed (last: timeout)"],
+  ];
+  for (const [check, title, detail] of alerts) {
+    storage.db
+      .prepare(
+        `INSERT INTO alerts (alert_key, network, check_name, severity, title, detail, since, updated_at, last_alarm_at, event)
+         VALUES (?, 'airnodehub', ?, 'alarm', ?, ?, ?, ?, ?, 0)`,
+      )
+      .run(`airnodehub:${check}`, check, title, detail, T0 - 7000, T0 - 60, T0 - 60);
+  }
+  const notice = storage.db.prepare("INSERT INTO messages (created_at, network, severity, text, status, attempts, sent_at) VALUES (?, 'airnodehub', 'alarm', ?, ?, ?, ?)");
+  notice.run(T0 - 7000, `[airnodehub] ALARM ${alerts[0][1]}: ${MISMATCH}`, "sent", 1, T0 - 6999);
+  notice.run(T0 - 30, UNREACHABLE, "pending", 0, null);
+}
+
+test("state the AirnodeHub probes left behind: a run ignores it, the object clears it when it starts, and other alerts go on as before", async () => {
+  const h = harness();
+  leaveProbeState(h.storage);
+
+  // A run on the old state before anything has cleaned it: nothing throws, the old alerts are neither shown, nor repeated, nor
+  // resolved, and the notice the old Worker had queued is still delivered. Three stored alarms do not make the page an alarm.
+  const first = await h.run(0);
+  assert.ok(!("airnodehub" in first));
+  assert.equal(first.messagesQueued, 0);
+  assert.equal(first.messagesDelivered, 1);
+  assert.deepEqual(h.state.telegram.map((m) => m.text), [UNREACHABLE]);
+  assert.equal(readAlerts(h.storage, "airnodehub").length, 3, "untouched by the run");
+  const status = buildStatus(h.storage, TELEGRAM, T0 + 5);
+  assert.ok(!("airnodehub" in status));
+  assert.deepEqual([status.networks["arc-mainnet"].alerts, status.networks["arc-testnet"].alerts, status.beacon.alerts], [[], [], []]);
+  const html = renderHtml(status);
+  assert.match(html, /<p class="pill ok">/);
+  assert.ok(!pageText(html).includes("AirnodeHub"));
+
+  // The object starts on this code: the alerts and the table go, the notice log stays.
+  migrate(h.storage);
+  assert.deepEqual(readAlerts(h.storage, "airnodehub"), []);
+  assert.ok(!tableNames(h.storage).includes("probe_state"));
+  assert.equal(recentMessages(h.storage).length, 2);
+
+  // An alert of a live check is raised and delivered as usual, with nothing of the old scope resolved beside it.
+  h.state.reads["arc-testnet"] = healthyRead(TESTNET, { balanceWei: USDC });
+  const second = await h.run(1);
+  const raised = `[arc-testnet] ALARM keeper balance low: keeper ${TESTNET.keeper} holds 1 USDC`;
+  assert.deepEqual(second.networks["arc-testnet"].messages, [raised]);
+  assert.equal(second.messagesQueued, 1);
+  assert.deepEqual(h.state.telegram.map((m) => m.text), [UNREACHABLE, raised]);
+  assert.deepEqual(readAlerts(h.storage, "arc-testnet").map((a) => a.check), ["balance"]);
+  assert.match(renderHtml(buildStatus(h.storage, TELEGRAM, T0 + 65)), /<p class="pill alarm">/);
+});
+
+test("migrate removes what the AirnodeHub probes left, once, and leaves every other alert, message and table alone", () => {
+  const storage = memoryStorage();
+  const tables = tableNames(storage);
+  assert.ok(!tables.includes("probe_state"), "an object that never ran the probes does not get the table");
+
+  leaveProbeState(storage);
+  const live = storage.db.prepare(
+    `INSERT INTO alerts (alert_key, network, check_name, severity, title, detail, since, updated_at, last_alarm_at, event)
+     VALUES (?, ?, ?, 'warning', 'live', '', ?, ?, NULL, 0)`,
+  );
+  live.run("arc-mainnet:balance", "arc-mainnet", "balance", T0, T0);
+  live.run("beacon:fresh:drand-evmnet", "beacon", "fresh:drand-evmnet", T0, T0);
+  assert.ok(tableNames(storage).includes("probe_state"));
+
+  migrate(storage);
+  assert.deepEqual(tableNames(storage), tables);
+  const keys = () => storage.db.prepare("SELECT alert_key FROM alerts ORDER BY alert_key").all().map((r) => r.alert_key);
+  assert.deepEqual(keys(), ["arc-mainnet:balance", "beacon:fresh:drand-evmnet"]);
+  assert.equal(recentMessages(storage).length, 2, "the notice log is history and stays");
+  migrate(storage); // idempotent
+  assert.deepEqual(keys(), ["arc-mainnet:balance", "beacon:fresh:drand-evmnet"]);
+
+  // A start that was cut short after the alerts went leaves the table: the next one finishes the job.
+  storage.db.exec("CREATE TABLE probe_state (recipe_id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, state_json TEXT NOT NULL) WITHOUT ROWID");
+  migrate(storage);
+  assert.deepEqual(tableNames(storage), tables);
 });

@@ -83,12 +83,6 @@ const SCHEMA = [
      sent_at INTEGER
    )`,
   `CREATE INDEX IF NOT EXISTS messages_pending ON messages (id) WHERE status = 'pending'`,
-  // AirnodeHub probe state per recipe id, as JSON (see src/listings.js), so fields can be added without migrations.
-  `CREATE TABLE IF NOT EXISTS probe_state (
-     recipe_id TEXT PRIMARY KEY,
-     updated_at INTEGER NOT NULL,
-     state_json TEXT NOT NULL
-   ) WITHOUT ROWID`,
   // drand beacon monitor state per group of relays and per network, as JSON (see src/beacon.js).
   `CREATE TABLE IF NOT EXISTS beacon_state (
      state_key TEXT PRIMARY KEY,
@@ -150,11 +144,31 @@ const ADDED_COLUMNS = [
 export const PRIMARY_STREAM = Object.freeze({ reports: "reports", state: "report_state" });
 export const BACKUP_STREAM = Object.freeze({ reports: "backup_reports", state: "backup_report_state" });
 
+// The AirnodeHub probes are gone, but an object that ran them still holds what they stored: a `probe_state` table and alerts
+// in the scope "airnodehub". Nothing reads or resolves either any more, so a stored alert would stay active for good.
+const RETIRED_ALERT_SCOPE = "airnodehub";
+
 export function migrate(storage) {
   for (const statement of SCHEMA) storage.sql.exec(statement);
   for (const [table, column, type] of ADDED_COLUMNS) {
     const present = rows(storage, `PRAGMA table_info(${table})`).some((c) => c.name === column);
     if (!present) storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
+  dropRetiredProbeState(storage);
+}
+
+/**
+ * Clear what the AirnodeHub probes left, once and silently (no "resolved" notices for a monitor that no longer exists). The
+ * table goes last and marks the work as pending: a start that was cut short does it again, and an object without the table has
+ * nothing to do. Best effort: what is left is ignored by everything else, so a failure here never keeps the object from starting.
+ */
+function dropRetiredProbeState(storage) {
+  try {
+    if (rows(storage, "PRAGMA table_info(probe_state)").length === 0) return;
+    storage.sql.exec("DELETE FROM alerts WHERE network = ?", RETIRED_ALERT_SCOPE);
+    storage.sql.exec("DROP TABLE probe_state");
+  } catch {
+    // Tried again at the next start.
   }
 }
 
@@ -526,33 +540,6 @@ export function pruneMessages(storage) {
 
 export function recentMessages(storage, limit = 20) {
   return rows(storage, "SELECT created_at, network, severity, text, status FROM messages ORDER BY id DESC LIMIT ?", limit);
-}
-
-// ---------------------------------------------------------------------------------------------
-// AirnodeHub probe state
-
-/** Map of recipe id -> probe state object. Unreadable rows are skipped (the recipe is then due again). */
-export function readProbeStates(storage) {
-  const states = new Map();
-  for (const r of rows(storage, "SELECT recipe_id, state_json FROM probe_state")) {
-    const state = parseJson(r.state_json, null);
-    if (state && typeof state === "object") states.set(r.recipe_id, state);
-  }
-  return states;
-}
-
-export function writeProbeState(storage, recipeId, now, state) {
-  storage.sql.exec(
-    `INSERT INTO probe_state (recipe_id, updated_at, state_json) VALUES (?, ?, ?)
-     ON CONFLICT (recipe_id) DO UPDATE SET updated_at = excluded.updated_at, state_json = excluded.state_json`,
-    recipeId,
-    now,
-    JSON.stringify(state),
-  );
-}
-
-export function deleteProbeState(storage, recipeId) {
-  storage.sql.exec("DELETE FROM probe_state WHERE recipe_id = ?", recipeId);
 }
 
 // ---------------------------------------------------------------------------------------------

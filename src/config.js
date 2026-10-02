@@ -69,10 +69,12 @@ export const NETWORKS = Object.freeze({
     backupKeepers: Object.freeze(["0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685"]),
     // Expected ERC-1967 implementations; update after each reviewed upgrade. A list accepts each of its addresses,
     // so a reviewed upgrade can be approved before it executes: the current implementation first, then the next.
+    // Once the upgrade has run, the old entry goes.
     implementations: Object.freeze({
-      coordinator: Object.freeze(["0xd20da0DADa4352A1a9722be43a2D85923443458c", "0xD20da000125643B4db5A6A36A3b853c17745DF44"]),
-      // The drand beacon implementation is approved before its upgrade executes; once it has run, the old entry can go.
-      registry: Object.freeze(["0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865", "0xD20dA0853a6f894c0cdc9018fD4F8F67Eac15704"]),
+      // Runtime code hash (keccak256 of the deployed code): 0x3dda400d8360d7e03b8dacd8ba1ffad7ad672e07628bee7de4542d754dd5348c
+      coordinator: Object.freeze(["0xD20da000125643B4db5A6A36A3b853c17745DF44"]),
+      // Runtime code hash: 0xb5e125e3b0f63ffe516d781266c1cbacebe3d131148b69f8736d3ca78bcddb12
+      registry: Object.freeze(["0xD20dA0853a6f894c0cdc9018fD4F8F67Eac15704"]),
     }),
     feeCapWei: 2000n * GWEI,
     // Blockdaemon accepts batches from Cloudflare egress; the public endpoint rate-limits them.
@@ -100,11 +102,12 @@ export const NETWORKS = Object.freeze({
     keeper: "0x61659d9A9A85dA07C36e7d1B35CF0d96CF199Cac",
     // Follower keepers authorized as backup committers: their fulfillments are ours, not a foreign submitter.
     backupKeepers: Object.freeze(["0xbb2fdE97a5F4855bEf872C71fbb80Be3170127Ee"]),
-    // Recipe registry and per-submitter keeper share, upgraded on 2026-09-18.
+    // The same rule as on Arc Mainnet: an upgrade's implementation is listed before it executes, the old one dropped after.
     implementations: Object.freeze({
-      coordinator: Object.freeze(["0xd20da0DADa4352A1a9722be43a2D85923443458c", "0xD20da000125643B4db5A6A36A3b853c17745DF44"]),
-      // The drand beacon implementation is approved before its upgrade executes; once it has run, the old entry can go.
-      registry: Object.freeze(["0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865", "0xD20dA0853a6f894c0cdc9018fD4F8F67Eac15704"]),
+      // Runtime code hash: 0x3dda400d8360d7e03b8dacd8ba1ffad7ad672e07628bee7de4542d754dd5348c
+      coordinator: Object.freeze(["0xD20da000125643B4db5A6A36A3b853c17745DF44"]),
+      // Runtime code hash: 0xb5e125e3b0f63ffe516d781266c1cbacebe3d131148b69f8736d3ca78bcddb12
+      registry: Object.freeze(["0xD20dA0853a6f894c0cdc9018fD4F8F67Eac15704"]),
     }),
     feeCapWei: 100n * GWEI,
     rpcs: Object.freeze(["https://rpc.blockdaemon.testnet.arc.io", "https://rpc.testnet.arc.io"]),
@@ -120,8 +123,6 @@ export const NETWORKS = Object.freeze({
     beacon: Object.freeze({ recipe: 11, preset: DRAND_EVMNET, relays: DRAND_RELAYS, verifier: "0xd20dA01Aa16AeD6b77Cd8DDb869151802599100a" }),
   }),
 });
-
-export const NETWORK_NAMES = Object.freeze(Object.keys(NETWORKS));
 
 /** A network's x402 agent API configuration when it is watched, otherwise null. */
 export const watchedAgentApi = (net) => (net?.agentApi?.enabled === true ? net.agentApi : null);
@@ -160,13 +161,6 @@ export const THRESHOLDS = Object.freeze({
   feeAlarmPercent: 85n,
   feeHeadroomWei: 1n * GWEI, // checked value is 2 x baseFee + 1 gwei
   rpcFailureRuns: 3,
-  // AirnodeHub listing probes: consecutive failed probes (unreachable, HTTP error, unsigned or unparsable reply).
-  probeWarnFailures: 2,
-  probeAlarmFailures: 4,
-  // Signed timestamp window at probe time. EpochEntropy accepts attestations at most 240 s old and never from
-  // after the block, so a reply outside this window could not be committed either.
-  probeMaxSignedAgeSeconds: 240,
-  probeMaxSignedAheadSeconds: 60,
   // drand beacon monitor. A relay serves a fresh round when its /public/latest is at most this many rounds behind the
   // chain's schedule: 3 rounds is 9 s at the evmnet period, and a relay's edge cache can trail by a round or two.
   beaconMaxLagRounds: 3,
@@ -209,22 +203,11 @@ export const LIMITS = Object.freeze({
   // and whether or not the account's Cron Trigger fires. Runs closer together than this are skipped.
   checkIntervalMs: 60_000,
   minRunSpacingMs: 45_000,
-  // AirnodeHub listing probes. Recipe i of n is probed at second (i x 3600 / n) of every hour, so five recipes
-  // are 12 minutes apart. After a probe that did not pass, the recipe is probed again after probeRetrySeconds.
-  probeIntervalSeconds: 3600,
-  probeRetrySeconds: 600,
-  probeTimeoutMs: 15_000, // fly.dev cold starts take 6-13 s
-  probeMaxResponseBytes: 16 * 1024, // the keeper's own limit for a signed reply
-  probeConcurrency: 3, // Workers allow 6 open connections per invocation; the two chain readers use 2
-  probeMaxPerRun: 5, // probe POSTs plus listing document GETs per run; the rest wait for the next run
-  listingDocumentIntervalSeconds: 24 * 3600,
-  listingDocumentRetrySeconds: 3600,
-  listingDocumentMaxBytes: 1024 * 1024,
   // drand beacon monitor (src/beacon.js). Each run reads every relay's latest round, then one earlier round from every
   // fresh relay, then makes one JSON-RPC batch per network. A relay's /info is read once a day, one relay per run.
   beaconTimeoutMs: 5000,
   beaconMaxResponseBytes: 4 * 1024, // a round record is about 230 bytes and a chain info about 600
-  beaconConcurrency: 4, // relay fetches in flight at once, a bound of its own next to the chain readers and probes
+  beaconConcurrency: 4, // relay fetches in flight at once, a bound of its own next to the chain readers
   // A registry batch holds beaconOf for the monitored recipe and the catalog's, slotSigner, verifyBeacon for each distinct
   // signature of the compared round and for one with its last byte flipped, epochForBlock and two catalogAt: 18 calls at
   // the most, and about 10 KB of answers with the catalog's four slots.
@@ -242,184 +225,5 @@ export const LIMITS = Object.freeze({
 
 export const DURABLE_OBJECT_NAME = "watchdog";
 
-// Alert and message scope of the AirnodeHub probes, shown as "[airnodehub]" in Telegram.
-export const AIRNODE_SCOPE = "airnodehub";
-
 // Alert and message scope of the drand beacon monitor, shown as "[beacon]" in Telegram.
 export const BEACON_SCOPE = "beacon";
-
-function deepFreeze(value) {
-  if (value && typeof value === "object" && !Object.isFrozen(value)) {
-    for (const inner of Object.values(value)) deepFreeze(inner);
-    Object.freeze(value);
-  }
-  return value;
-}
-
-const MULTICALL3_GET_LAST_BLOCK_HASH = { to: "0xcA11bde05977b3631167028862bE2a173976CA11", data: "0x27e86d6e" };
-
-/**
- * AirnodeHub recipes the epoch registry (EpochEntropy) can select, probed the way the keeper calls them.
- *
- *   id      stable key for probe state and alerts (lowercase letters, digits, dashes); renaming it resets both
- *   name    shown in messages and on the status page
- *   recipe  EpochEntropy recipe id: recipeRequest(recipe) must equal the canonical form of `body`
- *   url     the listing's gateway: POST `body` for a signed reply, GET for the listing's OpenAPI document
- *   body    the request, sent as JSON (POST / recipes)
- *   passthrough  instead of body, the provider's own request at the gateway's /api: {operation, method, path, query?,
- *           body? (exact text), projection?, route}; route is the entry the listing document's
- *           x-airnode.passthrough.routes held for the operation when the recipe was built
- *   signer  the airnode address the registry catalog holds for this recipe
- *   shape   the signed data bytes EpochEntropy._validate accepts (at most 128 bytes), as a sequence of:
- *             {literal: "..."}             exactly this text
- *             {number: "decimal"}          unsigned JSON number without exponent
- *             {number: "json"}             unsigned JSON number, fraction and exponent allowed
- *             {integer: {maxDigits: n}}    1 to n digits, no leading zero
- *             {integer: {digits: n}}       exactly n digits, no leading zero
- *             {hex: n}                     exactly n lowercase hex characters
- */
-// Signed records EpochEntropy accepts; a listing's POST / and passthrough forms answer with the same record.
-const SHAPES = {
-  btcDayVolume: [{ literal: '{"symbol":"BTC","value":"' }, { number: "decimal" }, { literal: '"}' }],
-  blockHash: [{ literal: '{"id":null,"jsonrpc":"2.0","result":"0x' }, { hex: 64 }, { literal: '"}' }],
-  btcUsdTrade: [
-    { literal: '{"symbol":"BTCUSD","price":' },
-    { number: "json" },
-    { literal: ',"size":' },
-    { number: "json" },
-    { literal: ',"timestamp":' },
-    { integer: { maxDigits: 16 } },
-    { literal: "}" },
-  ],
-  ethUsdFeed: [
-    { literal: '{"ETH/USD":{"value":' },
-    { number: "json" },
-    { literal: ',"timestamp":' },
-    { integer: { digits: 13 } },
-    { literal: ',"category":"crypto"}}' },
-  ],
-};
-const JSON_RPC_BLOCK_HASH_BODY = JSON.stringify({ jsonrpc: "2.0", id: null, method: "eth_call", params: [MULTICALL3_GET_LAST_BLOCK_HASH, "latest"] });
-const JSON_RPC_ROUTE = { method: "POST", path: "/ogrpc", parameters: { network: "query", method: "body", params: "body" } };
-
-export const AIRNODE_RECIPES = deepFreeze([
-  {
-    id: "hyperliquid-btc-day-volume",
-    name: "Hyperliquid BTC day volume",
-    recipe: 0,
-    url: "https://airnode-hyperliquid.fly.dev/",
-    body: {
-      operation: "metaAndAssetCtxs",
-      parameters: { dex: "" },
-      responseProjection: { symbol: "/0/universe/0/name", value: "/1/0/dayNtlVlm" },
-    },
-    signer: "0x509F4275Cbe2E2201cc5444bAc8948E3cc7c665B",
-    shape: SHAPES.btcDayVolume,
-  },
-  {
-    id: "drpc-ethereum-blockhash",
-    name: "dRPC Ethereum block hash",
-    recipe: 1,
-    url: "https://airnode-drpc.fly.dev/",
-    body: {
-      operation: "jsonRpc",
-      parameters: { network: "ethereum", method: "eth_call", params: [MULTICALL3_GET_LAST_BLOCK_HASH, "latest"] },
-    },
-    signer: "0x511AcE8648D2f64260d50D036F8f8ce622d92137",
-    shape: SHAPES.blockHash,
-  },
-  {
-    id: "tickerlayer-btcusd",
-    name: "TickerLayer BTCUSD last trade",
-    recipe: 2,
-    url: "https://airnode-tickerlayer.fly.dev/",
-    body: { operation: "lastTrade", parameters: { assetClass: "crypto", symbol: "BTCUSD" } },
-    signer: "0x32f5eA20F05fdADfCD50Cb8eD920acE96D5f9f2c",
-    shape: SHAPES.btcUsdTrade,
-  },
-  {
-    id: "nodary-eth-usd",
-    name: "Nodary ETH/USD",
-    recipe: 4,
-    url: "https://airnode-nodary.fly.dev/",
-    body: { operation: "latestFeeds", parameters: { name: "ETH/USD" } },
-    signer: "0xE70f1e8b22a21e4Bb5188918a3033341b281E4c0",
-    shape: SHAPES.ethUsdFeed,
-  },
-  {
-    id: "drpc-base-blockhash",
-    name: "dRPC Base block hash",
-    recipe: 5,
-    url: "https://airnode-drpc.fly.dev/",
-    body: {
-      operation: "jsonRpc",
-      parameters: { network: "base", method: "eth_call", params: [MULTICALL3_GET_LAST_BLOCK_HASH, "latest"] },
-    },
-    signer: "0x511AcE8648D2f64260d50D036F8f8ce622d92137",
-    shape: SHAPES.blockHash,
-  },
-  // The same listings through the gateways' passthrough (/api), registered as recipes 6 to 10 in the same slot order.
-  {
-    id: "hyperliquid-btc-day-volume-api",
-    name: "Hyperliquid BTC day volume (/api)",
-    recipe: 6,
-    url: "https://airnode-hyperliquid.fly.dev/",
-    passthrough: {
-      operation: "metaAndAssetCtxs",
-      method: "POST",
-      path: "/info",
-      body: '{"type":"metaAndAssetCtxs","dex":""}',
-      projection: { symbol: "/0/universe/0/name", value: "/1/0/dayNtlVlm" },
-      route: { method: "POST", path: "/info", body: { type: "metaAndAssetCtxs" }, parameters: { dex: "body" } },
-    },
-    signer: "0x509F4275Cbe2E2201cc5444bAc8948E3cc7c665B",
-    shape: SHAPES.btcDayVolume,
-  },
-  {
-    id: "drpc-ethereum-blockhash-api",
-    name: "dRPC Ethereum block hash (/api)",
-    recipe: 7,
-    url: "https://airnode-drpc.fly.dev/",
-    passthrough: { operation: "jsonRpc", method: "POST", path: "/ogrpc", query: { network: "ethereum" }, body: JSON_RPC_BLOCK_HASH_BODY, route: JSON_RPC_ROUTE },
-    signer: "0x511AcE8648D2f64260d50D036F8f8ce622d92137",
-    shape: SHAPES.blockHash,
-  },
-  {
-    id: "tickerlayer-btcusd-api",
-    name: "TickerLayer BTCUSD last trade (/api)",
-    recipe: 8,
-    url: "https://airnode-tickerlayer.fly.dev/",
-    passthrough: {
-      operation: "lastTrade",
-      method: "GET",
-      path: "/crypto/trade/last/BTCUSD",
-      route: { method: "GET", path: "/{assetClass}/trade/last/{symbol}", parameters: { assetClass: "path", symbol: "path" } },
-    },
-    signer: "0x32f5eA20F05fdADfCD50Cb8eD920acE96D5f9f2c",
-    shape: SHAPES.btcUsdTrade,
-  },
-  {
-    id: "nodary-eth-usd-api",
-    name: "Nodary ETH/USD (/api)",
-    recipe: 9,
-    url: "https://airnode-nodary.fly.dev/",
-    passthrough: {
-      operation: "latestFeeds",
-      method: "GET",
-      path: "/feed/latest",
-      query: { name: "ETH/USD" },
-      route: { method: "GET", path: "/feed/latest", parameters: { name: "query" } },
-    },
-    signer: "0xE70f1e8b22a21e4Bb5188918a3033341b281E4c0",
-    shape: SHAPES.ethUsdFeed,
-  },
-  {
-    id: "drpc-base-blockhash-api",
-    name: "dRPC Base block hash (/api)",
-    recipe: 10,
-    url: "https://airnode-drpc.fly.dev/",
-    passthrough: { operation: "jsonRpc", method: "POST", path: "/ogrpc", query: { network: "base" }, body: JSON_RPC_BLOCK_HASH_BODY, route: JSON_RPC_ROUTE },
-    signer: "0x511AcE8648D2f64260d50D036F8f8ce622d92137",
-    shape: SHAPES.blockHash,
-  },
-]);

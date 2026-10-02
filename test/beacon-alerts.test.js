@@ -5,7 +5,7 @@ import { DRAND_RELAYS, LIMITS, NETWORKS, THRESHOLDS } from "../src/config.js";
 import { runCron } from "../src/cron.js";
 import { RpcSession } from "../src/rpc.js";
 import { buildStatus, renderHtml } from "../src/status.js";
-import { migrate, readAlerts, readBeaconStates, readChainState, writeBeaconState, writeProbeState } from "../src/store.js";
+import { migrate, readAlerts, readBeaconStates, readChainState, writeBeaconState } from "../src/store.js";
 import {
   DRAND_ONLY_CATALOG,
   NOW,
@@ -34,33 +34,15 @@ const TELEGRAM = { TELEGRAM_BOT_TOKEN: "123456:throwaway-token", TELEGRAM_CHAT_I
 const HOSTS = DRAND_RELAYS.map((url) => new URL(url).host);
 const [API, API2, API3, CLOUDFLARE] = HOSTS;
 
-// An AirnodeHub recipe that is configured but never due, so no probe is made. It is made up here rather than taken from
-// AIRNODE_RECIPES: those go when the probes are retired, and these tests stay. The AirnodeHub section of the status is the
-// only thing it changes: the alarm's level comes from the registry's catalog, not from this list.
-const AIRNODE = {
-  id: "alpha-feed",
-  name: "Alpha feed",
-  recipe: 4,
-  url: "https://airnode-alpha.example/",
-  body: { operation: "latestFeeds", parameters: { name: "ETH/USD" } },
-  signer: "0x" + "22".repeat(20),
-  shape: [{ literal: "{}" }],
-};
-const FAR = 2 ** 40;
-const withAirnodeConfigured = (storage) =>
-  writeProbeState(storage, AIRNODE.id, NOW, { nextProbeAt: FAR, verdict: "ok", document: { nextCheckAt: FAR, verdict: "ok" } });
-
 /**
  * `catalog` is what both registries' catalogAt answers. The first run of a real watchdog only reads the epoch, and the catalog of
  * that epoch on the next; the epoch of a run before is stored here, so the catalog is read from the first run on
- * (`seedEpoch: false` leaves the states empty). `recipes: [AIRNODE]` configures an AirnodeHub recipe, which the beacon does not
- * look at. `state.cut` is a set of what the watchdog's network cannot reach: "relays" and/or "rpc". `networks` are the networks watched
- * (`state.networks`, changeable between runs): UNPINNED by default, the configured ones with no verifier pinned, since the fake registries
- * report a made-up verifier whatever the configuration pins.
+ * (`seedEpoch: false` leaves the states empty). `state.cut` is a set of what the watchdog's network cannot reach: "relays" and/or
+ * "rpc". `networks` are the networks watched (`state.networks`, changeable between runs): UNPINNED by default, the configured ones
+ * with no verifier pinned, since the fake registries report a made-up verifier whatever the configuration pins.
  */
-function harness({ recipes = [], env = TELEGRAM, networks, catalog = PRE_SWITCH_CATALOG, seedEpoch = true } = {}) {
+function harness({ env = TELEGRAM, networks, catalog = PRE_SWITCH_CATALOG, seedEpoch = true } = {}) {
   const storage = memoryStorage();
-  if (recipes.length > 0) withAirnodeConfigured(storage);
   const world = drandWorld({ now: NOW });
   const registries = Object.fromEntries(Object.values(NETWORKS).map((net) => [net.name, registryOf(net)]));
   for (const registry of Object.values(registries)) registry.catalog = catalog;
@@ -82,7 +64,7 @@ function harness({ recipes = [], env = TELEGRAM, networks, catalog = PRE_SWITCH_
     if (cut.has(relay ? "relays" : "rpc") && !url.startsWith("https://api.telegram.org/")) throw new TypeError("fetch failed");
     return beacon.fetch(url, init);
   };
-  const state = { recipes, networks, cut, runBeaconImpl: undefined, readChainImpl: async (net) => healthyRead(net) };
+  const state = { networks, cut, runBeaconImpl: undefined, readChainImpl: async (net) => healthyRead(net) };
   const run = (minutes) => {
     world.now = NOW + Math.round(minutes * 60);
     return runCron({
@@ -94,11 +76,10 @@ function harness({ recipes = [], env = TELEGRAM, networks, catalog = PRE_SWITCH_
       readAgentApiImpl: async (net) => agentApiPoll({}, net),
       runBeaconImpl: state.runBeaconImpl,
       networks: state.networks ?? UNPINNED,
-      recipes: state.recipes,
     });
   };
   const texts = () => telegram.flatMap((m) => m.text.split("\n\n"));
-  const status = (minutes = 0) => buildStatus(storage, env, NOW + minutes * 60, state.recipes, state.networks ?? UNPINNED);
+  const status = (minutes = 0) => buildStatus(storage, env, NOW + minutes * 60, state.networks ?? UNPINNED);
   const setCatalog = (value) => {
     for (const registry of Object.values(registries)) registry.catalog = value;
   };
@@ -145,8 +126,8 @@ test("before the registry lists a beacon nothing is raised, however long it take
   assert.ok(pageText(renderHtml(status)).includes("Registry · arc-mainnet Not registered yet recipe 11 · catalog: no drand · checked 1m ago"));
 });
 
-test("before the switch an outage is a warning, whatever else is configured: no catalog in force lists the beacon, so nothing depends on it", async () => {
-  const h = harness({ recipes: [AIRNODE] });
+test("before the switch an outage is a warning: no catalog in force lists the beacon, so nothing depends on it", async () => {
+  const h = harness();
   await h.run(0);
   all(h, { status: 503 });
   await h.run(1);
@@ -197,7 +178,7 @@ test("no relay serves a fresh round: an alarm after two runs in a row, a service
   ]);
 });
 
-test("how serious an outage is comes from the catalog in force on the chain, not from what the watchdog has configured", async () => {
+test("how serious an outage is comes from the catalog in force on the chain", async () => {
   // A catalog that lists the beacon among other sources: the epochs that select it cannot publish.
   const mixed = harness({ catalog: { recipes: [0, 1, 11] } });
   mixed.register();
@@ -221,20 +202,6 @@ test("how serious an outage is comes from the catalog in force on the chain, not
     `[beacon] ALARM drand beacon down, service stopping: no relay serves a fresh round (${reasonsOf("http 503")}); ` +
       "the catalog in force on arc-testnet lists only the drand beacon, so epoch publication stops there and requests cannot be served until one does",
   ]);
-
-  // The AirnodeHub recipes the watchdog still probes do not decide it: the chain's catalog does, in both directions.
-  const stillProbed = harness({ recipes: [AIRNODE], catalog: DRAND_ONLY_CATALOG });
-  await stillProbed.run(0);
-  all(stillProbed, { status: 503 });
-  await stillProbed.run(1);
-  await stillProbed.run(2);
-  assert.match(stillProbed.texts()[0], /^\[beacon\] ALARM drand beacon down, service stopping: /);
-  const retired = harness({ recipes: [] });
-  await retired.run(0);
-  all(retired, { status: 503 });
-  await retired.run(1);
-  await retired.run(2);
-  assert.match(retired.texts()[0], /^\[beacon\] WARNING drand beacon down: /);
 });
 
 test("a catalog that changes during an outage changes the alert's level: a rise is notified, a fall is silent", async () => {
@@ -1059,13 +1026,13 @@ test("status HTML: a drand beacon section with the relays, the registries and th
   assert.ok(text.includes(`api3.drand.sh drand-evmnet WARNING #${round} 0 rounds (0s) 0s ago differs · info ok`));
   assert.ok(text.includes(`round ${round - 1}: signature `));
   assert.match(html, /<p class="pill warning">/);
-  // The section sits between the networks and the AirnodeHub listings, and each tone is a class, not just a word.
+  // The section follows the networks, and each tone is a class, not just a word.
   assert.ok(html.indexOf("Agent API · arc-testnet") < html.indexOf(">drand beacon<"));
   assert.match(html, /<span class="warning">differs<\/span>/);
   assert.match(html, /<dd class="fig ok">3 of 4<\/dd>/);
   assert.match(html, /<dd class="fig warning">MISMATCH<\/dd>/);
   assert.match(html, /<dd class="fig muted">Not registered yet<\/dd>/);
-  assert.ok(!text.includes("AirnodeHub + drand"), "the catalog is each registry's own caption now");
+  assert.ok(!text.includes("AirnodeHub"));
 });
 
 test("status HTML: an alarm shows as one, a beacon not yet checked as such, and nothing a store holds reaches the page unescaped", async () => {
@@ -1095,39 +1062,29 @@ test("status HTML: an alarm shows as one, a beacon not yet checked as such, and 
   const network = { checkedAt: NOW, readOk: true, registration: "registered", verdict: "mismatch", verdictReason: hostile, everRegistered: true, verify: { outcome: "invalid", failures: 2, round: 5, reason: hostile, rejectedRound: 5, rejectedReason: hostile } };
   writeBeaconState(rows, "group:drand-evmnet", NOW, group);
   writeBeaconState(rows, "network:arc-mainnet", NOW, network);
-  const hostileHtml = renderHtml(buildStatus(rows, {}, NOW + 10, [], NETWORKS));
+  const hostileHtml = renderHtml(buildStatus(rows, {}, NOW + 10, NETWORKS));
   assert.ok(hostileHtml.includes("&lt;b&gt;x&lt;/b&gt; &quot;&amp;&#39;"));
   assert.ok(!hostileHtml.includes("<b>x</b>"));
 });
 
-test("the AirnodeHub section and key stay while recipes are configured and go with the last of them; the page description follows", async () => {
-  const h = harness({ recipes: [AIRNODE] });
+test("the beacon section and key are there while a network lists a beacon; the page description follows", async () => {
+  const h = harness();
   await h.run(0);
-  const both = h.status();
-  assert.deepEqual(Object.keys(both), ["service", "generatedAt", "notifier", "networks", "beacon", "airnodehub", "recentMessages"]);
-  assert.equal(both.beacon.catalogDrandOnly, false);
-  const bothHtml = renderHtml(both);
-  assert.ok(pageText(bothHtml).includes("AirnodeHub listings"));
-  assert.ok(bothHtml.includes('content="Live health of the D20DAO VRF keepers, agent API, drand beacon and AirnodeHub listings on Arc."'));
-  assert.ok(bothHtml.indexOf(">drand beacon<") < bothHtml.indexOf(">AirnodeHub listings<"));
-
-  // With no recipe configured the AirnodeHub section is gone; what the catalog is comes from the chain, not from that list.
-  const drandOnly = buildStatus(h.storage, TELEGRAM, NOW + 60, [], undefined);
-  assert.deepEqual(Object.keys(drandOnly), ["service", "generatedAt", "notifier", "networks", "beacon", "recentMessages"]);
-  assert.equal(drandOnly.beacon.catalogDrandOnly, false, "the catalog in force still lists sources other than the beacon");
+  const status = buildStatus(h.storage, TELEGRAM, NOW + 60);
+  assert.deepEqual(Object.keys(status), ["service", "generatedAt", "notifier", "networks", "beacon", "recentMessages"]);
+  assert.equal(status.beacon.catalogDrandOnly, false, "the catalog in force still lists sources other than the beacon");
   h.setCatalog(DRAND_ONLY_CATALOG);
   await h.run(1);
-  assert.equal(buildStatus(h.storage, TELEGRAM, NOW + 120, [], undefined).beacon.catalogDrandOnly, true);
-  assert.equal(buildStatus(h.storage, TELEGRAM, NOW + 120, [AIRNODE], undefined).beacon.catalogDrandOnly, true, "and a recipe still configured does not change it");
-  const html = renderHtml(drandOnly);
+  assert.equal(buildStatus(h.storage, TELEGRAM, NOW + 120).beacon.catalogDrandOnly, true, "what the catalog is comes from the chain");
+  const html = renderHtml(status);
   assert.ok(!pageText(html).includes("AirnodeHub"));
   assert.ok(html.includes('content="Live health of the D20DAO VRF keepers, agent API and drand beacon on Arc."'));
   assert.equal((html.match(/Live health of the D20DAO/g) ?? []).length, 3, "description, og:description and twitter:description");
 
-  // No beacon and no AirnodeHub recipe: the keepers and the agent API only.
+  // No beacon: the keepers and the agent API only.
   const { beacon: a, ...bareMainnet } = MAINNET;
   const { beacon: b, ...bareTestnet } = TESTNET;
-  const bare = buildStatus(memoryStorage(), {}, NOW, [], { "arc-mainnet": bareMainnet, "arc-testnet": bareTestnet });
+  const bare = buildStatus(memoryStorage(), {}, NOW, { "arc-mainnet": bareMainnet, "arc-testnet": bareTestnet });
   assert.deepEqual(Object.keys(bare), ["service", "generatedAt", "notifier", "networks", "recentMessages"]);
   assert.ok(renderHtml(bare).includes('content="Live health of the D20DAO VRF keepers and agent API on Arc."'));
 });
@@ -1137,13 +1094,12 @@ test("the AirnodeHub section and key stay while recipes are configured and go wi
 
 test("subrequest budget: the beacon adds at most 13 to a run and 10 in the steady state, and a day of runs stays inside it", async () => {
   // Static worst case of one run: every RPC round falls back on both networks (3 rounds x 2 endpoints), a /health poll per
-  // network, 3 Telegram sends, a full set of AirnodeHub probe tasks, and the beacon's worst case (see beaconWorstSubrequests).
+  // network, 3 Telegram sends, and the beacon's worst case (see beaconWorstSubrequests).
   const chainAndAgent = Object.keys(NETWORKS).length * (3 * 2 + 1);
-  const worst = chainAndAgent + LIMITS.telegramMaxSendsPerRun + LIMITS.probeMaxPerRun + beaconWorstSubrequests(NETWORKS);
+  const worst = chainAndAgent + LIMITS.telegramMaxSendsPerRun + beaconWorstSubrequests(NETWORKS);
   assert.equal(beaconWorstSubrequests(NETWORKS), 13);
-  assert.equal(worst, 14 + 3 + 5 + 13);
+  assert.equal(worst, 14 + 3 + 13);
   assert.ok(worst <= 50, `worst case ${worst}`);
-  assert.equal(worst - LIMITS.probeMaxPerRun, 30, "once the AirnodeHub probes are retired");
 
   // A healthy day, one run a minute, for both networks: the two chain reads and two agent API polls the harness stands
   // in with make 6; the beacon adds 4 latest rounds, 4 earlier rounds and 2 registry batches, and one chain info a few times a day.

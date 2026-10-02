@@ -286,6 +286,21 @@ test("committer and implementation slots", () => {
   }
 });
 
+test("each network accepts only the live implementations: the retired coordinator and registry alarm", () => {
+  const live = { coordinator: "0xD20da000125643B4db5A6A36A3b853c17745DF44", registry: "0xD20dA0853a6f894c0cdc9018fD4F8F67Eac15704" };
+  const retired = { coordinator: "0xd20da0DADa4352A1a9722be43a2D85923443458c", registry: "0xd20dA048C969e5aDcC703Dfdf8220cc9dCB2f865" };
+  for (const net of [MAINNET, TESTNET]) {
+    assert.deepEqual(net.implementations, { coordinator: [live.coordinator], registry: [live.registry] }, net.name);
+    const current = evaluateChainChecks(net, healthyRead(net, { coordinatorImpl: live.coordinator.toLowerCase(), registryImpl: live.registry.toLowerCase() }));
+    assert.deepEqual([severity(current.coordinator_impl), severity(current.registry_impl)], ["clear", "clear"], net.name);
+    const old = evaluateChainChecks(net, healthyRead(net, { coordinatorImpl: retired.coordinator, registryImpl: retired.registry }));
+    assert.equal(old.coordinator_impl.severity, "alarm", net.name);
+    assert.equal(old.coordinator_impl.detail, `ERC-1967 slot is ${retired.coordinator}, expected ${live.coordinator}`);
+    assert.equal(old.registry_impl.severity, "alarm", net.name);
+    assert.equal(old.registry_impl.detail, `ERC-1967 slot is ${retired.registry}, expected ${live.registry}`);
+  }
+});
+
 test("a listed implementation is accepted, so an approved upgrade raises no alarm", () => {
   const current = "0x00000000000000000000000000000000000000c1";
   const next = "0x00000000000000000000000000000000000000c2";
@@ -345,7 +360,7 @@ test("watchdog RPC failures warn after 3 consecutive runs", () => {
   assert.equal(c.detail, "3 consecutive runs failed (last error: http 429)");
 });
 
-test("a listed registry implementation is accepted, so the upgrade for the beacon raises no alarm before it executes", () => {
+test("a listed registry implementation is accepted, so an upgrade raises no alarm before it executes", () => {
   const current = [].concat(MAINNET.implementations.registry)[0];
   const next = "0x00000000000000000000000000000000000000d2";
   const net = { ...MAINNET, implementations: { ...MAINNET.implementations, registry: [current, next] } };

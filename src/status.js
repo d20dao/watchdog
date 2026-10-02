@@ -12,21 +12,17 @@ import {
   evaluateBeaconRelay,
   evaluateBeaconVerifier,
   evaluateBeaconVerify,
-  evaluateListingDocumentCheck,
-  evaluateProbeCheck,
   isAgentApiCheck,
 } from "./checks.js";
-import { AIRNODE_RECIPES, AIRNODE_SCOPE, BEACON_SCOPE, LIMITS, NETWORKS, THRESHOLDS, watchedAgentApi } from "./config.js";
+import { BEACON_SCOPE, NETWORKS, THRESHOLDS, watchedAgentApi } from "./config.js";
 import { formatDuration, formatGwei, formatUsdc, shortAddress } from "./format.js";
 import { ICONS } from "./icons.js";
-import { describeShape } from "./listings.js";
 import {
   readAgentApiState,
   readAlerts,
   readBackupReportState,
   readBeaconStates,
   readChainState,
-  readProbeStates,
   readReportState,
   recentMessages,
 } from "./store.js";
@@ -73,54 +69,6 @@ const alertView = (now) => (a) => ({
   activeSeconds: age(now, a.since),
   event: a.event,
 });
-
-/** Probe results per AirnodeHub recipe. Reasons are short texts built by the probe, never reply bodies. */
-function listingStatus(storage, now, recipes) {
-  const states = readProbeStates(storage);
-  return {
-    probeIntervalSeconds: LIMITS.probeIntervalSeconds,
-    listingDocumentIntervalSeconds: LIMITS.listingDocumentIntervalSeconds,
-    recipes: recipes.map((recipe) => {
-      const s = states.get(recipe.id) ?? null;
-      const probe = evaluateProbeCheck(recipe, s);
-      const doc = s?.document ?? null;
-      const docAlert = evaluateListingDocumentCheck(recipe, s);
-      return {
-        id: recipe.id,
-        name: recipe.name,
-        registryRecipe: recipe.recipe,
-        url: recipe.url,
-        operation: recipe.passthrough?.operation ?? recipe.body.operation,
-        form: recipe.passthrough ? "passthrough" : "post",
-        signer: recipe.signer,
-        expectedData: describeShape(recipe.shape),
-        status: s ? (probe ? probe.severity : "ok") : "not probed",
-        lastProbeAt: s?.probedAt ?? null,
-        lastProbeAgeSeconds: age(now, s?.probedAt),
-        latencyMs: s?.latencyMs ?? null,
-        lastOutcome: s?.outcome ?? null,
-        reason: s?.reason ?? null,
-        consecutiveFailures: s?.failures ?? 0,
-        verdict: s?.verdict ?? null,
-        verdictReason: s?.verdictReason ?? null,
-        lastOkAt: s?.lastOkAt ?? null,
-        signedLagSeconds: s?.outcome === "ok" ? s.signedLagSeconds ?? null : null,
-        nextProbeAt: s?.nextProbeAt ?? null,
-        listingDocument: doc
-          ? {
-              status: docAlert ? "alarm" : doc.verdict ? "ok" : "unknown",
-              checkedAt: doc.checkedAt,
-              checkedAgeSeconds: age(now, doc.checkedAt),
-              lastOutcome: doc.outcome,
-              reason: doc.reason,
-              nextCheckAt: doc.nextCheckAt,
-            }
-          : null,
-      };
-    }),
-    alerts: readAlerts(storage, AIRNODE_SCOPE).map(alertView(now)),
-  };
-}
 
 /**
  * The x402 agent API of one network: the watchdog's own on-chain read of the relayer balance and the sanitized
@@ -330,7 +278,7 @@ function beaconStatus(storage, now, nets) {
   };
 }
 
-export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets = NETWORKS) {
+export function buildStatus(storage, env, now, nets = NETWORKS) {
   const networks = {};
   for (const name of Object.keys(nets)) {
     const net = nets[name];
@@ -394,9 +342,8 @@ export function buildStatus(storage, env, now, recipes = AIRNODE_RECIPES, nets =
     generatedAt: now,
     notifier: notifierConfigured(env) ? "configured" : "not configured",
     networks,
-    // Each section is there while it is configured: a network's beacon, and any AirnodeHub recipe.
+    // The beacon section is there while a network lists a beacon.
     ...(beacon ? { beacon } : {}),
-    ...(recipes.length > 0 ? { airnodehub: listingStatus(storage, now, recipes) } : {}),
     recentMessages: recentMessages(storage, 10).map((m) => ({
       at: m.created_at,
       network: m.network,
@@ -416,7 +363,6 @@ const utc = (t) => `${new Date(t * 1000).toISOString().replace("T", " ").slice(0
 // Tones are fixed class names; stored values only ever select one of them and never reach markup themselves.
 const TONES = { ok: "ok", warning: "warning", alarm: "alarm", muted: "muted" };
 const LABELS = { ok: "OK", warning: "WARNING", alarm: "ALARM" };
-const DOCUMENT_VIEW = { ok: ["ok", "ok"], alarm: ["MISMATCH", "alarm"] };
 
 const pick = (map, key) => (typeof key === "string" && Object.hasOwn(map, key) ? map[key] : undefined);
 const cls = (...names) => {
@@ -607,40 +553,6 @@ function agentApiSection(name, a) {
   );
 }
 
-function listingRow(r) {
-  const probed = r.status !== "not probed";
-  const status = probed ? state(r.status, label(r.status)) : `<span class="muted">not probed yet</span>`;
-  const d = r.listingDocument;
-  let doc = "—";
-  if (d) {
-    const [text, tone] = pick(DOCUMENT_VIEW, d.status) ?? [String(d.status), "muted"];
-    doc = `<span class="${tone}">${escapeHtml(text)}</span> · ${escapeHtml(ago(d.checkedAgeSeconds))}`;
-  }
-  const notes = [];
-  if (r.reason) notes.push(r.consecutiveFailures > 0 ? `${r.reason} (${r.consecutiveFailures} failed in a row)` : r.reason);
-  if (r.verdict && r.verdict !== "ok" && r.verdictReason && r.verdictReason !== r.reason) notes.push(r.verdictReason);
-  if (d?.reason) notes.push(String(d.reason).startsWith("listing document") ? d.reason : `listing document: ${d.reason}`);
-  return (
-    `<tbody><tr><th scope="row">${escapeHtml(r.name)}<small>recipe ${escapeHtml(r.registryRecipe)} · ${escapeHtml(r.operation)}</small></th>` +
-    `<td>${status}</td><td>${probed ? escapeHtml(ago(r.lastProbeAgeSeconds)) : "—"}</td>` +
-    `<td>${r.latencyMs == null ? "—" : `${escapeHtml(r.latencyMs)} ms`}</td><td>${doc}</td></tr>` +
-    (notes.length ? `<tr class="note"><td colspan="5">${notes.map(escapeHtml).join("<br>")}</td></tr>` : "") +
-    `</tbody>`
-  );
-}
-
-function listingsSection(listings) {
-  const caption = `Probed every ${formatDuration(listings.probeIntervalSeconds)} · listing documents every ${formatDuration(listings.listingDocumentIntervalSeconds)}`;
-  return (
-    `<section class="section">` +
-    sectionHead("AirnodeHub listings", listings.alerts, { caption }) +
-    `<div class="scroll" tabindex="0" role="region" aria-label="AirnodeHub listings"><table class="table">` +
-    `<thead><tr><th scope="col">Listing</th><th scope="col">Status</th><th scope="col">Probed</th><th scope="col">Latency</th><th scope="col">Document</th></tr></thead>` +
-    listings.recipes.map(listingRow).join("") +
-    `</table></div></section>`
-  );
-}
-
 const REGISTRATION_VIEW = {
   registered: ["Registered", "ok"],
   "not registered yet": ["Not registered yet", "muted"],
@@ -732,8 +644,8 @@ const BRAND_MARK =
 // share image and X handle, and its icon set (served by this Worker, see icons.js). Indexable, like the site.
 const PAGE_URL = "https://watchdog.d20dao.org";
 const TITLE = "Arc VRF status | D20DAO";
-const DESCRIPTION_PARTS = { beacon: "drand beacon", airnodehub: "AirnodeHub listings" };
-/** "Live health of the D20DAO VRF keepers, agent API, drand beacon and AirnodeHub listings on Arc.", for the sections shown. */
+const DESCRIPTION_PARTS = { beacon: "drand beacon" };
+/** "Live health of the D20DAO VRF keepers, agent API and drand beacon on Arc.", for the sections shown. */
 function describe(status) {
   const parts = ["VRF keepers", "agent API", ...Object.keys(DESCRIPTION_PARTS).filter((key) => status[key]).map((key) => DESCRIPTION_PARTS[key])];
   return `Live health of the D20DAO ${parts.slice(0, -1).join(", ")} and ${parts.at(-1)} on Arc.`;
@@ -842,11 +754,10 @@ export function renderHtml(status) {
   const sections =
     Object.entries(status.networks)
       .map(([name, n]) => networkSection(name, n) + (n.agentApi?.enabled ? agentApiSection(name, n.agentApi) : ""))
-      .join("") + (status.beacon ? beaconSection(status.beacon) : "") + (status.airnodehub ? listingsSection(status.airnodehub) : "");
+      .join("") + (status.beacon ? beaconSection(status.beacon) : "");
   const alerts = [
     ...Object.values(status.networks).flatMap((n) => [...n.alerts, ...(n.agentApi?.alerts ?? [])]),
     ...(status.beacon?.alerts ?? []),
-    ...(status.airnodehub?.alerts ?? []),
   ];
   const overall = worstOf(alerts);
   return `<!doctype html>

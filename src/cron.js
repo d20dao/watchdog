@@ -1,6 +1,6 @@
-// One watchdog run: read both chains, poll each watched x402 agent API, read the drand beacon's relays and registries
-// and run any due AirnodeHub listing probes (network I/O, no storage held), then evaluate and commit every state change
-// in one synchronous transaction, then deliver queued Telegram messages.
+// One watchdog run: read both chains, poll each watched x402 agent API and read the drand beacon's relays and registries
+// (network I/O, no storage held), then evaluate and commit every state change in one synchronous transaction, then deliver
+// queued Telegram messages.
 
 import { applyAgentApiPoll, readAgentApi } from "./agentapi.js";
 import { alertKey, transition } from "./alerts.js";
@@ -22,20 +22,14 @@ import {
   evaluateBackupReportChecks,
   evaluateBeaconChecks,
   evaluateChainChecks,
-  evaluateListingDocumentCheck,
-  evaluateProbeCheck,
   evaluateReportChecks,
   evaluateRpcCheck,
-  listingCheckName,
   networkCheckNames,
-  probeCheckName,
 } from "./checks.js";
-import { AIRNODE_RECIPES, AIRNODE_SCOPE, BEACON_SCOPE, LIMITS, NETWORKS, watchedAgentApi } from "./config.js";
-import { applyDocumentResult, applyProbeResult, failedTaskResult, planProbeTasks } from "./listings.js";
+import { BEACON_SCOPE, LIMITS, NETWORKS, watchedAgentApi } from "./config.js";
 import { readChain } from "./rpc.js";
 import {
   deleteBeaconState,
-  deleteProbeState,
   enqueueMessage,
   expireMessages,
   markDroppedAlerted,
@@ -48,29 +42,13 @@ import {
   readBackupReportState,
   readBeaconStates,
   readChainState,
-  readProbeStates,
   readReportState,
   saveAlert,
   writeAgentApiState,
   writeBeaconState,
   writeChainState,
-  writeProbeState,
 } from "./store.js";
 import { chatIdFor, groupMessages, notifierConfigured, sendTelegram } from "./telegram.js";
-
-// The probe module carries the secp256k1 and keccak code; importing it lazily keeps it out of Worker startup.
-const loadProbeModule = () => import("./probe.js");
-
-/** Run planned probe tasks. Every task gets a result, even when the probe module cannot be loaded. */
-async function runProbes(tasks, { fetch, clock, loadProbes }) {
-  if (tasks.length === 0) return [];
-  try {
-    const { runProbeTasks } = await loadProbes();
-    return await runProbeTasks(tasks, { fetch, clock });
-  } catch {
-    return tasks.map((task) => failedTaskResult(task, "internal error"));
-  }
-}
 
 /**
  * The beacon's plan. A configuration or stored state it cannot plan from leaves the run without the beacon (`failed`), never
@@ -106,15 +84,12 @@ export async function runCron({
   readAgentApiImpl = readAgentApi,
   runBeaconImpl = runBeacon,
   networks: nets = NETWORKS,
-  recipes = AIRNODE_RECIPES,
-  loadProbes = loadProbeModule,
 }) {
   const names = Object.keys(nets);
   const cursors = names.map((name) => {
     const prev = readChainState(storage, name);
     return prev ? { logCursor: prev.logCursor, logSpan: prev.logSpan } : null;
   });
-  const tasks = planProbeTasks(recipes, readProbeStates(storage), Math.floor(clock() / 1000));
   const beaconPlan = planBeaconChecks(nets, storage, Math.floor(clock() / 1000));
 
   // Every chain read starts at once. The beacon's registry batch needs its network's head block and waits for that read only
@@ -131,7 +106,7 @@ export async function runCron({
     return read?.ok && read.block ? read.block.number : null;
   };
 
-  const [reads, polls, probeResults, beaconRun] = await Promise.all([
+  const [reads, polls, beaconRun] = await Promise.all([
     Promise.all(chainReads),
     // One /health GET per watched agent API; null for a network whose agent API is not watched.
     Promise.all(
@@ -144,7 +119,6 @@ export async function runCron({
         }
       }),
     ),
-    runProbes(tasks, { fetch, clock, loadProbes }),
     // The drand relays and each network's registry: shared work, read once however many networks list the beacon.
     runBeaconChecks(beaconPlan, { fetch, clock, runBeaconImpl, headOf }),
   ]);
@@ -215,14 +189,12 @@ export async function runCron({
         messages,
       };
     });
-    const airnodehub = commitProbes(storage, recipes, tasks, probeResults, now, deliverable);
-    enqueued += airnodehub.messages.length;
     const beacon = commitBeacon(storage, beaconPlan, beaconRun, now, deliverable);
     enqueued += beacon.messages.length;
     pruneReports(storage, now - LIMITS.reportRetentionSeconds);
     expireMessages(storage, now);
     if (enqueued > 0) pruneMessages(storage);
-    return { networks, airnodehub, beacon, enqueued };
+    return { networks, beacon, enqueued };
   });
 
   let delivered = 0;
@@ -256,63 +228,12 @@ export async function runCron({
     at: now,
     notifier: deliverable ? "configured" : "not configured",
     networks: outcome.networks,
-    airnodehub: outcome.airnodehub,
     beacon: outcome.beacon,
     messagesQueued: outcome.enqueued,
     messagesDelivered: delivered,
     deliveryError,
-    // Each probe task and each agent API poll is exactly one fetch; the beacon run counts its own.
-    subrequests: chainSubrequests + polls.filter(Boolean).length + tasks.length + beaconRun.subrequests + telegramSubrequests,
-  };
-}
-
-/** Store probe results, evaluate the probe alerts and queue their messages. Runs inside the run's transaction. */
-function commitProbes(storage, recipes, tasks, results, now, deliverable) {
-  const states = readProbeStates(storage);
-  const changed = new Set();
-  const probes = [];
-  tasks.forEach((task, i) => {
-    const result = results[i];
-    if (task.kind === "probe") {
-      const recipe = task.recipes[0];
-      states.set(recipe.id, applyProbeResult(states.get(recipe.id) ?? null, result, now, task.phase));
-      changed.add(recipe.id);
-      probes.push({ recipe: recipe.id, outcome: result.outcome, reason: result.reason ?? null, latencyMs: result.latencyMs ?? null });
-    } else {
-      task.recipes.forEach((recipe, j) => {
-        states.set(recipe.id, applyDocumentResult(states.get(recipe.id) ?? null, result.results[j], result.latencyMs, now, task.phase));
-        changed.add(recipe.id);
-      });
-      probes.push({ listingDocument: task.url, outcomes: result.results.map((r) => r.outcome), latencyMs: result.latencyMs ?? null });
-    }
-  });
-  for (const id of changed) writeProbeState(storage, id, now, states.get(id));
-  const configured = new Set(recipes.map((recipe) => recipe.id));
-  for (const id of states.keys()) if (!configured.has(id)) deleteProbeState(storage, id);
-
-  const conditions = new Map();
-  for (const recipe of recipes) {
-    const state = states.get(recipe.id) ?? null;
-    conditions.set(probeCheckName(recipe), evaluateProbeCheck(recipe, state));
-    conditions.set(listingCheckName(recipe), evaluateListingDocumentCheck(recipe, state));
-  }
-  const existing = new Map(readAlerts(storage, AIRNODE_SCOPE).map((row) => [row.check, row]));
-  // A recipe removed from the configuration resolves its alerts.
-  for (const check of existing.keys()) if (!conditions.has(check)) conditions.set(check, null);
-
-  const messages = [];
-  for (const [check, condition] of conditions) {
-    const step = transition(existing.get(check) ?? null, condition, now, AIRNODE_SCOPE, check);
-    if (step.write) saveAlert(storage, alertKey(AIRNODE_SCOPE, check), step.row);
-    if (step.message) {
-      enqueueMessage(storage, now, AIRNODE_SCOPE, step.message.severity, step.message.text, deliverable);
-      messages.push(step.message.text);
-    }
-  }
-  return {
-    probes,
-    activeAlerts: [...conditions].filter(([, condition]) => condition).map(([check]) => check),
-    messages,
+    // Each agent API poll is exactly one fetch; the beacon run counts its own.
+    subrequests: chainSubrequests + polls.filter(Boolean).length + beaconRun.subrequests + telegramSubrequests,
   };
 }
 

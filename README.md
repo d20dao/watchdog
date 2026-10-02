@@ -8,9 +8,8 @@ This Worker runs on Cloudflare instead. It:
 1. receives each keeper's outbound health reports (`POST /v1/health/<network>`), and its backup's (`POST /v1/health/<network>/backup`),
 2. reads both chains every minute,
 3. polls the public `/health` of the x402 agent API every minute, on each network where it is enabled,
-4. watches the drand beacon the epoch registry is switching to: its relays every minute, and each registry's registration of it,
-5. probes the AirnodeHub listings the epoch registry depends on, once an hour each,
-6. posts to the operator Telegram chat with its own bot token.
+4. watches the drand beacon the epoch registry publishes epochs from: its relays every minute, and each registry's registration of it,
+5. posts to the operator Telegram chat with its own bot token.
 
 ```
 keeper (arc-mainnet) ──POST /v1/health/arc-mainnet─────────┐
@@ -22,17 +21,15 @@ backup (arc-testnet) ──POST /v1/health/arc-testnet/backup──┤
            cron * * * * *            ──RPC──►    ├─ JSON-RPC batches to Arc (Blockdaemon, then public)
            GET / and /status.json    ──RPC──►    ├─ GET /health of the x402 agent API
                                                  ├─ drand beacon: GET on the relays, registration read from each registry
-                                                 ├─ AirnodeHub listing probes (signed POST, OpenAPI GET)
                                                  ├─ threshold checks and alert lifecycle
                                                  └─ Telegram sendMessage
 ```
 
 All state lives in one SQLite-backed Durable Object (the account token has no D1 or KV rights).
-The few ABI encodings and decodings are written by hand in `src/abi.js`. The only runtime dependencies are
-`@noble/curves` and `@noble/hashes` (pinned exact versions): they verify AirnodeHub signatures, and `@noble/hashes`
-derives the drand beacon's slot signer. `src/cron.js` imports the module that uses them for the probes (`src/probe.js`)
-lazily, and `src/beacon.js` loads the hash code only once a registry lists a beacon, so their code is evaluated only
-inside the Durable Object, never in the Worker entry. No pairing code is bundled.
+The few ABI encodings and decodings are written by hand in `src/abi.js`. The only runtime dependency is
+`@noble/hashes` (pinned exact version): it derives the drand beacon's slot signer. `src/beacon.js` loads the hash code
+only once a registry lists a beacon, so it is evaluated only inside the Durable Object, never in the Worker entry. No
+pairing code is bundled.
 
 ## Checks
 
@@ -52,7 +49,7 @@ These run every minute for each network. Thresholds live in `src/config.js` (`TH
 | `backup_role`: backup's latest report has a `health.role` other than `follower` | — | alarm |
 | `base_fee`: 2 × baseFee + 1 gwei against the fee cap (mainnet 2000 gwei, testnet 100 gwei) | > 60 % | > 85 % |
 | `committer`: registry `committer()` ≠ keeper wallet | — | alarm |
-| `coordinator_impl`, `registry_impl`: ERC-1967 implementation slot is not an expected one. Each is a list in `src/config.js`: append an upgrade's implementation before it executes, see [Registry upgrade](#registry-upgrade-and-retiring-the-airnodehub-probes) | — | alarm |
+| `coordinator_impl`, `registry_impl`: ERC-1967 implementation slot is not an expected one. Each is a list in `src/config.js`: append an upgrade's implementation before it executes, see [Registry upgrade](#registry-upgrade) | — | alarm |
 | `foreign_submitter`: `RandomnessFulfilled` whose submitter is neither the keeper nor a configured backup keeper | one-shot notice | — |
 | `rpc`: watchdog chain read failed or was partial for ≥ 3 consecutive runs | "watchdog cannot read chain" | — |
 | `dropped_events`: keeper `droppedTotal` increased (the receiver contract asks receivers to alert on dropped counts) | one-shot notice | — |
@@ -111,11 +108,11 @@ mainnet, 0.09 on testnet). The balance thresholds, one value per network in `THR
 
 ## drand beacon monitor
 
-The epoch registry (`EpochEntropy`) is switching its source from AirnodeHub listings to the drand evmnet beacon: one beacon recipe (id 11 on both networks) and no fallback source, so a drand outage stops epoch publication. Every run the watchdog reads the relays that serve the beacon and each registry's registration of it. It verifies no signature itself: the registry's own `verifyBeacon` does, over `eth_call` through the RPC client and batching the chain reads use.
+The epoch registry (`EpochEntropy`) publishes epochs only from the drand evmnet beacon: one beacon recipe (id 11 on both networks) and no fallback source, so a drand outage stops epoch publication. Epochs before the drand switch came from signed API records; the watchdog no longer probes those sources. Every run the watchdog reads the relays that serve the beacon and each registry's registration of it. It verifies no signature itself: the registry's own `verifyBeacon` does, over `eth_call` through the RPC client and batching the chain reads use.
 
 Each network's `beacon` block in `src/config.js` holds the recipe id, the preset (`DRAND_EVMNET`: chain hash, group public key, scheme, period 3 s, genesis 1727521075), the relays (`api.drand.sh`, `api2.drand.sh`, `api3.drand.sh`, `drand.cloudflare.com`) and `verifier`, the beacon verifier contract's address. Relays are shared: each is read once per run, however many networks list it.
 
-**Pin `verifier` before the switch.** It is null until the verifier contract is deployed, because its address is not known yet. While it is null, the rest of `beaconOf` is pinned and the expected slot signer is derived from the verifier the registry itself reports, so the slot signer proves nothing about the verifier: a registry pointed at another contract would still match. Only step 4 below would catch a verifier that accepts what it should not. Set the address on both networks once it is deployed.
+**`verifier` pins the beacon verifier contract** (one address on both networks), compared once the registry reports a registration. Without a pin (null), the rest of `beaconOf` is pinned and the expected slot signer is derived from the verifier the registry itself reports, so the slot signer proves nothing about the verifier: a registry pointed at another contract would still match. Only step 4 below would catch a verifier that accepts what it should not.
 
 Every run, per beacon:
 
@@ -142,7 +139,7 @@ Alerts use the scope `beacon` (messages read `[beacon] ALARM drand beacon down: 
 | `verifier:<network>`: `verifyBeacon` accepts the signature with its last byte flipped (step 4) | — | at once; stays until a check rejects it |
 | `monitor`: an error in the watchdog's own code while reading the relays or a registry, or recording the run | at once | — |
 
-How serious an outage is comes from the catalog in force on the chain, read every run, not from `AIRNODE_RECIPES`. It follows the catalog from run to run: a catalog that changes during an outage changes the level of the alert, and a rise is sent (an alarm sent in the last 30 minutes is not repeated). A catalog that has not been read while the beacon is registered counts as listing the beacon among other sources. A registry that cannot be read (every endpoint failing, another chain id, errors that are not reverts) leaves its checks unknown: alerts are neither resolved nor repeated.
+How serious an outage is comes from the catalog in force on the chain, read every run. It follows the catalog from run to run: a catalog that changes during an outage changes the level of the alert, and a rise is sent (an alarm sent in the last 30 minutes is not repeated). A catalog that has not been read while the beacon is registered counts as listing the beacon among other sources. A registry that cannot be read (every endpoint failing, another chain id, errors that are not reverts) leaves its checks unknown: alerts are neither resolved nor repeated.
 
 Two kinds of run say nothing about the relays and are unknown for them: they add to neither the runs a relay was not fresh nor the runs none was, and no alert is raised on them. One is a run in which the watchdog itself failed (`monitor` warns). The other is a run in which every relay failed with no reply at all (a timeout or a network error) and no registry batch got through either, so the watchdog's own network is not shown to work (the `rpc` check covers that). Reasons are short texts built by the watchdog, such as `http 503`, `timeout`, `latest round 21056964 is 4 rounds (12s) behind the schedule` or `asked for round 21056967, got round 21056968`. Reply bodies are never stored, logged or sent.
 
@@ -150,93 +147,15 @@ Relay fetches have a 5 s timeout and replies are limited to 4 KiB, with at most 
 
 A fault in the beacon stays in the beacon: if it cannot be planned, or its run cannot be worked out or recorded, its rows and alerts stay as they were, the rest of the run is committed as usual, and `monitor` warns.
 
-### Registry upgrade and retiring the AirnodeHub probes
+### Registry upgrade
 
-* **Next registry implementation.** `implementations.registry` in `src/config.js` is a list, like `implementations.coordinator`. Append the drand upgrade's implementation as a second entry before the upgrade executes; otherwise `registry_impl` alarms the moment the proxy points to it. Drop the old entry afterwards.
-* **Pin the verifier** on each network once the beacon verifier contract is deployed, before the switch (see above).
-* **At the switch,** remove the entries of `AIRNODE_RECIPES` in `src/config.js`. On the next run their alerts resolve and their state is deleted, and `airnodehub` leaves `/status.json` and the page. Nothing else changes for the beacon: the alarm becomes the service-stopping one when the registry's catalog lists the beacon alone, which is read from the chain. `test/listings.test.js` and `test/probe.test.js` pin the list and go with it. The `airnodehub` scope and its alert keys are untouched, so nothing stored is orphaned.
-
-## AirnodeHub listing probes
-
-The epoch registry (`EpochEntropy`) accepts an AirnodeHub reply only if its canonical request hash, its signed data
-bytes and its signer match the recipe exactly; otherwise the epoch falls back to the next source. A listing that
-changes or disappears therefore fails silently on chain. The watchdog calls each recipe the way the keeper does
-and alerts before an epoch selects the broken source.
-
-Probed recipes (`AIRNODE_RECIPES` in `src/config.js`):
-
-| Recipe id (registry recipe) | Gateway, operation | Signer | Signed data |
-| --- | --- | --- | --- |
-| `hyperliquid-btc-day-volume` (0) | `airnode-hyperliquid.fly.dev`, `metaAndAssetCtxs` with a projection | `0x509F…665B` | `{"symbol":"BTC","value":"<decimal>"}` |
-| `drpc-ethereum-blockhash` (1) | `airnode-drpc.fly.dev`, `jsonRpc` `eth_call` Multicall3 `getLastBlockHash()` on `ethereum` | `0x511A…2137` | `{"id":null,"jsonrpc":"2.0","result":"0x<64 lowercase hex>"}` |
-| `tickerlayer-btcusd` (2) | `airnode-tickerlayer.fly.dev`, `lastTrade` crypto `BTCUSD` | `0x32f5…9f2c` | `{"symbol":"BTCUSD","price":<number>,"size":<number>,"timestamp":<integer>}` |
-| `nodary-eth-usd` (4) | `airnode-nodary.fly.dev`, `latestFeeds` `ETH/USD` | `0xE70f…E4c0` | `{"ETH/USD":{"value":<number>,"timestamp":<13-digit integer>,"category":"crypto"}}` |
-| `drpc-base-blockhash` (5) | `airnode-drpc.fly.dev`, as recipe 1 on `base` | `0x511A…2137` | as recipe 1 |
-| `<id>-api` (6, 7, 8, 9, 10) | the same five listings through the gateway's passthrough (`/api`), in that order | as their POST / recipe | as their POST / recipe |
-
-AirnodeHub is retiring the `POST /` envelope. Each listing is probed in both forms until the catalog has moved to the
-passthrough recipes: a failing `POST /` probe then signals that the envelope is gone, and the `-api` probes show
-that the recipes replacing it work.
-
-Each probe calls the gateway exactly as the keeper does (15 s timeout, reply at most 16 KiB). A `POST /` recipe posts
-its body and reads the signed envelope. A passthrough recipe sends the provider's own request to `<gateway>/api` +
-path, with the query entries and one `x-airnode-project` parameter per projection entry in canonical order,
-percent-encoded except unreserved characters, and reads the attestation from the `X-Airnode-Address`,
-`X-Airnode-Request-Hash`, `X-Airnode-Timestamp` and `X-Airnode-Signature` headers over the body exactly as received.
-Each reply is checked in order:
-
-1. **Reply:** HTTP 200 with the signed envelope (`airnode`, `requestHash`, `timestamp`, `data`, `signature`) or, for a passthrough recipe, the attestation headers. A timeout, network error, other HTTP status, invalid JSON, an oversized reply, an unsigned `{"error": ...}` or a passthrough answer without attestation headers counts as a *failed probe*.
-2. **Request hash:** `requestHash` = keccak256 of the recipe's canonical request. For a `POST /` recipe that is the AirnodeHub canonical request of the configured body: every object, at any depth, becomes its `[key, value]` entries sorted by key, arrays keep their order, and a `responseProjection` is appended as a third element. For a passthrough recipe it is the JSON of `["passthrough", method, path, query entries sorted by name, body as sent]` with the projection entries sorted by alias as a sixth element. The tests pin each canonical string to `EpochEntropy.recipeRequest`.
-3. **Signer:** `airnode` is the configured signer, and the EIP-191 personal-sign signer of keccak256(abi.encodePacked(bytes32 requestHash, uint256 timestamp, bytes data)) is the configured signer. The data bytes are `data` itself when it is a string, otherwise `JSON.stringify(data)`. Signatures follow OpenZeppelin `ECDSA.recover`: 65 bytes, v 27 or 28, low s.
-4. **Data shape:** the data bytes pass a port of `EpochEntropy._validate` for the recipe: 1 to 128 bytes, exact literals and key order, the same number grammar.
-5. **Signed timestamp:** at most 240 s before the probe (the registry's `MAX_ATTESTATION_AGE`) and at most 60 s after it.
-
-Once a day the watchdog also GETs each gateway's OpenAPI document (one request per gateway URL, covering all its
-recipes). It checks that `x-airnode.address` is the configured signer and that the operation is still offered, still
-accepts every parameter and the projection the recipe sends, and requires no parameter the recipe omits. For a
-passthrough recipe it checks `x-airnode.passthrough.routes`: the operation keeps the method, path template,
-parameter locations and constant body the recipe was built for. A document
-that cannot be read or is in an unrecognized format raises nothing, because the POST probe covers reachability. The
-read is retried an hour later.
-
-Alerts use the scope `airnodehub` (messages read `[airnodehub] ALARM Hyperliquid BTC day volume request hash mismatch: ...`):
-
-| Check (key) | Warning | Alarm |
-| --- | --- | --- |
-| `probe:<id>` failed probes in a row (unreachable, HTTP error, unusable reply) | 2 | 4 |
-| `probe:<id>` request hash, signer, data shape or signed timestamp mismatch | — | immediately; stays active until a probe passes (a failed probe does not clear it) |
-| `listing:<id>` listing document signer mismatch, or operation missing | — | immediately; stays active until a document read shows it fixed |
-
-Reasons are short texts built by the watchdog, such as `http 503`, `gateway signed 0xd5ded974...2e3d, recipe expects
-0xabe6d1ad...abda` or `signature recovers 0x..., catalog expects 0x...`. Reply bodies are never stored, logged or
-sent.
-
-Schedule:
-
-* Recipe *i* of *n* is probed at second *i* × 3600 / *n* of every hour (five recipes: minutes 0, 12, 24, 36 and 48). After a probe that did not pass, the recipe is probed again 10 minutes later. An unreachable listing therefore warns within about 1 h 10 min and alarms within about 1 h 30 min, and a changed listing alarms within the hour.
-* Listing documents are read once a day, gateway *j* of *m* at second *j* × 86400 / *m*. They are read only in runs where no probe is due, so a slot that falls on a probe minute moves to the next run.
-* A recipe that was never probed (new deployment, new recipe) is due at once. A run starts at most 5 probe or document requests, with at most 3 open at a time; the rest wait for the next run.
-* The probes run concurrently with the chain reads, and their results are committed in the same transaction.
-
-Adding a recipe:
-
-1. Add an entry to `AIRNODE_RECIPES` in `src/config.js`: `id` (stable key for state and alerts), `name`, `recipe` (the registry recipe id), `url`, `body` (the request exactly as the keeper sends it), `signer` (the catalog's signer for this recipe) and `shape` (the data grammar of `EpochEntropy._validate` for the recipe; the part types are listed above the array).
-2. Record a real signed reply: POST the body to the gateway and add the line to a fixture in `test/fixtures/`. `test/probe.test.js` shows the pattern: recipes 3, 5 and 7 are configured in `EXTRA_RECIPES` and their real replies pass `evaluateResponse`.
-3. If the registry recipe is new, add its `recipeRequest` literal to `EPOCH_RECIPE_REQUESTS` in `test/helpers.js`, then run `npm test`. The configuration test checks that every configured body canonicalizes to that literal.
-
-The hourly phases of later entries shift when a recipe is inserted, which is harmless. Removing a recipe resolves its
-alerts and deletes its state on the next run.
-
-Known probe limits:
-
-* The signer and the recipe list come from `src/config.js`, not from the registry's on-chain `catalogAt(epoch)`. After `scheduleCatalog` changes the catalog, update the configuration too.
-* A gateway may answer the probe and still fail a keeper call seconds later. The probe shows that the listing and its signing format are intact; it does not measure availability between probes.
+* **Next implementation.** `implementations.coordinator` and `implementations.registry` in `src/config.js` are lists, and every address in one is accepted. Append an upgrade's implementation before it executes; otherwise `coordinator_impl` or `registry_impl` alarms the moment the proxy points to it. Drop the old entry afterwards, so each network accepts only the implementations in use.
 
 ## Alert lifecycle
 
 Each (network, check) pair has one alert row in the Durable Object. Each backup keeper wallet has its own check, so it
 resolves independently of the keeper and of other backups. A wallet removed from `backupKeepers` resolves its alert on the
-next run; an empty `backupKeepers` also resolves the backup health alerts. AirnodeHub probes use `airnodehub` and the drand beacon `beacon` in place of a network:
+next run; an empty `backupKeepers` also resolves the backup health alerts. The drand beacon uses `beacon` in place of a network:
 
 * **First activation:** one message, `[arc-mainnet] WARNING ...` or `[arc-mainnet] ALARM ...`.
 * **Warnings** never repeat.
@@ -314,17 +233,11 @@ Under `beacon` (there while a network lists a beacon) it returns `catalogDrandOn
 * `networks`, one per network: `registration` (`registered`, `mismatch`, `not a beacon`, `not registered yet`, `no longer registered`, `unknown` or `not checked`), `reason`, `recipe` (the one monitored) and `configuredRecipe`, the registry's `verifier` and `slotSigner`, `expectedVerifier`, `catalog` (`use`: `only`, `mixed` or `none`, `epochId`, `recipes`), `verification` (`status`, `lastOutcome`, `round`, `rejectedRound`, `consecutiveRejections`, `lastOkAt`) and `invalidSignatureCheck` (`status`, `lastOutcome`, `round`),
 * the active `beacon` alerts.
 
-Under `airnodehub` (there while `AIRNODE_RECIPES` is not empty) it returns, for each recipe: `status` (`ok`, `warning`, `alarm` or `not probed`), `lastProbeAt`,
-`lastProbeAgeSeconds`, `latencyMs`, `lastOutcome` (`ok`, `failure`, `request_hash`, `signer`, `data_shape` or
-`timestamp`), `reason`, `consecutiveFailures`, the last conclusive `verdict` and `verdictReason`, `lastOkAt`,
-`signedLagSeconds`, `nextProbeAt`, the expected data and `listingDocument` (`status`, `checkedAt`, `lastOutcome`,
-`reason`). It also returns the active `airnodehub` alerts.
-
 It also returns `notifier` (`configured` or `not configured`) and the last 10 notices. It never includes secrets, raw reports or report ids. Responses are edge-cached for 15 s, and query strings are ignored. Browsers get `max-age=15` on a cache hit too: the Worker sets it again, because Cloudflare raises a hit's lower `max-age` to the zone's Browser Cache TTL.
 
 ### `GET /`
 
-The same information as a small server-rendered HTML page, with backup keeper health under the backup balances, an Agent API section after each network whose agent API is watched (up or down, relayer balance, refunds owed, payments in doubt, breakers), a drand beacon section (relays fresh, each registry's registration and catalog, one row per relay with its latest round, lag and checks) and one row per AirnodeHub recipe (status, last probe, latency, reason and listing document). It uses the d20dao.org dark theme with inline CSS and the inline logo, no script, is readable on a phone and refreshes every 60 s. Its head carries the site's title pattern, description, canonical URL, Open Graph and X cards (with the d20dao.org share image) and the site's icons.
+The same information as a small server-rendered HTML page, with backup keeper health under the backup balances, an Agent API section after each network whose agent API is watched (up or down, relayer balance, refunds owed, payments in doubt, breakers), and a drand beacon section (relays fresh, each registry's registration and catalog, one row per relay with its latest round, lag and checks). It uses the d20dao.org dark theme with inline CSS and the inline logo, no script, is readable on a phone and refreshes every 60 s. Its head carries the site's title pattern, description, canonical URL, Open Graph and X cards (with the d20dao.org share image) and the site's icons.
 
 ### `GET /icon.svg`, `/favicon.ico`, `/apple-touch-icon.png`
 
@@ -391,7 +304,7 @@ npm test                                   # node --test, no network
 cp .dev.vars.example .dev.vars             # throwaway values only; git-ignored
 npx wrangler dev --test-scheduled
 curl "http://127.0.0.1:8787/__scheduled?cron=*+*+*+*+*"   # one live read of both networks
-curl http://127.0.0.1:8787/status.json            # beacon.relays and airnodehub.recipes: the first run reads every relay and probes the listings
+curl http://127.0.0.1:8787/status.json            # beacon.relays: the first run reads every relay
 rm .dev.vars
 ```
 
@@ -407,10 +320,7 @@ Layout:
 | `src/agentapi.js` | x402 agent API `/health` poll, the figures kept from it, poll state |
 | `src/rpc.js`, `src/abi.js`, `src/net.js` | JSON-RPC batches with fallback, hand-rolled ABI, timed fetch |
 | `src/checks.js`, `src/alerts.js` | pure threshold evaluation and alert lifecycle |
-| `src/listings.js` | AirnodeHub canonical requests, data shapes, probe schedule and state, listing document check (pure, no dependencies) |
-| `src/probe.js` | AirnodeHub probe requests, request hash and signature recovery (`@noble/*`), loaded lazily by `src/cron.js` |
 | `src/beacon.js` | drand beacon monitor: relay reads, registry batch, judgments, state (`fetch` and the RPC session are injected); loads the hash code on first use |
-| `test/fixtures/airnodehub-samples-2026-09-17.jsonl` | real signed gateway replies, two per catalog recipe |
 | `test/fixtures/drand-evmnet-2026-09-29.json` | real drand evmnet chain info and rounds 1, 21056714, 21056750 and 21056968, as the four relays served them on 2026-09-29; a byte for byte copy of the keeper repository's fixture of the same name |
 | `test/beacon-helpers.js` | a fake drand network and fake registries for the beacon tests |
 | `src/store.js` | SQLite schema and queries |
@@ -426,7 +336,7 @@ npx wrangler deploy
 
 The first deploy creates the `Watchdog` SQLite Durable Object class (migration `v1`), the custom domain `watchdog.d20dao.org` and the `* * * * *` cron trigger. `workers_dev` and preview URLs are disabled.
 
-Schema changes are applied in place when the object starts (`migrate` in `src/store.js`). Missing tables are created (for example `agent_api_state` and `beacon_state`), and columns added since the first deploy are added when missing (for example `chain_state.backup_balances_json`, `chain_state.agent_relayer_balance_wei` and `report_state.role`). Stored rows are kept, and no new migration tag is needed.
+Schema changes are applied in place when the object starts (`migrate` in `src/store.js`). Missing tables are created (for example `agent_api_state` and `beacon_state`), and columns added since the first deploy are added when missing (for example `chain_state.backup_balances_json`, `chain_state.agent_relayer_balance_wei` and `report_state.role`). Stored rows are kept, and no new migration tag is needed. `migrate` also drops a leftover `probe_state` table, with the alerts of its scope, the first time it finds one.
 
 The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an `exports` field for Durable Object classes. The two are mutually exclusive, and moving a deployed Worker to `exports` cannot be reverted.
 
@@ -434,13 +344,13 @@ The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an 
 
 | Limit (free plan) | Usage |
 | --- | --- |
-| Worker CPU 10 ms per invocation | The Worker only routes: report validation plus hashing measured ~0.1–0.4 ms (up to ~1.7 ms on a cold isolate) for 0.5–61 KB reports. The cron handler just calls the Durable Object. The signature code is never evaluated here. Loading the whole 204 KB bundle (parse plus top-level evaluation, Node 24) went from 3.3 ms to 5.9 ms with the probe; this is isolate startup, not per-request work. |
-| Durable Object CPU (30 s per request) | A full run for both networks with replayed live RPC responses measured ~0.4 ms warm and ~1.6 ms cold. A worst-case 5,000-block scan returning 1,000 logs measured ~3.5–5 ms. One AirnodeHub probe (reply parse, request hash, secp256k1 recovery, shape) measured 1.1–2 ms warm. The first probe after the object starts adds ~11 ms of module evaluation and ~7 ms of first verification. A run with all five probes due measured ~9 ms warm and ~39 ms cold; a run with none due adds ~0.06 ms. Parsing and checking the 60 KB Hyperliquid listing document takes ~0.1 ms. The drand beacon monitor's own work (records, signature comparison, ABI, state) measured ~0.3 ms per run warm before a beacon is registered and ~0.45 ms after (two slot signers included), against local fakes; the first slot signer after the object starts adds ~4 ms of module evaluation. |
-| Subrequests 50 per invocation | 2 batches per network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper and agent API relayer balances are extra calls inside the round A batch, so they add no fetches. Each watched agent API adds 1 `/health` poll. AirnodeHub adds ≤ 5 per run (5 at the first run, then 1 in each of 5 runs an hour, plus retries and 4 document reads a day), so ≤ 22 in total. The drand beacon adds 10 in the steady state (4 `latest` reads, 4 earlier-round reads and 1 registry batch per network; the networks share the relays, and the batch holds every call the monitor makes, up to 18, so the catalog and the verifier check add no fetch), 11 in a run that reads a relay's `/info` (the first four runs, then four a day), and ≤ 13 at most (both registries on their second endpoint), so ≤ 35 in total, ≤ 30 once the AirnodeHub probes are retired. |
+| Worker CPU 10 ms per invocation | The Worker only routes: report validation plus hashing measured ~0.1–0.4 ms (up to ~1.7 ms on a cold isolate) for 0.5–61 KB reports. The cron handler just calls the Durable Object. The hash code is never evaluated here. |
+| Durable Object CPU (30 s per request) | A full run for both networks with replayed live RPC responses measured ~0.4 ms warm and ~1.6 ms cold. A worst-case 5,000-block scan returning 1,000 logs measured ~3.5–5 ms. The drand beacon monitor's own work (records, signature comparison, ABI, state) measured ~0.3 ms per run warm before a beacon is registered and ~0.45 ms after (two slot signers included), against local fakes; the first slot signer after the object starts adds ~4 ms of module evaluation. |
+| Subrequests 50 per invocation | 2 batches per network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper and agent API relayer balances are extra calls inside the round A batch, so they add no fetches. Each watched agent API adds 1 `/health` poll, so ≤ 17 in total. The drand beacon adds 10 in the steady state (4 `latest` reads, 4 earlier-round reads and 1 registry batch per network; the networks share the relays, and the batch holds every call the monitor makes, up to 18, so the catalog and the verifier check add no fetch), 11 in a run that reads a relay's `/info` (the first four runs, then four a day), and ≤ 13 at most (both registries on their second endpoint), so ≤ 30 in total. |
 | DO requests 100,000/day | 2 networks × 2 keepers (primary and backup) × 2,880 reports + 1,440 cron runs ≈ 13,000/day, plus status views (edge-cached 15 s). |
-| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. AirnodeHub probe state is 1 row per probe or document read, ≈ 130/day (more while a listing is retried every 10 min). Agent API poll state is 1 row per watched network per run, ≈ 1,440/day each. Alerts and messages only change on transitions. The drand beacon keeps 3 rows a run (its relays, each network), ≈ 4,300/day. Total ≈ 68,000/day with both agent APIs watched. |
-| DO rows read 5,000,000/day | Point lookups plus a few rows per run; probe state and AirnodeHub alerts add about 11 per run (≈ 16,000/day), the beacon's state about 6 (≈ 9,000/day). Well under 100,000/day. |
-| DO duration 13,000 GB-s/day | Billed only while handling a request (RPC wait included): about 1 s × 1,440 runs + ~20 ms × 11,520 reports at 128 MB ≈ 220 GB-s/day. AirnodeHub probes wait alongside the chain reads: 0.1–9 s each (fly.dev cold starts), at most 15 s, so ≤ 120 × 15 s × 0.128 GB ≈ 230 GB-s/day more in the worst case. Agent API polls also wait alongside the chain reads and are bounded by their 10 s timeout. The beacon's three steps (relays, earlier round, registry) run one after another next to them, the last one after its network's chain read as well: about 0.3 s when everything answers, at most about 40 s with a slow chain read and every fetch at its 5 s timeout, so ≈ 55 GB-s/day typically and ≤ 7,400 GB-s/day at the worst. Timers are cleared so the object can hibernate. |
+| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. Agent API poll state is 1 row per watched network per run, ≈ 1,440/day each. Alerts and messages only change on transitions. The drand beacon keeps 3 rows a run (its relays, each network), ≈ 4,300/day. Total ≈ 68,000/day with both agent APIs watched. |
+| DO rows read 5,000,000/day | Point lookups plus a few rows per run; the beacon's state adds about 6 (≈ 9,000/day). Well under 100,000/day. |
+| DO duration 13,000 GB-s/day | Billed only while handling a request (RPC wait included): about 1 s × 1,440 runs + ~20 ms × 11,520 reports at 128 MB ≈ 220 GB-s/day. Agent API polls wait alongside the chain reads and are bounded by their 10 s timeout. The beacon's three steps (relays, earlier round, registry) run one after another next to them, the last one after its network's chain read as well: about 0.3 s when everything answers, at most about 40 s with a slow chain read and every fetch at its 5 s timeout, so ≈ 55 GB-s/day typically and ≤ 7,400 GB-s/day at the worst. Timers are cleared so the object can hibernate. |
 | DO storage 5 GB | 3 days of report ids (≈ 35,000 small rows, primary and backup) plus a bounded 100-row message log. |
 | Cron triggers (5 per account) | 1 |
 
