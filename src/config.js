@@ -217,24 +217,32 @@ export const ROUND_NETWORKS = Object.freeze({
     healthKeySecret: "HEALTH_KEY_ROBINHOOD_TESTNET",
     backupHealthKeySecret: "HEALTH_KEY_ROBINHOOD_TESTNET_BACKUP",
   }),
-  // Not deployed yet. To enable: fill coordinator, implementations, codeHashes and beacon from deployments/robinhood-mainnet.json,
-  // confirm pricing and feeRecipients, then set `enabled: true`.
+  // deployments/robinhood-mainnet.json in the keeper repository (commit deee1c8), checked against the chain. The implementation,
+  // its proof verifier and mapping library, and the beacon verifier are the same CREATE2 deployments as on testnet.
   "robinhood-mainnet": Object.freeze({
     name: "robinhood-mainnet",
     kind: "round",
-    enabled: false,
+    enabled: true,
     statusListed: false,
     ownTelegramGroup: true,
     chainId: "4663",
-    coordinator: null,
+    coordinator: "0xEc8b95B168c87294c45727Bd2ac903d09316D132",
     keeper: "0xA5496Bb35905Bfe0Bac7D23Ca18c008F5E6Eb13e",
     backupKeepers: Object.freeze(["0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685"]),
-    // The deployer during launch, the Safe after ownership moves to it.
+    // The deployer during launch (owner and fee recipient), the Safe after ownership moves to it.
     owners: Object.freeze(["0x7ad78fc8097DFEA5c12DBb503D6EB6E60f34B40B", "0xE953671bf063CF21F89BbA3bfdB4AFc5FE71078A"]),
     feeRecipients: Object.freeze(["0x7ad78fc8097DFEA5c12DBb503D6EB6E60f34B40B", "0xE953671bf063CF21F89BbA3bfdB4AFc5FE71078A"]),
-    implementations: Object.freeze({ coordinator: Object.freeze([]) }),
-    codeHashes: null,
-    beacon: null,
+    implementations: Object.freeze({ coordinator: Object.freeze(["0xC8Cd79B9092AEA38f3434388F291eb861b148f45"]) }),
+    codeHashes: Object.freeze({
+      proxy: "0x1e98fe55cc7d87073e415635715100988aad79cbb84e39b18f96f3727d1c716f",
+      // Proof verifier 0x1EEBe8B8f7a6A18b966C3fBe3f644B8234f93709 and mapping library 0xA57093a645C1Aed12486da50AfA95F3284826849
+      // are fixed in this code.
+      implementations: Object.freeze({
+        "0xc8cd79b9092aea38f3434388f291eb861b148f45": "0xe692b447c02225cb95c921ed29952edb566f2afdfe28ff929452b4909460e8f6",
+      }),
+    }),
+    // drand evmnet with beacon verifier 0xd20dA01Aa16AeD6b77Cd8DDb869151802599100a.
+    beacon: Object.freeze({ id: 0, identity: "0x65794cca839753a679e6274f47c6ae64359df498b1674f40a28f9500c91054a5" }),
     pricing: Object.freeze({ minFeeWei: 25_000_000_000_000n, feeMultiplier: 2, fulfillGasOverhead: 405_000, keeperFeeBps: 8000, refundBps: 10000 }),
     feeCapWei: 3n * GWEI,
     feeHeadroomWei: 0n,

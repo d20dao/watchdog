@@ -80,11 +80,11 @@ round that the keeper fulfils before the request's 60 s deadline. Its networks a
 | Network | Chain | Watched |
 | --- | --- | --- |
 | `robinhood-testnet` | 46630 | yes |
-| `robinhood-mainnet` | 4663 | no: `enabled: false` until it is deployed |
+| `robinhood-mainnet` | 4663 | yes (coordinator `0xEc8b95B168c87294c45727Bd2ac903d09316D132`) |
 
-`enabled` is the one switch. A disabled network is not read, raises nothing, has no health endpoint (404) and no status section. To
-enable mainnet, fill `coordinator`, `implementations`, `codeHashes` and `beacon` from the keeper repository's
-`deployments/robinhood-mainnet.json`, confirm `pricing` and `feeRecipients`, then set `enabled: true`.
+`enabled` is the one switch. A disabled network is not read, raises nothing, has no health endpoint (404) and no status section.
+Each entry's `coordinator`, `implementations`, `codeHashes`, `beacon`, `pricing` and `feeRecipients` come from the keeper repository's
+`deployments/robinhood-<network>.json`, checked against the chain.
 
 `statusListed` (default `false`) puts a network on the public page and in `status.json`. Until then nothing of it is public: no
 section, no alerts and no recent messages. Alerts work either way.
@@ -240,7 +240,7 @@ Messages are queued in SQLite in the same transaction as the alert change, then 
 
 ## Endpoints
 
-### `POST /v1/health/<network>` (`arc-mainnet`, `arc-testnet`, `robinhood-testnet`)
+### `POST /v1/health/<network>` (`arc-mainnet`, `arc-testnet`, `robinhood-mainnet`, `robinhood-testnet`)
 
 This endpoint implements the receiver contract in `d20-keeper-mainnet/docs/keeper-health-receiver.md`.
 
@@ -270,7 +270,7 @@ This endpoint implements the receiver contract in `d20-keeper-mainnet/docs/keepe
 | 422 | `chainId` or `coordinator` does not belong to this network |
 | 503 | receiver key not configured, or storage unavailable |
 
-### `POST /v1/health/<network>/backup` (`arc-mainnet`, `arc-testnet`, `robinhood-testnet`)
+### `POST /v1/health/<network>/backup` (`arc-mainnet`, `arc-testnet`, `robinhood-mainnet`, `robinhood-testnet`)
 
 The backup (follower) keeper's reports. Same envelope, checks and replies as above, with its own key and storage:
 
@@ -328,9 +328,15 @@ npx wrangler secret put TELEGRAM_CHAT_ID_ROBINHOOD_TESTNET
 npx wrangler secret put TELEGRAM_BOT_TOKEN_ROBINHOOD_TESTNET   # optional: TELEGRAM_BOT_TOKEN is used without it
 npx wrangler secret put HEALTH_KEY_ROBINHOOD_TESTNET
 npx wrangler secret put HEALTH_KEY_ROBINHOOD_TESTNET_BACKUP
+
+# Robinhood Chain mainnet: the same, with _MAINNET
+npx wrangler secret put TELEGRAM_CHAT_ID_ROBINHOOD_MAINNET
+npx wrangler secret put TELEGRAM_BOT_TOKEN_ROBINHOOD_MAINNET   # optional
+npx wrangler secret put HEALTH_KEY_ROBINHOOD_MAINNET
+npx wrangler secret put HEALTH_KEY_ROBINHOOD_MAINNET_BACKUP
 ```
 
-Robinhood Chain mainnet uses the same names with `_MAINNET`, once it is enabled. The bot must be a member of the group.
+The bot must be a member of each group.
 
 Generate each health key as a long random value, for example:
 

@@ -14,6 +14,7 @@ import {
   THRESHOLDS,
   TOPICS,
   WATCHED_ROUND_NETWORKS,
+  enabledNetworks,
   networkByName,
   reportThresholds,
 } from "../src/config.js";
@@ -196,8 +197,8 @@ test("round selectors are the keccak256 of the coordinator's signatures, and the
   assert.equal(encodeIsBackupKeeper(BACKUP), ROUND_SELECTORS.isBackupKeeper + addressWord(BACKUP));
 });
 
-test("round networks: testnet enabled and complete, mainnet prepared but switched off", () => {
-  assert.deepEqual(Object.keys(WATCHED_ROUND_NETWORKS), ["robinhood-testnet"]);
+test("round networks: testnet and mainnet enabled and complete, unlisted; `enabled: false` switches a network off", () => {
+  assert.deepEqual(Object.keys(WATCHED_ROUND_NETWORKS), ["robinhood-testnet", "robinhood-mainnet"]);
   for (const net of Object.values(WATCHED_ROUND_NETWORKS)) {
     assert.equal(net.kind, "round");
     assert.equal(net.statusListed, false, "unlisted until mainnet launch");
@@ -211,10 +212,14 @@ test("round networks: testnet enabled and complete, mainnet prepared but switche
     assert.ok(!Object.hasOwn(NETWORKS, net.name), "never among the Arc networks");
   }
   const mainnet = ROUND_NETWORKS["robinhood-mainnet"];
-  assert.equal(mainnet.enabled, false);
   assert.equal(mainnet.chainId, "4663");
+  assert.equal(mainnet.coordinator, "0xEc8b95B168c87294c45727Bd2ac903d09316D132");
   assert.deepEqual(mainnet.owners, ["0x7ad78fc8097DFEA5c12DBb503D6EB6E60f34B40B", "0xE953671bf063CF21F89BbA3bfdB4AFc5FE71078A"]);
-  assert.equal(networkByName("robinhood-mainnet"), null);
+  assert.notEqual(mainnet.coordinator.toLowerCase(), RH.coordinator.toLowerCase());
+  assert.equal(networkByName("robinhood-mainnet"), mainnet);
+  const switchedOff = enabledNetworks({ ...ROUND_NETWORKS, "robinhood-mainnet": { ...mainnet, enabled: false } });
+  assert.deepEqual(Object.keys(switchedOff), ["robinhood-testnet"]);
+  assert.equal(networkByName("robinhood-mainnet", NETWORKS, switchedOff), null);
   assert.equal(networkByName("robinhood-testnet"), RH);
   assert.equal(networkByName("arc-testnet"), NETWORKS["arc-testnet"]);
 });
@@ -658,7 +663,7 @@ test("cron: three failed reads warn that the watchdog cannot read the chain", as
   assert.match(h.state.telegram.at(-1).text, /WARNING watchdog cannot read chain: 3 consecutive runs failed \(last error: http 503\)/);
 });
 
-test("health endpoint: Robinhood testnet has its primary and backup streams; mainnet is unknown until enabled", async () => {
+test("health endpoint: Robinhood testnet has its primary and backup streams; mainnet's needs its key", async () => {
   const storage = memoryStorage();
   const env = { HEALTH_KEY_ROBINHOOD_TESTNET: "throwaway-rh-key", HEALTH_KEY_ROBINHOOD_TESTNET_BACKUP: "throwaway-rh-backup-key" };
   const stub = {
@@ -680,7 +685,8 @@ test("health endpoint: Robinhood testnet has its primary and backup streams; mai
   assert.equal((await post("/v1/health/robinhood-testnet", env.HEALTH_KEY_ROBINHOOD_TESTNET)).status, 200);
   assert.equal((await post("/v1/health/robinhood-testnet/backup", env.HEALTH_KEY_ROBINHOOD_TESTNET_BACKUP)).status, 200);
   assert.equal((await post("/v1/health/robinhood-testnet", "wrong")).status, 401);
-  assert.equal((await post("/v1/health/robinhood-mainnet", "anything")).status, 404);
+  assert.equal((await post("/v1/health/robinhood-mainnet", "anything")).status, 503, "receiver not configured without its key");
+  assert.equal((await post("/v1/health/robinhood-devnet", "anything")).status, 404);
   // An Arc report is not a Robinhood one.
   const arc = sampleReport();
   const wrongChain = await handleFetch(
