@@ -3,8 +3,9 @@
 //                     refundBps, backupKeeperCount, isBackupKeeper for each configured backup, beaconSchedule, beaconIdentity,
 //                     the implementation slot and every keeper wallet's balance; once a day also the runtime code of the proxy
 //                     and of each accepted implementation, whose keccak256 is compared with the pinned hashes.
-//   Round B (pinned to head, only when there is something to read): coordinator logs since the stored cursor, and
-//                     getRoundRequest for the requests from the oldest one not yet settled, at most LIMITS.roundScanMaxIds.
+//   Round B (latest, only when there is something to read): getRoundRequest for the requests from the oldest one not yet
+//                     settled, at most LIMITS.roundScanMaxIds.
+//   Logs (alongside round B, on the log endpoints): coordinator logs since the stored cursor, in chunks an endpoint accepts.
 // The public RPC keeps only about 6,000 blocks of state, so nothing reads deep history: requests are read by id at the head,
 // and a log cursor left far behind jumps to the recent blocks. Contracts see L1 block numbers in block.number; everything
 // here uses the RPC's own (L2) block numbers and timestamps.
@@ -260,42 +261,10 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
   if (out.block.baseFeeWei == null) errors.push("block: no baseFeePerGas");
 
   const head = out.block.number;
-  const blockTag = toQuantity(head);
 
-  // Round B
-  const calls = [];
-  let logsIndex = -1;
-  let logRange = null;
-  if (out.logCursor == null) {
-    // First run: start watching from the current head, no historical backfill.
-    out.logCursor = head;
-    out.logs = { fromBlock: null, toBlock: null, skippedBlocks: 0, refunds: [], foreignFulfillments: [] };
-  } else if (out.logCursor < head) {
-    let fromBlock = out.logCursor + 1;
-    let skippedBlocks = 0;
-    if (head - out.logCursor > LIMITS.roundLogMaxLagBlocks) {
-      // Far behind (the watchdog was down): the recent blocks only, never deep history the RPC may no longer serve.
-      const jumpTo = head - LIMITS.roundLogScanMaxBlocks + 1;
-      skippedBlocks = jumpTo - fromBlock;
-      fromBlock = jumpTo;
-    }
-    logRange = { fromBlock, toBlock: Math.min(head, fromBlock + LIMITS.roundLogScanMaxBlocks - 1), skippedBlocks };
-    logsIndex = calls.length;
-    calls.push([
-      "eth_getLogs",
-      [
-        {
-          address: net.coordinator,
-          fromBlock: toQuantity(logRange.fromBlock),
-          toBlock: toQuantity(logRange.toBlock),
-          topics: [[TOPICS.requestRefundedTo, TOPICS.randomnessFulfilled]],
-        },
-      ],
-    ]);
-  } else {
-    out.logs = { fromBlock: null, toBlock: null, skippedBlocks: 0, refunds: [], foreignFulfillments: [] };
-  }
-
+  // Round B: the requests, at `latest` (a public node keeps only about a hundred blocks of state, and may be a block behind the
+  // one that answered round A; ids are bounded by round A's nextRequestId and judged at its head time). The logs are read at the
+  // same time from their own endpoints (readLogs).
   let scanIds = [];
   let quiet = false;
   let more = false;
@@ -312,38 +281,122 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
     more = end < next;
     for (let id = out.scanCursor; id < end; id++) scanIds.push(id);
   }
-  const scanIndex = calls.length;
-  for (const id of scanIds) calls.push(call(encodeGetRoundRequest(id), blockTag));
+
+  let logRead = null;
+  const readScan = async () => {
+    if (scanIds.length === 0) return [];
+    return session.batch(scanIds.map((id) => call(encodeGetRoundRequest(id))));
+  };
+  const [b] = await Promise.all([
+    readScan(),
+    (async () => {
+      logRead = await readLogs(net, out.logCursor, head, { fetch, timeoutMs });
+    })(),
+  ]);
 
   let bFailed = false;
-  if (calls.length > 0) {
-    const b = await session.batch(calls);
-    if (!b) {
-      bFailed = true;
-      errors.push(`round B: ${session.lastError ?? "failed"}`);
-    } else {
-      if (logsIndex >= 0) {
-        const logs = pick(b[logsIndex], (r) => decodeLogs(r, net), errors, "logs");
-        if (logs) {
-          out.logs = { ...logRange, ...logs };
-          out.logCursor = logRange.toBlock;
-        }
-      }
-      if (out.nextRequestId != null) {
-        const requests = scanIds.map((id, i) => ({ id, request: pick(b[scanIndex + i], decodeRoundRequest, errors, `getRoundRequest ${id}`) }));
-        const walk = walkRequests(requests, out.scanCursor, out.block.timestamp, { quiet, more });
-        out.scan = { fromId: scanIds[0] ?? out.scanCursor, ids: scanIds.length, ...walk };
-        out.scanCursor = walk.cursor;
-      }
-    }
+  if (b === null) {
+    bFailed = true;
+    errors.push(`round B: ${session.lastError ?? "failed"}`);
   } else if (out.nextRequestId != null) {
-    out.scan = { fromId: out.scanCursor, ids: 0, ...walkRequests([], out.scanCursor, out.block.timestamp) };
+    const requests = scanIds.map((id, i) => ({ id, request: pick(b[i], decodeRoundRequest, errors, `getRoundRequest ${id}`) }));
+    const walk = walkRequests(requests, out.scanCursor, out.block.timestamp, { quiet, more });
+    out.scan = { fromId: scanIds[0] ?? out.scanCursor, ids: scanIds.length, ...walk };
+    out.scanCursor = walk.cursor;
+  }
+  out.logSubrequests = logRead.subrequests;
+  out.logRpc = logRead.rpc;
+  if (logRead.logs) {
+    out.logs = logRead.logs;
+    out.logCursor = logRead.cursor;
+  } else {
+    errors.push(`logs: ${logRead.error}`);
   }
 
   // As on Arc, a view that could not be decoded leaves its figure unknown without failing the read; the requests and logs must be read.
   out.complete = !bFailed && out.logs != null && out.scan?.pending != null;
   if (!out.complete) out.error = bFailed ? session.lastError ?? "partial read" : errors.find((e) => /^(logs|getRoundRequest)/.test(e)) ?? "partial read";
-  return finish();
+  const done = finish();
+  done.subrequests += logRead.subrequests;
+  return done;
+}
+
+/**
+ * The endpoints logs are read from: `logRpcs` ([{url, maxBlocks, maxBatch}], in order) when configured, else the state endpoints
+ * with the full span in one call. A keyless endpoint may cap a getLogs range (dRPC: about 100 blocks) and a batch (dRPC: 3 calls),
+ * and a public node may keep too few blocks to serve them at all.
+ */
+export function logEndpoints(net) {
+  if (Array.isArray(net.logRpcs) && net.logRpcs.length > 0) return net.logRpcs;
+  return net.rpcs.map((url) => ({ url, maxBlocks: LIMITS.roundLogScanMaxBlocks, maxBatch: 1 }));
+}
+
+/**
+ * Read the coordinator's refund and fulfilment logs from `cursor` + 1 towards `head`, trying each log endpoint in order. On an
+ * endpoint the range is split into calls of at most `maxBlocks` blocks, sent `maxBatch` to a fetch, and limited to
+ * LIMITS.roundLogMaxFetches fetches a run (a backlog is caught up over later runs). Any failure moves the whole range to the next
+ * endpoint. Returns {logs, cursor, rpc, subrequests} or {logs: null, error, subrequests}.
+ */
+export async function readLogs(net, cursor, head, { fetch, timeoutMs } = {}) {
+  const empty = { fromBlock: null, toBlock: null, skippedBlocks: 0, refunds: [], foreignFulfillments: [] };
+  // First run: start watching from the current head, no historical backfill.
+  if (cursor == null) return { logs: empty, cursor: head, rpc: null, subrequests: 0 };
+  if (cursor >= head) return { logs: empty, cursor, rpc: null, subrequests: 0 };
+  let fromBlock = cursor + 1;
+  let skippedBlocks = 0;
+  if (head - cursor > LIMITS.roundLogMaxLagBlocks) {
+    // Far behind (the watchdog was down): the recent blocks only, never deep history the RPC may no longer serve.
+    const jumpTo = head - LIMITS.roundLogScanMaxBlocks + 1;
+    skippedBlocks = jumpTo - fromBlock;
+    fromBlock = jumpTo;
+  }
+  let subrequests = 0;
+  let error = "no log endpoint";
+  for (const endpoint of logEndpoints(net)) {
+    const maxBlocks = Math.max(1, Math.min(endpoint.maxBlocks ?? LIMITS.roundLogScanMaxBlocks, LIMITS.roundLogScanMaxBlocks));
+    const maxBatch = Math.max(1, endpoint.maxBatch ?? 1);
+    const span = Math.min(LIMITS.roundLogScanMaxBlocks, maxBlocks * maxBatch * LIMITS.roundLogMaxFetches);
+    const toBlock = Math.min(head, fromBlock + span - 1);
+    const chunks = [];
+    for (let from = fromBlock; from <= toBlock; from += maxBlocks) chunks.push([from, Math.min(toBlock, from + maxBlocks - 1)]);
+    const session = new RpcSession([endpoint.url], { fetch, timeoutMs });
+    const refunds = [];
+    const foreignFulfillments = [];
+    let failed = null;
+    for (let i = 0; i < chunks.length && !failed; i += maxBatch) {
+      const group = chunks.slice(i, i + maxBatch);
+      const items = await session.batch(
+        group.map(([from, to]) => [
+          "eth_getLogs",
+          [{ address: net.coordinator, fromBlock: toQuantity(from), toBlock: toQuantity(to), topics: [[TOPICS.requestRefundedTo, TOPICS.randomnessFulfilled]] }],
+        ]),
+      );
+      if (!items) {
+        failed = session.lastError ?? "failed";
+        break;
+      }
+      for (const item of items) {
+        const errs = [];
+        const decoded = pick(item, (r) => decodeLogs(r, net), errs, "logs");
+        if (!decoded) {
+          failed = errs[0] ?? "logs: failed";
+          break;
+        }
+        refunds.push(...decoded.refunds);
+        foreignFulfillments.push(...decoded.foreignFulfillments);
+      }
+    }
+    subrequests += session.subrequests;
+    if (!failed) {
+      return { logs: { fromBlock, toBlock, skippedBlocks, refunds, foreignFulfillments }, cursor: toBlock, rpc: session.endpoint, subrequests };
+    }
+    let host = "endpoint";
+    try {
+      host = new URL(endpoint.url).host;
+    } catch {}
+    error = `${host}: ${failed}`;
+  }
+  return { logs: null, error, subrequests };
 }
 
 /** Whether a fulfilment came from one of this network's own keeper wallets. */

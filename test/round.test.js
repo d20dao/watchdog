@@ -20,7 +20,7 @@ import {
 } from "../src/config.js";
 import { runCron } from "../src/cron.js";
 import { handleFetch } from "../src/http.js";
-import { applyRoundRead, codeCheckDue, codeHash, readRoundChain, roundReadDue, walkRequests } from "../src/round.js";
+import { applyRoundRead, codeCheckDue, codeHash, readLogs, readRoundChain, roundReadDue, walkRequests } from "../src/round.js";
 import { buildStatus, renderHtml } from "../src/status.js";
 import { BACKUP_STREAM, ingestReport, readAlerts, readRoundState, recentMessages } from "../src/store.js";
 import { routeFor } from "../src/telegram.js";
@@ -75,7 +75,8 @@ function roundRequest({ deadline = NOW + 30, fulfilled = false, refunded = false
 
 /**
  * A fake Robinhood node: the coordinator's views as deployed, requests by id, logs and code. Tests change `chain` to move it.
- * Records each batch's methods in `batches`.
+ * Records each batch's methods in `batches` and its endpoint in `urls`. `refuse(url, calls)` may answer an endpoint with an
+ * HTTP status instead, as a capped or rate-limited endpoint does.
  */
 function fakeNode(net) {
   const chain = {
@@ -103,6 +104,8 @@ function fakeNode(net) {
     fail: false,
   };
   const batches = [];
+  const urls = [];
+  let refuse = () => null;
   const answer = ({ method, params }) => {
     switch (method) {
       case "eth_chainId":
@@ -147,13 +150,16 @@ function fakeNode(net) {
     }
   };
   const fetch = async (url, init) => {
-    assert.ok(net.rpcs.includes(url), "only the configured RPC is read");
+    assert.ok(net.rpcs.includes(url) || (net.logRpcs ?? []).some((e) => e.url === url), "only the configured endpoints are read");
     if (chain.fail) return new Response("busy", { status: 503 });
     const calls = JSON.parse(init.body);
+    const status = refuse(url, calls);
+    if (status) return new Response("refused", { status });
     batches.push(calls.map((c) => c.method));
+    urls.push(url);
     return Response.json(calls.map((c) => ({ jsonrpc: "2.0", id: c.id, result: answer(c) })));
   };
-  return { chain, batches, fetch };
+  return { chain, batches, urls, fetch, setRefuse: (fn) => void (refuse = fn) };
 }
 
 const refundLog = (id, block, net = RH) => ({
@@ -283,6 +289,7 @@ test("round reader: two batches, figures decoded, first run looks back one windo
   assert.equal(node.batches.length, 2);
   assert.ok(node.batches[0].filter((m) => m === "eth_getCode").length === 2, "the code is read on the first run");
   assert.deepEqual(node.batches[1], Array(32).fill("eth_call"), "no log scan on the first run, 32 requests");
+  assert.deepEqual(node.urls, [net.rpcs[0], net.rpcs[0]], "state reads on the first endpoint");
   assert.equal(read.keeper, net.keeper.toLowerCase());
   assert.equal(read.owner, OWNER.toLowerCase());
   assert.deepEqual(read.pricing, { minFeeWei: 25_000_000_000_000n, feeMultiplier: 2, fulfillGasOverhead: 405000 });
@@ -336,9 +343,11 @@ test("round reader: a later run reports a request that expired unserved, refunds
   node.chain.requests.set(4n, roundRequest({ deadline: NOW + 80 }));
   node.chain.logs = [fulfilledLog(3, 1200, "0x9999999999999999999999999999999999999999"), refundLog(2, 1500), fulfilledLog(1, 1300, BACKUP)];
   node.batches.length = 0;
+  node.urls.length = 0;
   const read = await readRoundChain(net, state, { fetch: node.fetch, nowSec: NOW + 120 });
   assert.equal(node.batches[0].includes("eth_getCode"), false, "the code is not read again the same day");
-  assert.deepEqual(node.batches[1], ["eth_getLogs", "eth_call", "eth_call"]);
+  assert.deepEqual(node.batches.slice(1).sort(), [["eth_call", "eth_call"], ["eth_getLogs"]]);
+  assert.equal(node.urls[node.batches.findIndex((b) => b[0] === "eth_getLogs")], net.logRpcs[0].url, "logs on the first log endpoint");
   assert.deepEqual(read.scan.expired.map((e) => e.requestId), [4n]);
   assert.equal(read.scanCursor, 5n);
   assert.deepEqual([read.logs.fromBlock, read.logs.toBlock], [1001, 1600]);
@@ -359,6 +368,7 @@ test("round reader: a later run reports a request that expired unserved, refunds
   node.batches.length = 0;
   const quiet = await readRoundChain(net, state, { fetch: node.fetch, nowSec: NOW + 180 });
   assert.deepEqual(node.batches[1], ["eth_getLogs"]);
+  assert.equal(quiet.subrequests, 2);
   assert.deepEqual([quiet.logs.fromBlock, quiet.logs.toBlock], [1601, 1700]);
   const cleared = evaluateRoundChainChecks(net, quiet, applyRoundRead(net, state, quiet, NOW + 180));
   assert.equal(cleared.expired, null);
@@ -747,4 +757,44 @@ test("cron: a fault in a round network's evaluation stays there; the Arc network
   assert.equal(readRoundState(storage, RH.name), null, "nothing of the round network was written");
   assert.deepEqual(summary.networks[arc.name].activeAlerts, ["committer"]);
   assert.deepEqual(readAlerts(storage, arc.name).map((a) => a.check), ["committer"]);
+});
+
+test("round reader: an endpoint that refuses eth_call (HTTP 429 from Workers) falls back, and logs fall back to dRPC in capped chunks", async () => {
+  for (const net of Object.values(WATCHED_ROUND_NETWORKS)) {
+    assert.ok(!/chain\.robinhood\.com/.test(net.rpcs[0]), `${net.name}: Robinhood's own endpoint is not first for state reads`);
+    const drpc = net.logRpcs.find((e) => /drpc\.org/.test(e.url));
+    assert.deepEqual([drpc.maxBlocks, drpc.maxBatch], [100, 3], `${net.name}: dRPC's keyless caps`);
+  }
+  const net = await pinnedNet();
+  const node = fakeNode(net);
+  node.chain.next = 3n;
+  const first = applyRoundRead(net, null, await readRoundChain(net, null, { fetch: node.fetch, nowSec: NOW }), NOW);
+  // Every state call to the first endpoint is refused, and so is every log call to Robinhood's own endpoint.
+  node.setRefuse((url, calls) =>
+    (url === net.rpcs[0] && calls.some((c) => c.method === "eth_call")) || (url === net.logRpcs[0].url && calls[0].method === "eth_getLogs") ? 429 : null,
+  );
+  node.chain.head = 1000 + 650;
+  node.chain.logs = [refundLog(2, 1640)];
+  node.batches.length = 0;
+  node.urls.length = 0;
+  const read = await readRoundChain(net, first, { fetch: node.fetch, nowSec: NOW + 60 });
+  assert.equal(read.complete, true, read.error);
+  assert.equal(read.rpc, new URL(net.rpcs[1]).host);
+  assert.deepEqual([read.logs.fromBlock, read.logs.toBlock], [1001, 1650]);
+  assert.deepEqual(read.logs.refunds.map((r) => r.requestId), [2n]);
+  const drpc = net.logRpcs[1].url;
+  const logBatches = node.batches.filter((b, i) => node.urls[i] === drpc);
+  assert.deepEqual(logBatches.map((b) => b.length), [3, 3, 1], "650 blocks: 7 calls of at most 100 blocks, 3 to a batch");
+  // Round A: 1 refused and 1 on the second endpoint (no request to scan); logs: 1 refused and 3 dRPC fetches.
+  assert.equal(read.subrequests, 2 + 1 + 3);
+
+  // A long backlog on dRPC is read 1,800 blocks a run.
+  const behind = await readLogs(net, 10_000, 20_000, { fetch: node.fetch });
+  assert.deepEqual([behind.logs.fromBlock, behind.logs.toBlock], [10_001, 11_800]);
+  assert.equal(behind.cursor, 11_800);
+  // Every log endpoint failing leaves the logs unknown and names the last error.
+  node.setRefuse(() => 429);
+  const none = await readLogs(net, 1000, 1100, { fetch: node.fetch });
+  assert.equal(none.logs, null);
+  assert.match(none.error, /drpc\.org: http 429/);
 });
