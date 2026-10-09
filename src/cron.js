@@ -29,6 +29,7 @@ import {
   roundCheckNames,
 } from "./checks.js";
 import { BEACON_SCOPE, LIMITS, NETWORKS, WATCHED_ROUND_NETWORKS, watchedAgentApi } from "./config.js";
+import { applyConsumers, seedRange } from "./consumers.js";
 import { applyRoundRead, readRoundChain, roundReadDue } from "./round.js";
 import { readChain } from "./rpc.js";
 import {
@@ -104,7 +105,7 @@ export async function runCron({
   // when the beacon's relay steps have finished before it.
   const chainReads = names.map(async (name, i) => {
     try {
-      return await readChainImpl(nets[name], cursors[i], { fetch });
+      return await readChainImpl(nets[name], cursors[i], { fetch, consumerSeed: seedRange(storage, nets[name]) });
     } catch {
       return { ok: false, complete: false, error: "internal error", errors: [], subrequests: 0 };
     }
@@ -123,7 +124,7 @@ export async function runCron({
       if (!roundReadDue(roundNets[name], previous, nowSec)) return null;
       const net = roundNets[name];
       const keyedRpc = net.keyedRpcSecret ? env[net.keyedRpcSecret] ?? null : null;
-      return await readRoundChainImpl(net, previous, { fetch, nowSec, keyedRpc });
+      return await readRoundChainImpl(net, previous, { fetch, nowSec, keyedRpc, consumerSeed: seedRange(storage, net) });
     } catch {
       return { ok: false, complete: false, error: "internal error", errors: [], subrequests: 0 };
     }
@@ -191,6 +192,10 @@ export async function runCron({
         }
       }
       if (report && conditions.dropped_events) markDroppedAlerted(storage, name, report.droppedTotal);
+      for (const text of recordConsumers(storage, net, read, now, deliverable)) {
+        messages.push(text);
+        enqueued++;
+      }
       networks[name] = {
         chain: read.ok ? (read.complete ? "ok" : "partial") : "failed",
         error: read.error ?? null,
@@ -269,6 +274,23 @@ export async function runCron({
 }
 
 /**
+ * The new consumer notice for one network's read: consumers from its logs and decoded requests, and its batch of old requests.
+ * Queues one info message per new consumer and returns their texts. A fault here is the notice's alone: nothing is queued and
+ * the rest of the run goes on.
+ */
+function recordConsumers(storage, net, read, now, deliverable) {
+  if (!read?.ok) return [];
+  try {
+    const live = [...(read.logs?.requests ?? []), ...(read.consumers ?? [])];
+    const notices = applyConsumers(storage, net, now, { nextRequestId: read.nextRequestId, seed: read.consumerSeed ?? null, live });
+    for (const { text } of notices) enqueueMessage(storage, now, net.name, "info", text, deliverable);
+    return notices.map((n) => n.text);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Store a round network's read, evaluate its checks and queue its messages, inside the run's transaction. The same alert
  * lifecycle as an Arc network's; its messages go only to the network's own Telegram group (see routeFor). As with the beacon,
  * a fault stays in the network: everything is worked out before anything is written, so a fault there writes nothing, and one
@@ -318,6 +340,7 @@ function commitRoundNetwork(storage, net, read, now, deliverable) {
       }
     }
     if (report && conditions.dropped_events) markDroppedAlerted(storage, name, report.droppedTotal);
+    if (read) messages.push(...recordConsumers(storage, net, read, now, deliverable));
   } catch {
     // A row that could not be written is worked out again next run; nothing else in the run is touched.
   }

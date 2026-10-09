@@ -152,6 +152,7 @@ is deferred to the next run (`deferred` in the summary), never counted as a fail
   the proxy and each accepted implementation (about 25 KB). Between slow reads the role, pricing and beacon checks keep their state.
 * **Logs**, with what is left: `eth_getLogs` from the stored cursor (at most 5,000 blocks a run). On dRPC a minute of mainnet
   (about 600 blocks) is 2 fetches, five minutes of testnet (about 1,650) 6.
+* **History** for the new consumer notice, with what is left after the logs, until the old requests are read.
 
 On keyed dRPC a mainnet minute costs 4 fetches (fast 2, logs 2), and a minute that also reads the slow part 8 or 9.
 
@@ -165,6 +166,23 @@ Alerts go only to the network's own Telegram group, `TELEGRAM_CHAT_ID_ROBINHOOD_
 `TELEGRAM_BOT_TOKEN_ROBINHOOD_TESTNET` (`..._MAINNET`) when set, else `TELEGRAM_BOT_TOKEN`. Without its own chat id a Robinhood alert
 is stored as `not_sent`: it never falls back to the default chat. The drand relays are watched once for all networks by the beacon
 monitor below; its alerts stay in the default chat.
+
+## New consumer notice
+
+One Telegram message, severity `info`, the first time a consumer contract makes a request on a network whose
+`newConsumerNotice` is on: Arc Mainnet (default chat) and Robinhood Mainnet (its own group). The testnets have it off.
+
+```
+[arc-mainnet] NEW CONSUMER 0x… made its first request, 61 https://arc.d20dao.org/request/<coordinator>/61
+[robinhood-mainnet] NEW CONSUMER 0x… made its first request, 5 https://d20dao.org/explorer/request/4663/<coordinator>/5
+```
+
+Consumers come from the `RandomnessRequested` logs (one more topic in the existing log scan, no extra fetch) and from the requests
+the readers already decode. On a network's first run the watchdog notes its `nextRequestId`; the requests before it are then read
+by id, 100 a run, to learn the existing consumers without a message (on Arc inside the round B fetch, on Robinhood with what is left
+of the network's fetch budget). A consumer seen live while that history is still being read waits, and is announced once history
+is read through, unless history shows it requested before. Each consumer is one row (`consumers`), written when first seen, and a
+message is never repeated for it. When the network is unlisted, its notices stay off the status page like its other messages.
 
 ## x402 agent API
 
@@ -478,7 +496,7 @@ The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an 
 | Durable Object CPU (30 s per request) | A full run for both networks with replayed live RPC responses measured ~0.4 ms warm and ~1.6 ms cold. A worst-case 5,000-block scan returning 1,000 logs measured ~3.5–5 ms. The drand beacon monitor's own work (records, signature comparison, ABI, state) measured ~0.3 ms per run warm before a beacon is registered and ~0.45 ms after (two slot signers included), against local fakes; the first slot signer after the object starts adds ~4 ms of module evaluation. |
 | Subrequests 50 per invocation | Each Robinhood network spends at most 9 fetches a run, failed and fallback ones included (`roundMaxSubrequests`; what does not fit waits for the next run), so ≤ 18 for both. With Arc at its worst (30, below) a run makes at most 48. Normally mainnet takes 2 to 4 a minute and testnet 4 to 8 every five minutes. 2 batches per Arc network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper and agent API relayer balances are extra calls inside the round A batch, so they add no fetches. Each watched agent API adds 1 `/health` poll, so ≤ 17 in total. The drand beacon adds 10 in the steady state (4 `latest` reads, 4 earlier-round reads and 1 registry batch per network; the networks share the relays, and the batch holds every call the monitor makes, up to 18, so the catalog and the verifier check add no fetch), 11 in a run that reads a relay's `/info` (the first four runs, then four a day), and ≤ 13 at most (both registries on their second endpoint), so ≤ 30 in total. |
 | DO requests 100,000/day | 2 networks × 2 keepers (primary and backup) × 2,880 reports + 1,440 cron runs ≈ 13,000/day, plus status views (edge-cached 15 s). Robinhood testnet's two keepers at 300 s add 576, and mainnet's two at 60 s add 2,880: ≈ 16,500/day. |
-| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. Agent API poll state is 1 row per watched network per run, ≈ 1,440/day each. Alerts and messages only change on transitions. The drand beacon keeps 3 rows a run (its relays, each network), ≈ 4,300/day. Arc ≈ 68,000/day with both agent APIs watched. Robinhood testnet, thinned: 5 × 576 reports from its two keepers at 300 s plus 288 state writes (one per 5-minute read) ≈ 3,200. Robinhood mainnet at 60 s: 5 × 2,880 reports plus 1,440 state writes ≈ 15,800. Total ≈ 87,000/day with mainnet enabled. Keepers left at the 30 s default would add ≈ 14,400 more per network, so keep the intervals above. |
+| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. Agent API poll state is 1 row per watched network per run, ≈ 1,440/day each. Alerts and messages only change on transitions. The drand beacon keeps 3 rows a run (its relays, each network), ≈ 4,300/day. Arc ≈ 68,000/day with both agent APIs watched. Robinhood testnet, thinned: 5 × 576 reports from its two keepers at 300 s plus 288 state writes (one per 5-minute read) ≈ 3,200. Robinhood mainnet at 60 s: 5 × 2,880 reports plus 1,440 state writes ≈ 15,800. Total ≈ 87,000/day with mainnet enabled. The new consumer notice adds one row per consumer, ever, plus one per history batch while the old requests are read. Keepers left at the 30 s default would add ≈ 14,400 more per network, so keep the intervals above. |
 | DO rows read 5,000,000/day | Point lookups plus a few rows per run; the beacon's state adds about 6 (≈ 9,000/day). Well under 100,000/day. |
 | DO duration 13,000 GB-s/day | Billed only while handling a request (RPC wait included): about 1 s × 1,440 runs + ~20 ms × 11,520 reports at 128 MB ≈ 220 GB-s/day. Agent API polls wait alongside the chain reads and are bounded by their 10 s timeout. The beacon's three steps (relays, earlier round, registry) run one after another next to them, the last one after its network's chain read as well: about 0.3 s when everything answers, at most about 40 s with a slow chain read and every fetch at its 5 s timeout, so ≈ 55 GB-s/day typically and ≤ 7,400 GB-s/day at the worst. Timers are cleared so the object can hibernate. |
 | DO storage 5 GB | 3 days of report ids (≈ 35,000 small rows, primary and backup) plus a bounded 100-row message log. |

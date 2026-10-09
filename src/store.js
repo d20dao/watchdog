@@ -112,6 +112,21 @@ const SCHEMA = [
      updated_at INTEGER NOT NULL,
      state_json TEXT NOT NULL
    ) WITHOUT ROWID`,
+  // New consumer notice (src/consumers.js): each consumer seen on a network, written once, and how far history has been read.
+  `CREATE TABLE IF NOT EXISTS consumers (
+     network TEXT NOT NULL,
+     consumer TEXT NOT NULL,
+     first_request_id TEXT NOT NULL,
+     first_seen_at INTEGER NOT NULL,
+     notified INTEGER NOT NULL,
+     PRIMARY KEY (network, consumer)
+   ) WITHOUT ROWID`,
+  `CREATE TABLE IF NOT EXISTS consumer_state (
+     network TEXT PRIMARY KEY,
+     live_from TEXT NOT NULL,
+     seeded_to TEXT NOT NULL,
+     updated_at INTEGER NOT NULL
+   ) WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS backup_report_state (
      network TEXT PRIMARY KEY,
      first_received_at INTEGER NOT NULL,

@@ -150,7 +150,7 @@ const sameAddress = (a, b) => typeof a === "string" && typeof b === "string" && 
  * `backupBalances` is [{address, balanceWei}] in configured order (balanceWei null when unknown), or null when
  * round A failed. `agentRelayerBalanceWei` is the agent API relayer's balance, null when unknown or not watched.
  */
-export async function readChain(net, cursor, { fetch, timeoutMs } = {}) {
+export async function readChain(net, cursor, { fetch, timeoutMs, consumerSeed = null } = {}) {
   const session = new RpcSession(net.rpcs, { fetch, timeoutMs });
   const backups = net.backupKeepers ?? [];
   const relayer = watchedAgentApi(net)?.relayer ?? null;
@@ -172,6 +172,10 @@ export async function readChain(net, cursor, { fetch, timeoutMs } = {}) {
     agentRelayerBalanceWei: null,
     pending: null,
     logs: null,
+    // {fromId, toId, consumers: [{id, consumer}]} when this run read a batch of old requests for the new consumer notice.
+    consumerSeed: null,
+    // [{id, consumer}] of the pending requests decoded in round C.
+    consumers: [],
     logCursor: cursor?.logCursor ?? null,
     logSpan: cursor?.logSpan ?? LIMITS.logScanMaxBlocks,
   };
@@ -259,13 +263,19 @@ export async function readChain(net, cursor, { fetch, timeoutMs } = {}) {
           address: net.coordinator,
           fromBlock: toQuantity(logRange.fromBlock),
           toBlock: toQuantity(logRange.toBlock),
-          topics: [[TOPICS.requestRefundedTo, TOPICS.randomnessFulfilled]],
+          topics: [[TOPICS.requestRefundedTo, TOPICS.randomnessFulfilled, TOPICS.randomnessRequested]],
         },
       ],
     ]);
   } else {
     out.logs = { fromBlock: null, toBlock: null, refunds: [], foreignFulfillments: [] };
   }
+
+  // Old requests for the new consumer notice ride in the same fetch.
+  const seedIndex = calls.length;
+  const seedIds = [];
+  if (consumerSeed) for (let id = BigInt(consumerSeed.fromId); id < BigInt(consumerSeed.toId); id++) seedIds.push(id);
+  for (const id of seedIds) calls.push(["eth_call", [{ to: net.coordinator, data: encodeGetRequest(id) }, blockTag]]);
 
   let bFailed = false;
   if (calls.length > 0) {
@@ -274,6 +284,17 @@ export async function readChain(net, cursor, { fetch, timeoutMs } = {}) {
       bFailed = true;
       errors.push(`round B: ${session.lastError ?? "failed"}`);
     } else {
+      if (seedIds.length > 0) {
+        const consumers = [];
+        const seedErrors = [];
+        for (const [i, id] of seedIds.entries()) {
+          const request = pick(b[seedIndex + i], decodeRequest, seedErrors, `getRequest ${id}`);
+          if (!request) break;
+          consumers.push({ id, consumer: request.consumer });
+        }
+        // Read up to the first id that could not be: the rest comes next run.
+        if (consumers.length > 0) out.consumerSeed = { fromId: seedIds[0], toId: seedIds[0] + BigInt(consumers.length), consumers };
+      }
       if (pendingIndex >= 0) {
         const decoded = pick(b[pendingIndex], (r) => decodePendingRequestIds(r, LIMITS.pendingScanWindow), errors, "pending ids");
         if (decoded) out.pending = { count: decoded.ids.length, ids: decoded.ids, oldest: null };
@@ -309,6 +330,7 @@ export async function readChain(net, cursor, { fetch, timeoutMs } = {}) {
       sample.forEach((id, i) => {
         const request = pick(c[i], decodeRequest, errors, `getRequest ${id}`);
         if (!request) return;
+        out.consumers.push({ id, consumer: request.consumer });
         known++;
         const createdAt = request.deadline - LIMITS.requestTimeoutSeconds;
         const ageSeconds = Math.max(0, out.block.timestamp - createdAt);
@@ -333,13 +355,15 @@ function decodeLogs(result, net) {
   if (!Array.isArray(result)) throw new AbiError("logs not an array");
   const refunds = [];
   const foreignFulfillments = [];
+  const requests = [];
   for (const log of result) {
     if (!log || log.removed === true) continue;
     if (!sameAddress(log.address, net.coordinator)) continue;
     const decoded = decodeCoordinatorLog(log);
     if (!decoded) continue;
-    if (decoded.kind === "refund") refunds.push(decoded);
+    if (decoded.kind === "requested") requests.push({ id: decoded.requestId, consumer: decoded.consumer });
+    else if (decoded.kind === "refund") refunds.push(decoded);
     else if (!ourSubmitter(decoded.submitter, net)) foreignFulfillments.push(decoded);
   }
-  return { refunds, foreignFulfillments };
+  return { refunds, foreignFulfillments, requests };
 }

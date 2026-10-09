@@ -23,6 +23,8 @@ export const SELECTORS = Object.freeze({
 });
 
 export const TOPICS = Object.freeze({
+  // RandomnessRequested(uint256 indexed requestId, address indexed consumer, bytes32 indexed keyHash, ...): the same on both coordinators.
+  randomnessRequested: "0xaf91b17376114a36689aa115062983bda7b43263a891fb8de0cc69d30d4240ad",
   requestRefundedTo: "0x0f6107d218fea62a20553f3700dba7c94dcf653bd2027c0bf1ebe0832f42a506",
   randomnessFulfilled: "0x9c82683ee7932041c254d206bcce4241d66a811d53ee7191799cc120777b2b87",
 });
@@ -80,6 +82,8 @@ export const NETWORKS = Object.freeze({
     // Blockdaemon accepts batches from Cloudflare egress; the public endpoint rate-limits them.
     rpcs: Object.freeze(["https://rpc.blockdaemon.mainnet.arc.io", "https://rpc.mainnet.arc.io"]),
     explorer: "https://arc.d20dao.org",
+    // One Telegram notice when a consumer contract makes its first request (src/consumers.js).
+    newConsumerNotice: true,
     healthKeySecret: "HEALTH_KEY_ARC_MAINNET",
     backupHealthKeySecret: "HEALTH_KEY_ARC_MAINNET_BACKUP",
     // x402 agent API: its public /health and the balance of its relayer wallet. Unwatched while `enabled` is false:
@@ -112,6 +116,7 @@ export const NETWORKS = Object.freeze({
     feeCapWei: 100n * GWEI,
     rpcs: Object.freeze(["https://rpc.blockdaemon.testnet.arc.io", "https://rpc.testnet.arc.io"]),
     explorer: "https://arc-testnet.d20dao.org",
+    newConsumerNotice: false,
     healthKeySecret: "HEALTH_KEY_ARC_TESTNET",
     backupHealthKeySecret: "HEALTH_KEY_ARC_TESTNET_BACKUP",
     agentApi: Object.freeze({
@@ -172,6 +177,8 @@ export const ROUND_SELECTORS = Object.freeze({
  *   keyedRpcSecret   name of an optional secret holding a keyed endpoint URL (dRPC: https://lb.drpc.org/<network>/<key>), tried
  *                    first for state and logs. A keyed endpoint is limited per key, not per source IP. Unset by default.
  *   slowIntervalSeconds  how often the roles, pricing and beacon are read (the code hashes once a day whatever it is)
+ *   newConsumerNotice    one Telegram notice when a consumer contract makes its first request (src/consumers.js)
+ *   requestExplorer      the site's request pages: <requestExplorer>/<chainId>/<coordinator>/<id>
  *   readIntervalSeconds  how often the coordinator is read: 60 reads it every run, 300 every fifth minute. Report checks run
  *                    every minute either way; between reads the chain checks keep their state.
  */
@@ -227,6 +234,8 @@ export const ROUND_NETWORKS = Object.freeze({
       Object.freeze({ url: "https://rpc.testnet.chain.robinhood.com", maxBlocks: 5000 }),
     ]),
     slowIntervalSeconds: 1800,
+    newConsumerNotice: false,
+    requestExplorer: "https://d20dao.org/explorer/request",
     keyedRpcSecret: "RPC_URL_ROBINHOOD_TESTNET",
     explorer: null,
     healthKeySecret: "HEALTH_KEY_ROBINHOOD_TESTNET",
@@ -280,6 +289,8 @@ export const ROUND_NETWORKS = Object.freeze({
       Object.freeze({ url: "https://rpc.mainnet.chain.robinhood.com", maxBlocks: 5000 }),
     ]),
     slowIntervalSeconds: 600,
+    newConsumerNotice: true,
+    requestExplorer: "https://d20dao.org/explorer/request",
     keyedRpcSecret: "RPC_URL_ROBINHOOD_MAINNET",
     explorer: null,
     healthKeySecret: "HEALTH_KEY_ROBINHOOD_MAINNET",
@@ -421,6 +432,9 @@ export const LIMITS = Object.freeze({
   roundMaxSubrequests: 9,
   // Blocks in one eth_getLogs call to dRPC, keyless or keyed (its keyless tier refuses about 150).
   roundDrpcLogBlocks: 100,
+  // New consumer notice: requests from before the watchdog's first run read a batch a run to learn their consumers. On Arc the
+  // batch rides in the round B fetch; on Robinhood it takes what is left of the network's fetch budget.
+  consumerSeedBatch: 100,
   // An endpoint that refused a batch for its rate or plan limits is tried only after the others for this long.
   roundRpcCooldownSeconds: 600,
   roundLogMaxLagBlocks: 30_000,

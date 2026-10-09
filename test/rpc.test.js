@@ -216,7 +216,8 @@ test("log scan: cursor + 1 to head, capped at 5,000 blocks, refunds and foreign 
   assert.equal(getLogs.fromBlock, "0x" + (80001).toString(16));
   assert.equal(getLogs.toBlock, "0x" + (85000).toString(16));
   assert.equal(getLogs.address, TESTNET.coordinator);
-  assert.deepEqual(getLogs.topics, [[TOPICS.requestRefundedTo, TOPICS.randomnessFulfilled]]);
+  // RandomnessRequested rides along for the new consumer notice: the same call, no extra fetch.
+  assert.deepEqual(getLogs.topics, [[TOPICS.requestRefundedTo, TOPICS.randomnessFulfilled, TOPICS.randomnessRequested]]);
   assert.equal(behind.logCursor, 85000);
   assert.deepEqual(behind.logs.refunds.map((r) => r.requestId), [812n]);
   assert.equal(behind.logs.refunds[0].paid, false);
@@ -359,4 +360,36 @@ test("a session with a bound refuses a longer reply as 'reply too large' and tri
   const unbounded = new RpcSession(["https://a.example"], { fetch: async () => Response.json([{ jsonrpc: "2.0", id: 1, result: "0x" + "ab".repeat(100000) }]) });
   assert.equal((await unbounded.batch([["eth_chainId", []]]))[0].result.length, 200002);
   assert.equal(unbounded.maxBytes, undefined);
+});
+
+test("new consumer notice on Arc: RandomnessRequested logs give live consumers, old requests ride in the round B fetch", async () => {
+  const consumer = "0x3333333333333333333333333333333333333333";
+  const rpc = mockRpc(TESTNET, {
+    next: 973n,
+    requests: {
+      1: encodeRequest({ consumer: "0x1111111111111111111111111111111111111111" }),
+      2: encodeRequest({ consumer }),
+    },
+    logs: [
+      {
+        address: TESTNET.coordinator,
+        blockNumber: "0x10",
+        topics: [TOPICS.randomnessRequested, "0x" + word(972), "0x" + addressWord(consumer), "0x" + "ab".repeat(32)],
+        data: "0x" + word(0).repeat(6),
+      },
+    ],
+  });
+  const read = await readChain(TESTNET, { logCursor: 62576700, logSpan: 5000 }, { fetch: rpc.fetch, consumerSeed: { fromId: 1n, toId: 4n } });
+  assert.equal(rpc.calls.length, 2, "no extra fetch");
+  assert.deepEqual(read.logs.requests, [{ id: 972n, consumer }]);
+  // Id 3 is not answered (undefined result decodes as an error): the batch ends before it and the rest comes next run.
+  assert.deepEqual(read.consumerSeed, {
+    fromId: 1n,
+    toId: 3n,
+    consumers: [
+      { id: 1n, consumer: "0x1111111111111111111111111111111111111111" },
+      { id: 2n, consumer },
+    ],
+  });
+  assert.equal(read.complete, true, "a seed batch that stops early is not a failed read");
 });

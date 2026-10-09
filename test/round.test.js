@@ -915,3 +915,30 @@ test("keyed endpoint: an optional secret URL goes first for state and logs, and 
   await readRoundChain(net, state, { fetch: node.fetch, nowSec: NOW + 120 });
   assert.ok(!node.urls.includes(keyedRpc));
 });
+
+test("new consumer notice on Robinhood: logs and request reads give consumers, old requests take what is left of the budget", async () => {
+  const net = await pinnedNet({ logRpcs: RH.logRpcs });
+  const node = fakeNode(net);
+  node.chain.next = 3n;
+  const first = applyRoundRead(net, null, await readRoundChain(net, null, { fetch: node.fetch, nowSec: NOW }), NOW);
+  node.chain.next = 4n;
+  node.chain.head = 1100;
+  node.chain.logs = [
+    { address: net.coordinator, blockNumber: "0x" + (1050).toString(16), topics: [TOPICS.randomnessRequested, "0x" + word(3), "0x" + addressWord(BACKUP), "0x" + "ab".repeat(32)], data: "0x" + word(0).repeat(6) },
+  ];
+  // PublicNode takes the whole history batch in one fetch.
+  let read = await readRoundChain(net, first, { fetch: node.fetch, nowSec: NOW + 60, consumerSeed: { fromId: 1n, toId: 3n } });
+  assert.deepEqual(read.logs.requests, [{ id: 3n, consumer: BACKUP.toLowerCase() }]);
+  assert.deepEqual(read.consumers.map((c) => c.id), [3n], "the request scan's consumers too");
+  assert.deepEqual(read.consumerSeed, { fromId: 1n, toId: 3n, consumers: [1n, 2n].map((id) => ({ id, consumer: "0x1111111111111111111111111111111111111111" })) });
+  // On dRPC alone, 3 ids a fetch with what the budget leaves; never a failure.
+  const drpc = "https://robinhood-testnet.drpc.org";
+  const tight = await pinnedNet({ rpcs: [drpc], logRpcs: [{ url: drpc }] });
+  const node2 = fakeNode(tight);
+  node2.chain.next = 200n;
+  const state = { ...first, scanCursor: "200", slowAt: NOW, codeCheck: applyRoundRead(net, null, await readRoundChain(net, null, { fetch: node.fetch, nowSec: NOW }), NOW).codeCheck };
+  read = await readRoundChain(tight, state, { fetch: node2.fetch, nowSec: NOW + 60, consumerSeed: { fromId: 1n, toId: 200n } });
+  assert.equal(read.complete, true);
+  assert.equal(read.subrequests, LIMITS.roundMaxSubrequests);
+  assert.equal(read.consumerSeed.toId - read.consumerSeed.fromId, BigInt(3 * (LIMITS.roundMaxSubrequests - 2)), "fast 2 (no new blocks to scan), the rest for history");
+});

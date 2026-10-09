@@ -251,7 +251,7 @@ export class RoundSession {
  * subrequests}; figures are null when unknown or not read this run. `scan` is null when the requests were not read; `logs` is null
  * when unknown; `code` is null when the code was not read this run; `slow` says whether the slow part was read.
  */
-export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec = Math.floor(Date.now() / 1000), keyedRpc = null } = {}) {
+export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec = Math.floor(Date.now() / 1000), keyedRpc = null, consumerSeed = null } = {}) {
   const keyed = typeof keyedRpc === "string" && /^https:\/\//.test(keyedRpc.trim()) ? keyedRpc.trim() : null;
   const cooldowns = previous?.cooldowns ?? {};
   const budget = { left: LIMITS.roundMaxSubrequests };
@@ -290,6 +290,9 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
     code: null,
     scan: null,
     logs: null,
+    // New consumer notice: [{id, consumer}] of the requests decoded this run, and a batch of old requests (see readChain).
+    consumers: [],
+    consumerSeed: null,
     scanCursor: previous?.scanCursor == null ? null : BigInt(previous.scanCursor),
     logCursor: previous?.logCursor ?? null,
   };
@@ -358,6 +361,7 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
     } else {
       // Ids past the window (or the head of a first scan) are unread: `pending.more`.
       const requests = scanIds.map((id, i) => ({ id, request: pick(b[i], decodeRoundRequest, errors, `getRoundRequest ${id}`) }));
+      for (const { id, request } of requests) if (request) out.consumers.push({ id, consumer: request.consumer });
       const walk = walkRequests(requests, out.scanCursor, out.block.timestamp, { quiet, more: end < next });
       out.scan = { fromId: scanIds[0] ?? out.scanCursor, ids: scanIds.length, ...walk };
       out.scanCursor = walk.cursor;
@@ -436,6 +440,24 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
     errors.push(`logs: ${logRead.error}`);
   }
 
+  // Old requests for the new consumer notice, with what is left of the budget: never a failure, the rest comes next run.
+  if (consumerSeed && budget.left > 0 && session.url) {
+    const cap = batchCap(session.url);
+    const most = Number.isFinite(cap) ? cap * budget.left : LIMITS.consumerSeedBatch;
+    const ids = [];
+    for (let id = BigInt(consumerSeed.fromId); id < BigInt(consumerSeed.toId) && ids.length < most; id++) ids.push(id);
+    const d = ids.length === 0 ? null : await session.batch(ids.map((id) => call(encodeGetRoundRequest(id))), notRateLimited);
+    if (d) {
+      const consumers = [];
+      for (const [i, id] of ids.entries()) {
+        const request = pick(d[i], decodeRoundRequest, [], `getRoundRequest ${id}`);
+        if (!request) break;
+        consumers.push({ id, consumer: request.consumer });
+      }
+      if (consumers.length > 0) out.consumerSeed = { fromId: ids[0], toId: ids[0] + BigInt(consumers.length), consumers };
+    }
+  }
+
   // As on Arc, a view that could not be decoded leaves its figure unknown without failing the read; what was due and could be
   // paid for must be read. A part deferred for the budget is not a failure.
   const scanKnown = out.scan?.pending != null || out.deferred.includes("requests") || out.nextRequestId == null;
@@ -468,7 +490,7 @@ export function logEndpoints(net, keyed = null) {
  * Returns {logs, cursor, rpc, deferred, subrequests, failures} or {logs: null, error, subrequests, failures}.
  */
 export async function readLogs(net, cursor, head, { fetch, timeoutMs, cooldowns = {}, nowSec = 0, keyed = null, budget = { left: Infinity } } = {}) {
-  const empty = { fromBlock: null, toBlock: null, skippedBlocks: 0, refunds: [], foreignFulfillments: [] };
+  const empty = { fromBlock: null, toBlock: null, skippedBlocks: 0, refunds: [], foreignFulfillments: [], requests: [] };
   // First run: start watching from the current head, no historical backfill.
   if (cursor == null) return { logs: empty, cursor: head, rpc: null, subrequests: 0, failures: [] };
   if (cursor >= head) return { logs: empty, cursor, rpc: null, subrequests: 0, failures: [] };
@@ -492,6 +514,7 @@ export async function readLogs(net, cursor, head, { fetch, timeoutMs, cooldowns 
     const session = new RpcSession([endpoint.url], { fetch, timeoutMs });
     const refunds = [];
     const foreignFulfillments = [];
+    const requests = [];
     let readTo = null;
     let failed = null;
     let deferred = false;
@@ -505,7 +528,7 @@ export async function readLogs(net, cursor, head, { fetch, timeoutMs, cooldowns 
       const items = await session.batch(
         group.map(([from, to]) => [
           "eth_getLogs",
-          [{ address: net.coordinator, fromBlock: toQuantity(from), toBlock: toQuantity(to), topics: [[TOPICS.requestRefundedTo, TOPICS.randomnessFulfilled]] }],
+          [{ address: net.coordinator, fromBlock: toQuantity(from), toBlock: toQuantity(to), topics: [[TOPICS.requestRefundedTo, TOPICS.randomnessFulfilled, TOPICS.randomnessRequested]] }],
         ]),
         notRateLimited,
       );
@@ -522,6 +545,7 @@ export async function readLogs(net, cursor, head, { fetch, timeoutMs, cooldowns 
         }
         refunds.push(...decoded.refunds);
         foreignFulfillments.push(...decoded.foreignFulfillments);
+        requests.push(...decoded.requests);
       }
       if (failed) break;
       readTo = group.at(-1)[1];
@@ -531,7 +555,7 @@ export async function readLogs(net, cursor, head, { fetch, timeoutMs, cooldowns 
     if (!failed) {
       if (readTo == null) return { logs: empty, cursor, rpc: null, deferred: true, subrequests, failures };
       return {
-        logs: { fromBlock, toBlock: readTo, skippedBlocks, refunds, foreignFulfillments },
+        logs: { fromBlock, toBlock: readTo, skippedBlocks, refunds, foreignFulfillments, requests },
         cursor: readTo,
         rpc: endpointId(endpoint.url, keyed),
         deferred,
@@ -553,15 +577,17 @@ function decodeLogs(result, net) {
   if (!Array.isArray(result)) throw new AbiError("logs not an array");
   const refunds = [];
   const foreignFulfillments = [];
+  const requests = [];
   for (const log of result) {
     if (!log || log.removed === true) continue;
     if (!sameAddress(log.address, net.coordinator)) continue;
     const decoded = decodeCoordinatorLog(log);
     if (!decoded) continue;
-    if (decoded.kind === "refund") refunds.push(decoded);
+    if (decoded.kind === "requested") requests.push({ id: decoded.requestId, consumer: decoded.consumer });
+    else if (decoded.kind === "refund") refunds.push(decoded);
     else if (!ourSubmitter(decoded.submitter, net)) foreignFulfillments.push(decoded);
   }
-  return { refunds, foreignFulfillments };
+  return { refunds, foreignFulfillments, requests };
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -305,6 +305,15 @@ export function decodeCoordinatorLog(log) {
         : null,
     };
   };
+  if (topic0 === TOPICS.randomnessRequested) {
+    if (log.topics.length !== 4) throw new AbiError("unexpected topic count");
+    return {
+      kind: "requested",
+      requestId: wordToBigInt(topicWord(log.topics[1])),
+      consumer: wordToAddress(topicWord(log.topics[2])),
+      blockNumber: log.blockNumber == null ? null : hexToSafeNumber(log.blockNumber),
+    };
+  }
   if (topic0 === TOPICS.requestRefundedTo) {
     const record = base();
     const data = toWords(log.data ?? "0x");
