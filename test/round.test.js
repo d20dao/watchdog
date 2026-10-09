@@ -40,10 +40,14 @@ const IMPL = RH.implementations.coordinator[0];
 const hex = (bytes) => "0x" + Buffer.from(bytes).toString("hex");
 const selector = (signature) => hex(keccak_256(new TextEncoder().encode(signature))).slice(0, 10);
 
-/** The testnet configuration with code pins that match the fake node's code. */
+/**
+ * The testnet configuration with code pins that match the fake node's code, and logs read in one call from Robinhood's own
+ * endpoint (the dRPC chunking and the endpoint order are tested on their own below).
+ */
 async function pinnedNet(overrides = {}) {
   return {
     ...RH,
+    logRpcs: [RH.logRpcs.find((e) => /chain\.robinhood\.com/.test(e.url))],
     codeHashes: { proxy: await codeHash(PROXY_CODE), implementations: { [IMPL.toLowerCase()]: await codeHash(IMPL_CODE) } },
     ...overrides,
   };
@@ -759,42 +763,101 @@ test("cron: a fault in a round network's evaluation stays there; the Arc network
   assert.deepEqual(readAlerts(storage, arc.name).map((a) => a.check), ["committer"]);
 });
 
-test("round reader: an endpoint that refuses eth_call (HTTP 429 from Workers) falls back, and logs fall back to dRPC in capped chunks", async () => {
+test("endpoint order: keyless first and Robinhood's own last; a rate limit fails over in the run and cools the endpoint", async () => {
   for (const net of Object.values(WATCHED_ROUND_NETWORKS)) {
-    assert.ok(!/chain\.robinhood\.com/.test(net.rpcs[0]), `${net.name}: Robinhood's own endpoint is not first for state reads`);
+    assert.match(net.rpcs.at(-1), /chain\.robinhood\.com/, `${net.name}: Robinhood's own endpoint is the last state fallback`);
+    assert.match(net.logRpcs.at(-1).url, /chain\.robinhood\.com/, `${net.name}: and the last log fallback`);
     const drpc = net.logRpcs.find((e) => /drpc\.org/.test(e.url));
     assert.deepEqual([drpc.maxBlocks, drpc.maxBatch], [100, 3], `${net.name}: dRPC's keyless caps`);
+    assert.match(net.keyedRpcSecret, /^RPC_URL_ROBINHOOD_(TESTNET|MAINNET)$/);
   }
-  const net = await pinnedNet();
+  const net = await pinnedNet({ logRpcs: RH.logRpcs });
+  const [drpc, official] = net.logRpcs.map((e) => e.url);
   const node = fakeNode(net);
   node.chain.next = 3n;
   const first = applyRoundRead(net, null, await readRoundChain(net, null, { fetch: node.fetch, nowSec: NOW }), NOW);
-  // Every state call to the first endpoint is refused, and so is every log call to Robinhood's own endpoint.
-  node.setRefuse((url, calls) =>
-    (url === net.rpcs[0] && calls.some((c) => c.method === "eth_call")) || (url === net.logRpcs[0].url && calls[0].method === "eth_getLogs") ? 429 : null,
-  );
+
+  // A healthy run: logs from dRPC in chunks of 100 blocks, 3 to a fetch.
   node.chain.head = 1000 + 650;
   node.chain.logs = [refundLog(2, 1640)];
   node.batches.length = 0;
   node.urls.length = 0;
-  const read = await readRoundChain(net, first, { fetch: node.fetch, nowSec: NOW + 60 });
+  let read = await readRoundChain(net, first, { fetch: node.fetch, nowSec: NOW + 60 });
+  assert.equal(read.complete, true, read.error);
+  assert.deepEqual(node.batches.filter((b, i) => node.urls[i] === drpc).map((b) => b.length), [3, 3, 1], "650 blocks: 7 calls, 3 to a batch");
+  assert.deepEqual(read.logs.refunds.map((r) => r.requestId), [2n]);
+  assert.deepEqual(read.rateLimited, []);
+  let state = applyRoundRead(net, first, read, NOW + 60);
+
+  // PublicNode answers HTTP 429 and dRPC a batch of rate-limit errors: both fail over to Robinhood's own endpoint in the same run,
+  // the read is complete, and both are cooled.
+  node.setRefuse((url) => (url === net.rpcs[0] ? 429 : null));
+  const realFetch = node.fetch;
+  const fetchLimited = async (url, init) => {
+    if (url !== drpc) return realFetch(url, init);
+    const calls = JSON.parse(init.body);
+    return Response.json(calls.map((c) => ({ jsonrpc: "2.0", id: c.id, error: { code: 429, message: "Too many requests" } })));
+  };
+  node.chain.head = 1700;
+  node.batches.length = 0;
+  node.urls.length = 0;
+  read = await readRoundChain(net, state, { fetch: fetchLimited, nowSec: NOW + 120 });
   assert.equal(read.complete, true, read.error);
   assert.equal(read.rpc, new URL(net.rpcs[1]).host);
-  assert.deepEqual([read.logs.fromBlock, read.logs.toBlock], [1001, 1650]);
-  assert.deepEqual(read.logs.refunds.map((r) => r.requestId), [2n]);
-  const drpc = net.logRpcs[1].url;
-  const logBatches = node.batches.filter((b, i) => node.urls[i] === drpc);
-  assert.deepEqual(logBatches.map((b) => b.length), [3, 3, 1], "650 blocks: 7 calls of at most 100 blocks, 3 to a batch");
-  // Round A: 1 refused and 1 on the second endpoint (no request to scan); logs: 1 refused and 3 dRPC fetches.
-  assert.equal(read.subrequests, 2 + 1 + 3);
+  assert.equal(read.logRpc, new URL(official).host);
+  assert.deepEqual(read.rateLimited, [
+    { endpoint: new URL(net.rpcs[0]).host, step: "state" },
+    { endpoint: new URL(drpc).host, step: "logs" },
+  ]);
+  state = applyRoundRead(net, state, read, NOW + 120);
+  assert.equal(state.consecutiveFailures, 0, "a rate limit that another endpoint covered is not a failed read");
+  assert.deepEqual(state.cooldowns, {
+    [new URL(net.rpcs[0]).host]: NOW + 120 + LIMITS.roundRpcCooldownSeconds,
+    [new URL(drpc).host]: NOW + 120 + LIMITS.roundRpcCooldownSeconds,
+  });
 
-  // A long backlog on dRPC is read 1,800 blocks a run.
+  // While cooling, the cooled endpoints are not asked first: one fetch each for state and logs, on Robinhood's own endpoint.
+  node.setRefuse(() => null);
+  node.chain.head = 1750;
+  node.urls.length = 0;
+  node.batches.length = 0;
+  read = await readRoundChain(net, state, { fetch: node.fetch, nowSec: NOW + 180 });
+  assert.equal(read.complete, true);
+  assert.deepEqual(node.urls, [official, official]);
+  // After the cooldown, the configured order again.
+  node.chain.head = 1800;
+  node.urls.length = 0;
+  read = await readRoundChain(net, applyRoundRead(net, state, read, NOW + 180), { fetch: node.fetch, nowSec: NOW + 120 + LIMITS.roundRpcCooldownSeconds + 1 });
+  assert.deepEqual(node.urls, [net.rpcs[0], drpc]);
+  assert.deepEqual(applyRoundRead(net, state, read, NOW + 120 + LIMITS.roundRpcCooldownSeconds + 1).cooldowns, {});
+
+  // A long backlog on dRPC is read 1,800 blocks a run, and every log endpoint failing leaves the logs unknown.
   const behind = await readLogs(net, 10_000, 20_000, { fetch: node.fetch });
   assert.deepEqual([behind.logs.fromBlock, behind.logs.toBlock], [10_001, 11_800]);
-  assert.equal(behind.cursor, 11_800);
-  // Every log endpoint failing leaves the logs unknown and names the last error.
   node.setRefuse(() => 429);
   const none = await readLogs(net, 1000, 1100, { fetch: node.fetch });
   assert.equal(none.logs, null);
-  assert.match(none.error, /drpc\.org: http 429/);
+  assert.match(none.error, /chain\.robinhood\.com: http 429/);
+});
+
+test("keyed endpoint: an optional secret URL goes first for state and logs, and its URL is never stored or reported", async () => {
+  const net = await pinnedNet({ logRpcs: RH.logRpcs });
+  const node = fakeNode({ ...net, rpcs: [...net.rpcs, "https://keyed.example/v2/SECRET-KEY"] });
+  const keyedRpc = "https://keyed.example/v2/SECRET-KEY";
+  node.chain.next = 3n;
+  const first = applyRoundRead(net, null, await readRoundChain(net, null, { fetch: node.fetch, nowSec: NOW, keyedRpc }), NOW);
+  node.chain.head = 1300;
+  node.urls.length = 0;
+  node.setRefuse((url) => (url === keyedRpc ? 429 : null));
+  const read = await readRoundChain(net, first, { fetch: node.fetch, nowSec: NOW + 60, keyedRpc });
+  assert.equal(read.complete, true);
+  assert.deepEqual(read.rateLimited, [{ endpoint: "keyed", step: "state" }, { endpoint: "keyed", step: "logs" }]);
+  const state = applyRoundRead(net, first, read, NOW + 60);
+  assert.doesNotMatch(JSON.stringify(state) + JSON.stringify(read.rateLimited) + read.rpc, /SECRET|keyed\.example/);
+  assert.deepEqual(Object.keys(state.cooldowns), ["keyed"]);
+  // Without the secret nothing changes.
+  node.urls.length = 0;
+  node.setRefuse(() => null);
+  await readRoundChain(net, state, { fetch: node.fetch, nowSec: NOW + 120 });
+  assert.ok(!node.urls.includes(keyedRpc));
 });

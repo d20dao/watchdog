@@ -56,6 +56,39 @@ function decodeBlock(block) {
   };
 }
 
+/**
+ * An endpoint's id in stored state and logs: its host, or "keyed" for the optional keyed endpoint from a secret, whose URL may
+ * carry its key and is never stored or logged.
+ */
+export const endpointId = (url, keyed = null) => {
+  if (keyed && url === keyed) return "keyed";
+  try {
+    return new URL(url).host;
+  } catch {
+    return "invalid";
+  }
+};
+
+/** A batch refused for rate or plan limits fails the endpoint, so the read moves on to the next one in the same run. */
+const notRateLimited = (items) => (items.some((item) => item?.rateLimited) ? "rate limited" : null);
+
+/**
+ * `list` (URLs, or log endpoints {url, ...}) in configured order with the endpoints still cooling down after a rate limit moved
+ * to the end: they are tried only when every other one has failed. The keyed endpoint, when set, goes first.
+ */
+export function orderEndpoints(list, cooldowns, nowSec, urlOf = (e) => e, keyed = null) {
+  const cooling = (e) => (cooldowns?.[endpointId(urlOf(e), keyed)] ?? 0) > nowSec;
+  return [...list.filter((e) => !cooling(e)), ...list.filter(cooling)];
+}
+
+/** The cooldowns after a read: expired ones dropped, each endpoint that refused for its limits this run cooled again. */
+export function nextCooldowns(previous, failures, nowSec, keyed = null) {
+  const out = {};
+  for (const [id, until] of Object.entries(previous ?? {})) if (until > nowSec) out[id] = until;
+  for (const f of failures) if (f.rateLimited) out[endpointId(f.url, keyed)] = nowSec + LIMITS.roundRpcCooldownSeconds;
+  return out;
+}
+
 /** The pins the code check compares with, as one string: a change of configuration makes the check due at once. */
 export function codePinsKey(net) {
   const pins = net.codeHashes;
@@ -136,8 +169,11 @@ export function walkRequests(requests, cursor, nowTs, { quiet = false, more = fa
  * Result always has {ok, complete, rpc, error, errors, subrequests}; figures are null when unknown. `scan` is null when the
  * requests were not read; `logs` is null when unknown or not scanned; `code` is null when the code was not read this run.
  */
-export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec = Math.floor(Date.now() / 1000) } = {}) {
-  const session = new RpcSession(net.rpcs, { fetch, timeoutMs });
+export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec = Math.floor(Date.now() / 1000), keyedRpc = null } = {}) {
+  const keyed = typeof keyedRpc === "string" && /^https:\/\//.test(keyedRpc.trim()) ? keyedRpc.trim() : null;
+  const cooldowns = previous?.cooldowns ?? {};
+  const stateUrls = [...(keyed ? [keyed] : []), ...orderEndpoints(net.rpcs, cooldowns, nowSec)];
+  const session = new RpcSession(stateUrls, { fetch, timeoutMs });
   const backups = net.backupKeepers ?? [];
   const errors = [];
   const out = {
@@ -147,6 +183,9 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
     error: null,
     errors,
     subrequests: 0,
+    // Endpoints that refused a batch for their limits this run: [{endpoint, step}] (ids, never URLs).
+    rateLimited: [],
+    cooldowns,
     block: null,
     nextRequestId: null,
     keeper: null,
@@ -169,9 +208,12 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
     scanCursor: previous?.scanCursor == null ? null : BigInt(previous.scanCursor),
     logCursor: previous?.logCursor ?? null,
   };
-  const finish = () => {
+  const finish = (logFailures = []) => {
     out.subrequests = session.subrequests;
-    out.rpc = session.endpoint;
+    out.rpc = session.index < stateUrls.length ? endpointId(stateUrls[session.index], keyed) : null;
+    const failures = [...session.failures.map((f) => ({ ...f, step: "state" })), ...logFailures.map((f) => ({ ...f, step: "logs" }))];
+    out.rateLimited = failures.filter((f) => f.rateLimited).map((f) => ({ endpoint: endpointId(f.url, keyed), step: f.step }));
+    out.cooldowns = nextCooldowns(cooldowns, failures, nowSec, keyed);
     return out;
   };
   const call = (data, tag = "latest") => ["eth_call", [{ to: net.coordinator, data }, tag]];
@@ -208,6 +250,7 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
 
   const a = await session.batch(roundA, (items) => {
     try {
+      if (notRateLimited(items)) return "rate limited";
       if (!("result" in items[0]) || hexToBigInt(items[0].result) !== BigInt(net.chainId)) return "wrong chain id";
       if (!("result" in items[1])) return `block: ${items[1].error}`;
       decodeBlock(items[1].result);
@@ -285,12 +328,12 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
   let logRead = null;
   const readScan = async () => {
     if (scanIds.length === 0) return [];
-    return session.batch(scanIds.map((id) => call(encodeGetRoundRequest(id))));
+    return session.batch(scanIds.map((id) => call(encodeGetRoundRequest(id))), notRateLimited);
   };
   const [b] = await Promise.all([
     readScan(),
     (async () => {
-      logRead = await readLogs(net, out.logCursor, head, { fetch, timeoutMs });
+      logRead = await readLogs(net, out.logCursor, head, { fetch, timeoutMs, cooldowns, nowSec, keyed });
     })(),
   ]);
 
@@ -316,7 +359,7 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
   // As on Arc, a view that could not be decoded leaves its figure unknown without failing the read; the requests and logs must be read.
   out.complete = !bFailed && out.logs != null && out.scan?.pending != null;
   if (!out.complete) out.error = bFailed ? session.lastError ?? "partial read" : errors.find((e) => /^(logs|getRoundRequest)/.test(e)) ?? "partial read";
-  const done = finish();
+  const done = finish(logRead.failures);
   done.subrequests += logRead.subrequests;
   return done;
 }
@@ -326,9 +369,12 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
  * with the full span in one call. A keyless endpoint may cap a getLogs range (dRPC: about 100 blocks) and a batch (dRPC: 3 calls),
  * and a public node may keep too few blocks to serve them at all.
  */
-export function logEndpoints(net) {
-  if (Array.isArray(net.logRpcs) && net.logRpcs.length > 0) return net.logRpcs;
-  return net.rpcs.map((url) => ({ url, maxBlocks: LIMITS.roundLogScanMaxBlocks, maxBatch: 1 }));
+export function logEndpoints(net, keyed = null) {
+  const list = Array.isArray(net.logRpcs) && net.logRpcs.length > 0
+    ? net.logRpcs
+    : net.rpcs.map((url) => ({ url, maxBlocks: LIMITS.roundLogScanMaxBlocks, maxBatch: 1 }));
+  // A keyed endpoint is a paid tier: a full span in one call.
+  return keyed ? [{ url: keyed, maxBlocks: LIMITS.roundLogScanMaxBlocks, maxBatch: 1 }, ...list] : list;
 }
 
 /**
@@ -337,11 +383,11 @@ export function logEndpoints(net) {
  * LIMITS.roundLogMaxFetches fetches a run (a backlog is caught up over later runs). Any failure moves the whole range to the next
  * endpoint. Returns {logs, cursor, rpc, subrequests} or {logs: null, error, subrequests}.
  */
-export async function readLogs(net, cursor, head, { fetch, timeoutMs } = {}) {
+export async function readLogs(net, cursor, head, { fetch, timeoutMs, cooldowns = {}, nowSec = 0, keyed = null } = {}) {
   const empty = { fromBlock: null, toBlock: null, skippedBlocks: 0, refunds: [], foreignFulfillments: [] };
   // First run: start watching from the current head, no historical backfill.
-  if (cursor == null) return { logs: empty, cursor: head, rpc: null, subrequests: 0 };
-  if (cursor >= head) return { logs: empty, cursor, rpc: null, subrequests: 0 };
+  if (cursor == null) return { logs: empty, cursor: head, rpc: null, subrequests: 0, failures: [] };
+  if (cursor >= head) return { logs: empty, cursor, rpc: null, subrequests: 0, failures: [] };
   let fromBlock = cursor + 1;
   let skippedBlocks = 0;
   if (head - cursor > LIMITS.roundLogMaxLagBlocks) {
@@ -352,7 +398,10 @@ export async function readLogs(net, cursor, head, { fetch, timeoutMs } = {}) {
   }
   let subrequests = 0;
   let error = "no log endpoint";
-  for (const endpoint of logEndpoints(net)) {
+  const failures = [];
+  const [first, ...rest] = logEndpoints(net, keyed);
+  const ordered = keyed ? [first, ...orderEndpoints(rest, cooldowns, nowSec, (e) => e.url)] : orderEndpoints([first, ...rest], cooldowns, nowSec, (e) => e.url);
+  for (const endpoint of ordered) {
     const maxBlocks = Math.max(1, Math.min(endpoint.maxBlocks ?? LIMITS.roundLogScanMaxBlocks, LIMITS.roundLogScanMaxBlocks));
     const maxBatch = Math.max(1, endpoint.maxBatch ?? 1);
     const span = Math.min(LIMITS.roundLogScanMaxBlocks, maxBlocks * maxBatch * LIMITS.roundLogMaxFetches);
@@ -370,6 +419,7 @@ export async function readLogs(net, cursor, head, { fetch, timeoutMs } = {}) {
           "eth_getLogs",
           [{ address: net.coordinator, fromBlock: toQuantity(from), toBlock: toQuantity(to), topics: [[TOPICS.requestRefundedTo, TOPICS.randomnessFulfilled]] }],
         ]),
+        notRateLimited,
       );
       if (!items) {
         failed = session.lastError ?? "failed";
@@ -387,16 +437,13 @@ export async function readLogs(net, cursor, head, { fetch, timeoutMs } = {}) {
       }
     }
     subrequests += session.subrequests;
+    failures.push(...session.failures);
     if (!failed) {
-      return { logs: { fromBlock, toBlock, skippedBlocks, refunds, foreignFulfillments }, cursor: toBlock, rpc: session.endpoint, subrequests };
+      return { logs: { fromBlock, toBlock, skippedBlocks, refunds, foreignFulfillments }, cursor: toBlock, rpc: endpointId(endpoint.url, keyed), subrequests, failures };
     }
-    let host = "endpoint";
-    try {
-      host = new URL(endpoint.url).host;
-    } catch {}
-    error = `${host}: ${failed}`;
+    error = `${endpointId(endpoint.url, keyed)}: ${failed}`;
   }
-  return { logs: null, error, subrequests };
+  return { logs: null, error, subrequests, failures };
 }
 
 /** Whether a fulfilment came from one of this network's own keeper wallets. */
@@ -461,6 +508,8 @@ export function applyRoundRead(net, previous, read, now) {
     oldestPendingAge: read.ok && read.scan?.pending?.oldest ? read.scan.pending.oldest.ageSeconds : null,
     scanCursor: read.ok ? str(read.scanCursor) : prev.scanCursor ?? null,
     logCursor: read.ok ? read.logCursor : prev.logCursor ?? null,
+    // Endpoints cooling down after a rate limit: {id: until}. Kept from a read that failed too, since that is when they matter.
+    cooldowns: read.cooldowns ?? prev.cooldowns ?? {},
     codeCheck: applyCodeRead(net, prev.codeCheck ?? null, read.code, now),
   };
   return state;

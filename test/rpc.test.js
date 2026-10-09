@@ -330,7 +330,7 @@ test("a call that reverted is marked as such; other errors are not, and say noth
   assert.deepEqual(items, [
     { error: "rpc error 3", revert: true },
     { error: "rpc error -32000", revert: true },
-    { error: "rpc error -32005" },
+    { error: "rpc error -32005", rateLimited: true }, // marked for callers that fail over on it; the Arc reader ignores it
     { error: "rpc error 3", revert: true },
     { error: "rpc error unknown" },
     { result: "0x1" },

@@ -23,6 +23,9 @@ import { FetchTimeoutError, ResponseTooLargeError, fetchText } from "./net.js";
 
 // An eth_call that reverted: code 3 on geth and reth, or another code with a message that says so.
 const isRevert = (error) => error?.code === 3 || (typeof error?.message === "string" && /revert/i.test(error.message));
+// A call the endpoint refused for its rate or plan limits rather than answered.
+const isRateLimit = (error) =>
+  error?.code === 429 || error?.code === -32005 || (typeof error?.message === "string" && /rate.?limit|too many requests|exceeded/i.test(error.message));
 
 export class RpcSession {
   /** `maxBytes` bounds one endpoint's reply: a longer one fails that endpoint. The chain reader sets none. */
@@ -34,6 +37,8 @@ export class RpcSession {
     this.index = 0;
     this.subrequests = 0;
     this.lastError = null;
+    // Each endpoint that failed a batch, in order: {url, error, rateLimited}. Read only by callers that track endpoints.
+    this.failures = [];
   }
 
   get endpoint() {
@@ -60,8 +65,10 @@ export class RpcSession {
         const problem = validate ? validate(outcome.items) : null;
         if (!problem) return outcome.items;
         this.lastError = problem;
+        this.failures.push({ url: this.urls[this.index], error: problem, rateLimited: outcome.items.some((item) => item?.rateLimited) });
       } else {
         this.lastError = outcome.error;
+        this.failures.push({ url: this.urls[this.index], error: outcome.error, rateLimited: outcome.error === "http 429" });
       }
       this.index++;
     }
@@ -103,6 +110,7 @@ export class RpcSession {
         ? {
             error: `rpc error ${Number.isInteger(entry.error?.code) ? entry.error.code : "unknown"}`,
             ...(isRevert(entry.error) ? { revert: true } : {}),
+            ...(isRateLimit(entry.error) ? { rateLimited: true } : {}),
           }
         : { result: entry.result };
     }

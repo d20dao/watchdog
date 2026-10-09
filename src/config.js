@@ -165,9 +165,11 @@ export const ROUND_SELECTORS = Object.freeze({
  *   balances         wallet thresholds in wei (native ETH; one fulfilment costs about 0.0000056 ETH): the keeper's, and each backup's
  *   reports          the keepers' HEALTH_INTERVAL_SECONDS and the report thresholds scaled to it (see reportThresholds); Arc
  *                    networks have none and use THRESHOLDS
- *   rpcs             keyless endpoints for the state reads, in order. Each must take a batch of about 20 calls and serve eth_call
- *                    from Cloudflare: Robinhood's own endpoint answers eth_call from Workers with HTTP 429, so it comes last.
+ *   rpcs             keyless endpoints for the state reads, in order. Each must take a batch of about 20 calls. Robinhood's own
+ *                    endpoints rate-limit by source IP, and Cloudflare's egress IPs are shared with every other Worker, so they
+ *                    answer the watchdog with HTTP 429 at random: they come last, as a fallback only.
  *   logRpcs          endpoints for eth_getLogs, in order, with the range (`maxBlocks`) and batch (`maxBatch`) each accepts
+ *   keyedRpcSecret   name of an optional secret holding a keyed endpoint URL, tried first for state and logs; unset by default
  *   readIntervalSeconds  how often the coordinator is read: 60 reads it every run, 300 every fifth minute. Report checks run
  *                    every minute either way; between reads the chain checks keep their state.
  */
@@ -219,9 +221,10 @@ export const ROUND_NETWORKS = Object.freeze({
     // too few for the state reads, so it serves logs only.
     rpcs: Object.freeze(["https://robinhood-sepolia-rpc.publicnode.com", "https://rpc.testnet.chain.robinhood.com"]),
     logRpcs: Object.freeze([
-      Object.freeze({ url: "https://rpc.testnet.chain.robinhood.com", maxBlocks: 5000, maxBatch: 1 }),
       Object.freeze({ url: "https://robinhood-testnet.drpc.org", maxBlocks: 100, maxBatch: 3 }),
+      Object.freeze({ url: "https://rpc.testnet.chain.robinhood.com", maxBlocks: 5000, maxBatch: 1 }),
     ]),
+    keyedRpcSecret: "RPC_URL_ROBINHOOD_TESTNET",
     explorer: null,
     healthKeySecret: "HEALTH_KEY_ROBINHOOD_TESTNET",
     backupHealthKeySecret: "HEALTH_KEY_ROBINHOOD_TESTNET_BACKUP",
@@ -270,9 +273,10 @@ export const ROUND_NETWORKS = Object.freeze({
     // As on testnet. PublicNode's mainnet nodes keep only about 80 blocks (8 s), enough for the state reads, not for logs.
     rpcs: Object.freeze(["https://robinhood-rpc.publicnode.com", "https://rpc.mainnet.chain.robinhood.com"]),
     logRpcs: Object.freeze([
-      Object.freeze({ url: "https://rpc.mainnet.chain.robinhood.com", maxBlocks: 5000, maxBatch: 1 }),
       Object.freeze({ url: "https://robinhood.drpc.org", maxBlocks: 100, maxBatch: 3 }),
+      Object.freeze({ url: "https://rpc.mainnet.chain.robinhood.com", maxBlocks: 5000, maxBatch: 1 }),
     ]),
+    keyedRpcSecret: "RPC_URL_ROBINHOOD_MAINNET",
     explorer: null,
     healthKeySecret: "HEALTH_KEY_ROBINHOOD_MAINNET",
     backupHealthKeySecret: "HEALTH_KEY_ROBINHOOD_MAINNET_BACKUP",
@@ -411,6 +415,8 @@ export const LIMITS = Object.freeze({
   // Fetches one log endpoint may take a run: with dRPC's caps (100 blocks a call, 3 calls a batch) 6 fetches cover 1,800 blocks,
   // three minutes of mainnet (about 10 blocks a second) or five of testnet (about 5.5).
   roundLogMaxFetches: 6,
+  // An endpoint that refused a batch for its rate or plan limits is tried only after the others for this long.
+  roundRpcCooldownSeconds: 600,
   roundLogMaxLagBlocks: 30_000,
   // Runtime code hashes are compared once a day, and an hour after a read that failed.
   roundCodeCheckIntervalSeconds: 24 * 3600,

@@ -123,13 +123,23 @@ Endpoints, all keyless, in order (`rpcs` for state, `logRpcs` for logs):
 
 | Network | State reads | Logs |
 | --- | --- | --- |
-| `robinhood-mainnet` | `robinhood-rpc.publicnode.com`, then `rpc.mainnet.chain.robinhood.com` | `rpc.mainnet.chain.robinhood.com`, then `robinhood.drpc.org` |
-| `robinhood-testnet` | `robinhood-sepolia-rpc.publicnode.com`, then `rpc.testnet.chain.robinhood.com` | `rpc.testnet.chain.robinhood.com`, then `robinhood-testnet.drpc.org` |
+| `robinhood-mainnet` | `robinhood-rpc.publicnode.com`, then `rpc.mainnet.chain.robinhood.com` | `robinhood.drpc.org`, then `rpc.mainnet.chain.robinhood.com` |
+| `robinhood-testnet` | `robinhood-sepolia-rpc.publicnode.com`, then `rpc.testnet.chain.robinhood.com` | `robinhood-testnet.drpc.org`, then `rpc.testnet.chain.robinhood.com` |
 
-Robinhood's own endpoints answer `eth_call` from Cloudflare Workers with HTTP 429 (block reads still work), so they come after
-PublicNode for state. PublicNode takes large batches but keeps only about 80 blocks of state on mainnet and 128 on testnet, too few
+Robinhood's own endpoints rate-limit by source IP, and Cloudflare's egress IPs are shared with every other Worker, so they answer the
+watchdog with HTTP 429 at random whatever its own volume (on mainnet, every `eth_call` batch for a while). They come last, as a
+fallback only. PublicNode takes large batches but keeps only about 80 blocks of state on mainnet and 128 on testnet, too few
 for logs. dRPC's keyless tier takes at most 3 calls a batch and about 100 blocks a `getLogs`, so it serves only logs, in chunks of
 100 blocks, 3 to a fetch, at most 6 fetches (1,800 blocks) a run.
+
+An endpoint that answers HTTP 429, or a batch whose calls come back rate-limited, fails over to the next endpoint in the same run, and
+is then tried only after the others for 10 minutes (`cooldowns` in the stored state). A read counts as failed only when every
+endpoint failed for some part of it (state, requests or logs), so `rpc` warns only after 3 such runs in a row. Each run's summary
+lists the endpoints that refused it under `rateLimited`.
+
+If the keyless endpoints prove unreliable too, a keyed endpoint can be added without a code change: set the secret
+`RPC_URL_ROBINHOOD_MAINNET` (or `RPC_URL_ROBINHOOD_TESTNET`) to its HTTPS URL. It is then tried first for state and logs, in one
+`getLogs` call per run. Its URL is never stored or logged (it appears as `keyed`). Unset by default.
 
 Each read:
 
@@ -139,7 +149,8 @@ Each read:
   `eth_getCode` of the proxy and each accepted implementation (about 25 KB).
 * **Round B** (`latest`, only when there is something to read): `getRoundRequest` for the requests from the oldest one not yet
   settled (at most 32 a run).
-* **Logs**, alongside round B: `eth_getLogs` from the stored cursor (at most 5,000 blocks a run, 1,800 on dRPC).
+* **Logs**, alongside round B: `eth_getLogs` from the stored cursor (at most 5,000 blocks a run, 1,800 on dRPC: two fetches a minute
+  on mainnet, five or six every five minutes on testnet).
 
 Public endpoints keep little state (Robinhood's own about 6,000 blocks), so nothing reads deep history. Requests are read by id at the head: a
 fulfilled or refunded one is settled, an open one past its deadline is reported once as `expired`, and the cursor stops at the first
@@ -462,7 +473,7 @@ The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an 
 | --- | --- |
 | Worker CPU 10 ms per invocation | The Worker only routes: report validation plus hashing measured ~0.1–0.4 ms (up to ~1.7 ms on a cold isolate) for 0.5–61 KB reports. The cron handler just calls the Durable Object. The hash code is never evaluated here. |
 | Durable Object CPU (30 s per request) | A full run for both networks with replayed live RPC responses measured ~0.4 ms warm and ~1.6 ms cold. A worst-case 5,000-block scan returning 1,000 logs measured ~3.5–5 ms. The drand beacon monitor's own work (records, signature comparison, ABI, state) measured ~0.3 ms per run warm before a beacon is registered and ~0.45 ms after (two slot signers included), against local fakes; the first slot signer after the object starts adds ~4 ms of module evaluation. |
-| Subrequests 50 per invocation | Each Robinhood network adds 2 or 3 fetches in a run that reads it (round A, round B when a request is open, one log fetch); with every fallback used, at most 3 for the state reads (round B stays on the endpoint round A ended on) and 1 + 6 for logs, so ≤ 20 for both, in the runs (one in five) that read testnet. With everything else at its worst too, a run reaches the limit of 50. 2 batches per Arc network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper and agent API relayer balances are extra calls inside the round A batch, so they add no fetches. Each watched agent API adds 1 `/health` poll, so ≤ 17 in total. The drand beacon adds 10 in the steady state (4 `latest` reads, 4 earlier-round reads and 1 registry batch per network; the networks share the relays, and the batch holds every call the monitor makes, up to 18, so the catalog and the verifier check add no fetch), 11 in a run that reads a relay's `/info` (the first four runs, then four a day), and ≤ 13 at most (both registries on their second endpoint), so ≤ 30 in total. |
+| Subrequests 50 per invocation | Each Robinhood network adds 2 or 3 fetches in a run that reads it (round A, round B when a request is open, one log fetch); with every fallback used, at most 3 for the state reads (round B stays on the endpoint round A ended on) and 1 + 6 for logs, so ≤ 20 for both, in the runs (one in five) that read testnet. With everything else at its worst too, a run reaches the limit of 50. Normally mainnet takes 3 a minute (round A, logs in 2 dRPC fetches) and testnet 7 every five minutes. 2 batches per Arc network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper and agent API relayer balances are extra calls inside the round A batch, so they add no fetches. Each watched agent API adds 1 `/health` poll, so ≤ 17 in total. The drand beacon adds 10 in the steady state (4 `latest` reads, 4 earlier-round reads and 1 registry batch per network; the networks share the relays, and the batch holds every call the monitor makes, up to 18, so the catalog and the verifier check add no fetch), 11 in a run that reads a relay's `/info` (the first four runs, then four a day), and ≤ 13 at most (both registries on their second endpoint), so ≤ 30 in total. |
 | DO requests 100,000/day | 2 networks × 2 keepers (primary and backup) × 2,880 reports + 1,440 cron runs ≈ 13,000/day, plus status views (edge-cached 15 s). Robinhood testnet's two keepers at 300 s add 576, and mainnet's two at 60 s add 2,880: ≈ 16,500/day. |
 | DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. Agent API poll state is 1 row per watched network per run, ≈ 1,440/day each. Alerts and messages only change on transitions. The drand beacon keeps 3 rows a run (its relays, each network), ≈ 4,300/day. Arc ≈ 68,000/day with both agent APIs watched. Robinhood testnet, thinned: 5 × 576 reports from its two keepers at 300 s plus 288 state writes (one per 5-minute read) ≈ 3,200. Robinhood mainnet at 60 s: 5 × 2,880 reports plus 1,440 state writes ≈ 15,800. Total ≈ 87,000/day with mainnet enabled. Keepers left at the 30 s default would add ≈ 14,400 more per network, so keep the intervals above. |
 | DO rows read 5,000,000/day | Point lookups plus a few rows per run; the beacon's state adds about 6 (≈ 9,000/day). Well under 100,000/day. |

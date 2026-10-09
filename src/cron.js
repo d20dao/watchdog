@@ -121,7 +121,9 @@ export async function runCron({
       const previous = readRoundState(storage, name);
       const nowSec = Math.floor(clock() / 1000);
       if (!roundReadDue(roundNets[name], previous, nowSec)) return null;
-      return await readRoundChainImpl(roundNets[name], previous, { fetch, nowSec });
+      const net = roundNets[name];
+      const keyedRpc = net.keyedRpcSecret ? env[net.keyedRpcSecret] ?? null : null;
+      return await readRoundChainImpl(net, previous, { fetch, nowSec, keyedRpc });
     } catch {
       return { ok: false, complete: false, error: "internal error", errors: [], subrequests: 0 };
     }
@@ -328,6 +330,7 @@ function commitRoundNetwork(storage, net, read, now, deliverable) {
     pending: read.scan?.pending ? read.scan.pending.count : null,
     oldestPendingAge: read.scan?.pending?.oldest?.ageSeconds ?? null,
     expired: read.scan ? read.scan.expired.length : null,
+    rateLimited: read.rateLimited ?? [],
     scanCursor: state?.scanCursor ?? null,
     logs: read.logs ? { from: read.logs.fromBlock, to: read.logs.toBlock, refunds: read.logs.refunds.length, foreign: read.logs.foreignFulfillments.length } : null,
     codeChecked: read.code ? read.code.ok : null,
