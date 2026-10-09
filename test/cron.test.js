@@ -81,6 +81,7 @@ function harness(env = TELEGRAM) {
       },
       runBeaconImpl: async (plan) => healthyBeaconRun(plan), // the drand beacon monitor is covered in beacon.test.js
       networks: state.networks,
+      roundNetworks: {}, // the round networks are covered in round.test.js
     });
   };
   return { storage, state, run };

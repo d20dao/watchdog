@@ -8,7 +8,8 @@
 import { storedCalls } from "./agentapi.js";
 import { groupStateKey, networkStateKey } from "./beacon.js";
 import { LIMITS, THRESHOLDS, watchedAgentApi } from "./config.js";
-import { formatDuration, formatGwei, formatUsdc, listWithMore, requestLink, shortAddress } from "./format.js";
+import { formatDuration, formatEth, formatGwei, formatUsdc, listWithMore, requestLink, shortAddress } from "./format.js";
+import { codePinsKey } from "./round.js";
 
 export const CHECK_NAMES = Object.freeze([
   "heartbeat",
@@ -246,6 +247,235 @@ export function evaluateChainChecks(net, chain) {
     result.registry_impl = expected.some((a) => lower(a) === lower(chain.registryImpl))
       ? null
       : alarm("registry implementation changed", `ERC-1967 slot is ${chain.registryImpl}, expected ${expected.join(" or ")}`);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round networks (Robinhood Chain). `chain` is a readRoundChain() result, `state` the stored state after it (applyRoundRead).
+
+/** The checks of a round network: no registry, so no committer or registry implementation; the coordinator's roles instead. */
+export const ROUND_CHECK_NAMES = Object.freeze([
+  "heartbeat",
+  "health_age",
+  "unhealthy",
+  "dropped_events",
+  "pending",
+  "expired",
+  "refund",
+  "balance",
+  "backup_heartbeat",
+  "backup_unhealthy",
+  "backup_role",
+  "backup_keepers",
+  "base_fee",
+  "keeper",
+  "owner",
+  "fee_recipient",
+  "pricing",
+  "beacon",
+  "coordinator_impl",
+  "code_hash",
+  "foreign_submitter",
+  "rpc",
+]);
+
+/** Every check of a round network, with one balance check per backup keeper after the keeper's own. */
+export function roundCheckNames(net) {
+  const backups = (net.backupKeepers ?? []).map(backupBalanceCheckName);
+  return ROUND_CHECK_NAMES.flatMap((check) => (check === "balance" ? [check, ...backups] : [check]));
+}
+
+const ZERO_ADDRESS = "0x" + "0".repeat(40);
+const accepts = (list, address) => [].concat(list ?? []).some((a) => lower(a) === lower(address));
+/** " <link>" for a network with a request explorer, else nothing. */
+const roundLink = (net, id) => (net.explorer ? ` ${requestLink(net, id)}` : "");
+
+/** The code check's condition from the stored state: unknown until a check under the configured pins has run. */
+export function evaluateCodeHash(net, codeCheck) {
+  if (!net.codeHashes) return null;
+  if (!codeCheck || codeCheck.pins !== codePinsKey(net) || !codeCheck.verdict) return undefined;
+  return codeCheck.verdict === "mismatch" ? alarm("runtime code differs from the pinned hash", codeCheck.detail ?? "") : null;
+}
+
+/**
+ * Checks driven by a round network's chain read. The code check comes from the stored state, so it holds its verdict between
+ * the daily reads; everything else is unknown when the read failed.
+ */
+export function evaluateRoundChainChecks(net, chain, state) {
+  const backups = net.backupKeepers ?? [];
+  const result = {
+    pending: undefined,
+    expired: undefined,
+    refund: undefined,
+    balance: undefined,
+    backup_keepers: undefined,
+    base_fee: undefined,
+    keeper: undefined,
+    owner: undefined,
+    fee_recipient: undefined,
+    pricing: undefined,
+    beacon: undefined,
+    coordinator_impl: undefined,
+    code_hash: evaluateCodeHash(net, state?.codeCheck ?? null),
+    foreign_submitter: undefined,
+  };
+  for (const wallet of backups) result[backupBalanceCheckName(wallet)] = undefined;
+  if (!chain || !chain.ok) return result;
+  const T = THRESHOLDS;
+
+  const pending = chain.scan?.pending;
+  if (pending) {
+    const oldest = pending.oldest;
+    if (pending.count === 0 || !oldest) {
+      result.pending = null;
+    } else {
+      const count = `${pending.count}${pending.more ? "+" : ""} pending`;
+      const detail = `request ${oldest.id} pending for ${formatDuration(oldest.ageSeconds)} (${count})${roundLink(net, oldest.id)}`;
+      result.pending = oldest.ageSeconds >= T.pendingAlarmSeconds
+        ? alarm("request pending too long", detail)
+        : oldest.ageSeconds >= T.pendingWarnSeconds
+          ? warning("request pending too long", detail)
+          : null;
+    }
+  }
+
+  if (chain.scan) {
+    const expired = chain.scan.expired;
+    result.expired = expired.length === 0
+      ? null
+      : alarm(
+          "request expired without fulfilment",
+          `${listWithMore(expired.map((e) => `request ${e.requestId} (fee ${formatEth(e.feePaidWei)} ETH)`), LIMITS.maxIdsInMessage)}: ` +
+            `the fee is refundable to the refund address; check the keepers${roundLink(net, expired[0].requestId)}`,
+          { event: true },
+        );
+  }
+
+  if (chain.logs) {
+    const refunds = chain.logs.refunds;
+    if (refunds.length === 0) {
+      result.refund = null;
+    } else {
+      const items = refunds.map(
+        (r) => `request ${r.requestId} (${formatEth(r.amountWei)} ETH ${r.paid ? "paid" : "credited"} to ${r.refundAddress})`,
+      );
+      result.refund = alarm("refund issued, investigate", `${listWithMore(items, LIMITS.maxIdsInMessage)}${roundLink(net, refunds[0].requestId)}`, { event: true });
+    }
+    const foreign = chain.logs.foreignFulfillments;
+    if (foreign.length === 0) {
+      result.foreign_submitter = null;
+    } else {
+      const items = foreign.map((f) => `request ${f.requestId} by ${f.submitter}`);
+      result.foreign_submitter = warning(
+        "randomness fulfilled by another submitter",
+        `${listWithMore(items, LIMITS.maxIdsInMessage)} (keeper ${net.keeper})${roundLink(net, foreign[0].requestId)}`,
+        { event: true },
+      );
+    }
+  }
+
+  if (chain.balanceWei != null) {
+    result.balance = balanceCondition(
+      chain.balanceWei,
+      "keeper balance low",
+      `keeper ${net.keeper} holds ${formatEth(chain.balanceWei)} ETH (warning below ${formatEth(T.roundBalanceWarnWei)}, alarm below ${formatEth(T.roundBalanceAlarmWei)})`,
+      T.roundBalanceAlarmWei,
+      T.roundBalanceWarnWei,
+    );
+  }
+  const backupBalances = new Map((chain.backupBalances ?? []).map((b) => [lower(b.address), b.balanceWei]));
+  for (const wallet of backups) {
+    const balanceWei = backupBalances.get(lower(wallet));
+    if (balanceWei == null) continue;
+    result[backupBalanceCheckName(wallet)] = balanceCondition(
+      balanceWei,
+      `backup keeper ${shortAddress(wallet)} balance low`,
+      `${wallet} holds ${formatEth(balanceWei)} ETH`,
+      T.roundBackupBalanceAlarmWei,
+      T.roundBackupBalanceWarnWei,
+    );
+  }
+
+  // Backup keepers: each configured one must be allowed, and no other may be.
+  const authorized = chain.backupAuthorized ?? [];
+  if (authorized.length === backups.length && authorized.every((b) => b.allowed != null) && chain.backupKeeperCount != null) {
+    const missing = authorized.filter((b) => !b.allowed).map((b) => b.address);
+    const allowed = BigInt(authorized.length - missing.length);
+    result.backup_keepers = chain.backupKeeperCount > allowed
+      ? alarm(
+          "unknown backup keeper allowed",
+          `backupKeeperCount() is ${chain.backupKeeperCount}, but only ${allowed} of the configured backup keepers are allowed`,
+        )
+      : missing.length > 0
+        ? warning("backup keeper not allowed", `isBackupKeeper is false for ${missing.join(", ")}: it cannot take over while the primary is down`)
+        : null;
+  }
+
+  if (chain.block?.baseFeeWei != null) {
+    const headroom = net.feeHeadroomWei ?? T.feeHeadroomWei;
+    const needed = 2n * chain.block.baseFeeWei + headroom;
+    const percent = Number((needed * 10000n) / net.feeCapWei) / 100;
+    const formula = headroom === 0n ? "2 x base fee" : `2 x base fee + ${formatGwei(headroom)} gwei`;
+    const detail = `${formula} = ${formatGwei(needed)} gwei is ${percent}% of the ${formatGwei(net.feeCapWei)} gwei fee cap`;
+    result.base_fee = needed * 100n > net.feeCapWei * T.feeAlarmPercent
+      ? alarm("base fee near fee cap", detail)
+      : needed * 100n > net.feeCapWei * T.feeWarnPercent
+        ? warning("base fee near fee cap", detail)
+        : null;
+  }
+
+  if (chain.keeper != null) {
+    result.keeper = lower(chain.keeper) === lower(net.keeper)
+      ? null
+      : alarm("coordinator keeper is not the configured keeper", `keeper() is ${chain.keeper}, expected ${net.keeper}`);
+  }
+  if (chain.owner != null) {
+    const pendingOwner = chain.pendingOwner != null && lower(chain.pendingOwner) !== ZERO_ADDRESS ? chain.pendingOwner : null;
+    result.owner = !accepts(net.owners, chain.owner)
+      ? alarm("coordinator owner changed", `owner() is ${chain.owner}, expected ${[].concat(net.owners).join(" or ")}`)
+      : pendingOwner && !accepts(net.owners, pendingOwner)
+        ? alarm("ownership transfer pending to an unknown address", `pendingOwner() is ${pendingOwner}`)
+        : pendingOwner
+          ? warning("ownership transfer pending", `pendingOwner() is ${pendingOwner}; it takes effect when that address accepts`)
+          : null;
+  }
+  if (chain.feeRecipient != null) {
+    result.fee_recipient = accepts(net.feeRecipients, chain.feeRecipient)
+      ? null
+      : alarm("fee recipient changed", `feeRecipient() is ${chain.feeRecipient}, expected ${[].concat(net.feeRecipients).join(" or ")}`);
+  }
+  if (chain.pricing && chain.keeperFeeBps != null && chain.refundBps != null) {
+    const p = net.pricing;
+    const drift = [];
+    if (chain.pricing.minFeeWei !== p.minFeeWei) drift.push(`minFee ${chain.pricing.minFeeWei} wei (expected ${p.minFeeWei})`);
+    if (chain.pricing.feeMultiplier !== p.feeMultiplier) drift.push(`feeMultiplier ${chain.pricing.feeMultiplier} (expected ${p.feeMultiplier})`);
+    if (chain.pricing.fulfillGasOverhead !== p.fulfillGasOverhead) {
+      drift.push(`fulfillGasOverhead ${chain.pricing.fulfillGasOverhead} (expected ${p.fulfillGasOverhead})`);
+    }
+    if (chain.keeperFeeBps !== p.keeperFeeBps) drift.push(`keeperFeeBps ${chain.keeperFeeBps} (expected ${p.keeperFeeBps})`);
+    if (chain.refundBps !== p.refundBps) drift.push(`refundBps ${chain.refundBps} (expected ${p.refundBps})`);
+    result.pricing = drift.length === 0 ? null : warning("coordinator pricing changed", drift.join(", "));
+  }
+
+  if (!net.beacon) {
+    result.beacon = null;
+  } else if (chain.beaconSchedule && chain.beaconIdentity != null) {
+    const s = chain.beaconSchedule;
+    result.beacon = lower(chain.beaconIdentity) !== lower(net.beacon.identity)
+      ? alarm("beacon registration differs", `beaconIdentity(${net.beacon.id}) is ${chain.beaconIdentity}, pinned ${net.beacon.identity}`)
+      : s.beaconId !== net.beacon.id
+        ? warning("another beacon in force", `beaconSchedule() has beacon ${s.beaconId} in force since ${s.since}; the watchdog pins beacon ${net.beacon.id}`)
+        : s.nextFrom !== 0
+          ? warning("beacon change scheduled", `beacon ${s.nextBeaconId} takes over for requests from ${new Date(s.nextFrom * 1000).toISOString()}`)
+          : null;
+  }
+
+  if (chain.implementation != null) {
+    const expected = [].concat(net.implementations.coordinator);
+    result.coordinator_impl = expected.some((a) => lower(a) === lower(chain.implementation))
+      ? null
+      : alarm("coordinator implementation changed", `ERC-1967 slot is ${chain.implementation}, expected ${expected.join(" or ") || "none configured"}`);
   }
   return result;
 }

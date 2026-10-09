@@ -14,8 +14,8 @@ import {
   evaluateBeaconVerify,
   isAgentApiCheck,
 } from "./checks.js";
-import { BEACON_SCOPE, NETWORKS, THRESHOLDS, watchedAgentApi } from "./config.js";
-import { formatDuration, formatGwei, formatUsdc, shortAddress } from "./format.js";
+import { BEACON_SCOPE, LIMITS, NETWORKS, ROUND_NETWORKS, THRESHOLDS, WATCHED_ROUND_NETWORKS, watchedAgentApi } from "./config.js";
+import { formatDuration, formatEth, formatGwei, formatUsdc, shortAddress } from "./format.js";
 import { ICONS } from "./icons.js";
 import {
   readAgentApiState,
@@ -24,6 +24,7 @@ import {
   readBeaconStates,
   readChainState,
   readReportState,
+  readRoundState,
   recentMessages,
 } from "./store.js";
 import { notifierConfigured } from "./telegram.js";
@@ -278,7 +279,67 @@ function beaconStatus(storage, now, nets) {
   };
 }
 
-export function buildStatus(storage, env, now, nets = NETWORKS) {
+/**
+ * A listed round network (Robinhood Chain): its keepers' reports and the watchdog's own read of its coordinator. Only the
+ * figures the page shows; the pins and roles are compared, not repeated.
+ */
+function roundNetworkView(name, net, storage, now) {
+  const backups = net.backupKeepers ?? [];
+  const b = readBackupReportState(storage, name);
+  const c = readRoundState(storage, name);
+  const feeCapUsagePercent = c?.baseFeeWei == null
+    ? null
+    : Number(((2n * BigInt(c.baseFeeWei) + (net.feeHeadroomWei ?? THRESHOLDS.feeHeadroomWei)) * 10000n) / net.feeCapWei) / 100;
+  const code = c?.codeCheck ?? null;
+  return {
+    kind: "round",
+    chainId: net.chainId,
+    coordinator: net.coordinator,
+    keeper: net.keeper,
+    backupKeepers: [...backups],
+    explorer: net.explorer,
+    report: reportView(readReportState(storage, name), now),
+    backupReport: b ? { ...reportView(b, now), role: b.role } : reportView(null, now),
+    chain: c
+      ? {
+          checkedAt: c.checkedAt,
+          checkedAgeSeconds: age(now, c.checkedAt),
+          ok: c.ok && c.complete,
+          error: c.error,
+          rpc: c.rpc,
+          consecutiveFailures: c.consecutiveFailures,
+          lastSuccessAt: c.lastSuccessAt,
+          blockNumber: c.blockNumber,
+          blockTimestamp: c.blockTimestamp,
+          nextRequestId: c.nextRequestId,
+          pendingCount: c.pendingCount,
+          oldestPendingId: c.oldestPendingId,
+          oldestPendingAgeSeconds: c.oldestPendingAge,
+          keeperBalanceEth: c.balanceWei == null ? null : formatEth(BigInt(c.balanceWei)),
+          backupKeeperBalances: backups.map((address) => {
+            const wei = c.backupBalances?.[address.toLowerCase()];
+            return { address, balanceEth: wei == null ? null : formatEth(BigInt(wei)) };
+          }),
+          baseFeeGwei: c.baseFeeWei == null ? null : formatGwei(BigInt(c.baseFeeWei)),
+          feeCapGwei: formatGwei(net.feeCapWei),
+          feeCapUsagePercent,
+          keeperIsConfigured: same(c.keeper, net.keeper),
+          ownerAccepted: accepted(c.owner, net.owners),
+          feeRecipientAccepted: accepted(c.feeRecipient, net.feeRecipients),
+          coordinatorImplementationExpected: accepted(c.implementation, net.implementations.coordinator),
+          codeHashes: !code?.verdict ? "not checked" : code.verdict === "ok" ? "as pinned" : "mismatch",
+          codeCheckedAt: code?.checkedAt ?? null,
+        }
+      : null,
+    alerts: readAlerts(storage, name).map(alertView(now)),
+  };
+}
+
+/** Scopes kept off the public page: every configured round network not listed (enabled or not). */
+const unlistedScopes = (roundNets) =>
+  new Set(Object.values({ ...ROUND_NETWORKS, ...roundNets }).filter((net) => net.statusListed !== true).map((net) => net.name));
+
+export function buildStatus(storage, env, now, nets = NETWORKS, roundNets = WATCHED_ROUND_NETWORKS) {
   const networks = {};
   for (const name of Object.keys(nets)) {
     const net = nets[name];
@@ -337,14 +398,19 @@ export function buildStatus(storage, env, now, nets = NETWORKS) {
     };
   }
   const beacon = beaconStatus(storage, now, nets);
+  // Round networks are shown only once listed (statusListed); until then nothing of theirs is public, messages included.
+  const roundNetworks = {};
+  for (const [name, net] of Object.entries(roundNets)) if (net.statusListed === true) roundNetworks[name] = roundNetworkView(name, net, storage, now);
+  const hidden = unlistedScopes(roundNets);
   return {
     service: "d20dao-watchdog",
     generatedAt: now,
     notifier: notifierConfigured(env) ? "configured" : "not configured",
     networks,
+    ...(Object.keys(roundNetworks).length > 0 ? { roundNetworks } : {}),
     // The beacon section is there while a network lists a beacon.
     ...(beacon ? { beacon } : {}),
-    recentMessages: recentMessages(storage, 10).map((m) => ({
+    recentMessages: recentMessages(storage, LIMITS.messagesKept).filter((m) => !hidden.has(m.network)).slice(0, 10).map((m) => ({
       at: m.created_at,
       network: m.network,
       severity: m.severity,
@@ -455,6 +521,9 @@ function networkSection(name, n) {
   );
 }
 
+/** A backup keeper's balance as listed: USDC on Arc, ETH on a round network. */
+const walletBalance = (b) => (b.balanceUsdc != null ? `${b.balanceUsdc} USDC` : b.balanceEth != null ? `${b.balanceEth} ETH` : "unknown");
+
 /** Backup keeper wallet balances, then the backup's own health reports. Empty for a network without backups. */
 function backupKeepers(n) {
   const wallets = n.chain?.backupKeeperBalances ?? [];
@@ -463,7 +532,7 @@ function backupKeepers(n) {
     parts.push(
       `<table class="kv wallets">` +
         wallets
-          .map((b) => `<tr><th scope="row">${escapeHtml(shortAddress(b.address))}</th><td>${escapeHtml(b.balanceUsdc == null ? "unknown" : `${b.balanceUsdc} USDC`)}</td></tr>`)
+          .map((b) => `<tr><th scope="row">${escapeHtml(shortAddress(b.address))}</th><td>${escapeHtml(walletBalance(b))}</td></tr>`)
           .join("") +
         `</table>`,
     );
@@ -481,6 +550,60 @@ function backupKeepers(n) {
     parts.push(`<table class="kv">${rows.join("")}</table>`);
   }
   return parts.length ? `<h3>Backup keepers</h3>${parts.join("")}` : "";
+}
+
+/** A listed round network: the keeper, its requests, its balance and the coordinator's roles and pins. */
+function roundNetworkSection(name, n) {
+  const r = n.report;
+  const c = n.chain;
+  const stats = [
+    r.everReported
+      ? stat("Keeper", r.healthy ? "Healthy" : "Unhealthy", `report ${ago(r.lastReceivedAgeSeconds)}`, r.healthy ? "ok" : "alarm")
+      : stat("Keeper", "No reports", "none received yet", "muted"),
+  ];
+  if (!c) {
+    stats.push(stat("Pending requests", "—", "not checked yet"), stat("Keeper balance", "—", "not checked yet"), stat("Base fee", "—", "not checked yet"));
+  } else {
+    const oldest = c.oldestPendingAgeSeconds == null ? "none" : `#${c.oldestPendingId}, ${formatDuration(c.oldestPendingAgeSeconds)}`;
+    stats.push(
+      stat("Pending requests", c.pendingCount ?? "unknown", `oldest ${oldest}`),
+      stat("Keeper balance", c.keeperBalanceEth == null ? "unknown" : `${c.keeperBalanceEth} ETH`, `at block ${c.blockNumber == null ? "unknown" : `#${c.blockNumber}`}`),
+      stat(
+        "Base fee",
+        c.baseFeeGwei == null ? "unknown" : `${c.baseFeeGwei} gwei`,
+        c.baseFeeGwei == null ? `${c.feeCapGwei} gwei cap` : `${c.feeCapUsagePercent}% of ${c.feeCapGwei} gwei cap`,
+      ),
+    );
+  }
+  const reports = !r.everReported
+    ? [row("Reports", "none received yet")]
+    : [
+        row("Report observed", ago(r.reportObservedAgeSeconds)),
+        row("Health observed", r.observed ? ago(r.healthObservedAgeSeconds) : "not yet observed"),
+        row("Faults", r.faults.length ? r.faults.join(", ") : "none"),
+        row("Sending enabled", r.sendEnabled == null ? "unknown" : r.sendEnabled ? "yes" : "no"),
+      ];
+  const chain = [];
+  if (!c) {
+    chain.push(row("Checked", "not yet"));
+  } else {
+    const roles = [c.keeperIsConfigured, c.ownerAccepted, c.feeRecipientAccepted, c.coordinatorImplementationExpected];
+    chain.push(
+      row("Checked", `${ago(c.checkedAgeSeconds)}${c.ok ? "" : ` (${c.error ?? "failed"})`}`, c.ok ? "" : "alarm"),
+      row("Roles and implementation", roles.includes(null) ? "unknown" : roles.every(Boolean) ? "as expected" : "MISMATCH", roles.includes(false) ? "alarm" : ""),
+      row("Code hashes", c.codeHashes, c.codeHashes === "mismatch" ? "alarm" : ""),
+      row("RPC", c.rpc ?? "none"),
+    );
+  }
+  const link = n.explorer ? `<a href="${escapeHtml(n.explorer)}">Explorer</a>` : "";
+  return (
+    `<section class="section">` +
+    sectionHead(name, n.alerts, { link }) +
+    `<dl class="stats">${stats.join("")}</dl>` +
+    `<div class="cols"><div><h3>Keeper reports</h3><table class="kv">${reports.join("")}</table></div>` +
+    `<div><h3>Chain</h3><table class="kv">${chain.join("")}</table>${backupKeepers(n)}</div></div>` +
+    `</section>`
+  );
 }
 
 const API_STATUS = { ok: ["Up", "ok"], "not ok": ["Not OK", "alarm"], unreachable: ["Down", "alarm"], "not checked": ["—", "muted"] };
@@ -754,9 +877,12 @@ export function renderHtml(status) {
   const sections =
     Object.entries(status.networks)
       .map(([name, n]) => networkSection(name, n) + (n.agentApi?.enabled ? agentApiSection(name, n.agentApi) : ""))
-      .join("") + (status.beacon ? beaconSection(status.beacon) : "");
+      .join("") +
+    Object.entries(status.roundNetworks ?? {}).map(([name, n]) => roundNetworkSection(name, n)).join("") +
+    (status.beacon ? beaconSection(status.beacon) : "");
   const alerts = [
     ...Object.values(status.networks).flatMap((n) => [...n.alerts, ...(n.agentApi?.alerts ?? [])]),
+    ...Object.values(status.roundNetworks ?? {}).flatMap((n) => n.alerts),
     ...(status.beacon?.alerts ?? []),
   ];
   const overall = worstOf(alerts);

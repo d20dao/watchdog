@@ -106,6 +106,12 @@ const SCHEMA = [
      updated_at INTEGER NOT NULL,
      state_json TEXT NOT NULL
    ) WITHOUT ROWID`,
+  // Chain state of round networks (Robinhood Chain), as JSON (see applyRoundRead in src/round.js).
+  `CREATE TABLE IF NOT EXISTS round_state (
+     network TEXT PRIMARY KEY,
+     updated_at INTEGER NOT NULL,
+     state_json TEXT NOT NULL
+   ) WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS backup_report_state (
      network TEXT PRIMARY KEY,
      first_received_at INTEGER NOT NULL,
@@ -439,6 +445,25 @@ export function readAgentApiState(storage, network) {
 export function writeAgentApiState(storage, network, now, state) {
   storage.sql.exec(
     `INSERT INTO agent_api_state (network, updated_at, state_json) VALUES (?, ?, ?)
+     ON CONFLICT (network) DO UPDATE SET updated_at = excluded.updated_at, state_json = excluded.state_json`,
+    network,
+    now,
+    JSON.stringify(state),
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round network chain state
+
+export function readRoundState(storage, network) {
+  const r = first(storage, "SELECT state_json FROM round_state WHERE network = ?", network);
+  const state = r ? parseJson(r.state_json, null) : null;
+  return state && typeof state === "object" ? state : null;
+}
+
+export function writeRoundState(storage, network, now, state) {
+  storage.sql.exec(
+    `INSERT INTO round_state (network, updated_at, state_json) VALUES (?, ?, ?)
      ON CONFLICT (network) DO UPDATE SET updated_at = excluded.updated_at, state_json = excluded.state_json`,
     network,
     now,

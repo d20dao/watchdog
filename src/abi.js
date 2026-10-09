@@ -1,7 +1,7 @@
 // Minimal hand-rolled ABI helpers for the few calls and events the watchdog reads.
 // Every decoder validates lengths and word ranges and throws AbiError on malformed data.
 
-import { SELECTORS, TOPICS } from "./config.js";
+import { ROUND_SELECTORS, SELECTORS, TOPICS } from "./config.js";
 
 export class AbiError extends Error {}
 
@@ -329,4 +329,93 @@ export function decodeCoordinatorLog(log) {
     };
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round coordinator (D20VRFCoordinatorRobinhood)
+
+export function encodeGetRoundRequest(requestId) {
+  return encodeCall(ROUND_SELECTORS.getRoundRequest, requestId);
+}
+
+/** isBackupKeeper(address) */
+export function encodeIsBackupKeeper(address) {
+  if (typeof address !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(address)) throw new AbiError("not an address");
+  return ROUND_SELECTORS.isBackupKeeper + address.slice(2).toLowerCase().padStart(WORD, "0");
+}
+
+/** beaconIdentity(uint8) */
+export function encodeBeaconIdentity(beaconId) {
+  return encodeCall(ROUND_SELECTORS.beaconIdentity, encodeRecipe(beaconId));
+}
+
+/** A single bytes32 return value, lowercase. */
+export function decodeBytes32(hex) {
+  const words = toWords(hex);
+  if (words.length !== 1) throw new AbiError("expected one word");
+  return "0x" + words[0].toLowerCase();
+}
+
+/** A single uint16 return value (keeperFeeBps, refundBps). */
+export function decodeUint16(hex) {
+  const words = toWords(hex);
+  if (words.length !== 1) throw new AbiError("expected one word");
+  return wordToSmallNumber(words[0], 16);
+}
+
+/** pricing() -> (uint256 minFee, uint16 feeMultiplier, uint32 fulfillGasOverhead) */
+export function decodePricing(hex) {
+  const w = toWords(hex);
+  if (w.length !== 3) throw new AbiError("pricing must be 3 words");
+  return { minFeeWei: wordToBigInt(w[0]), feeMultiplier: wordToSmallNumber(w[1], 16), fulfillGasOverhead: wordToSmallNumber(w[2], 32) };
+}
+
+/** beaconSchedule() -> (uint8 beaconId, uint64 since, uint8 nextBeaconId, uint64 nextFrom); nextFrom 0 is no pending change. */
+export function decodeBeaconSchedule(hex) {
+  const w = toWords(hex);
+  if (w.length !== 4) throw new AbiError("beacon schedule must be 4 words");
+  return {
+    beaconId: wordToSmallNumber(w[0], 8),
+    since: wordToSmallNumber(w[1], 64),
+    nextBeaconId: wordToSmallNumber(w[2], 8),
+    nextFrom: wordToSmallNumber(w[3], 64),
+  };
+}
+
+export const ROUND_REQUEST_FIELDS = Object.freeze([
+  "consumer",
+  "callbackGasLimit",
+  "requestBlock",
+  "deadline",
+  "refundAddress",
+  "clientSeed",
+  "mappingHash",
+  "beaconId",
+  "round",
+  "roundRandomness",
+  "randomness",
+  "proofHash",
+  "transcriptHash",
+  "feePaid",
+  "fulfilled",
+  "delivered",
+  "refunded",
+]);
+
+/** getRoundRequest(uint256) -> static RoundRequest tuple of 17 words. Only the fields the watchdog uses are returned. */
+export function decodeRoundRequest(hex) {
+  const w = toWords(hex);
+  if (w.length !== ROUND_REQUEST_FIELDS.length) throw new AbiError("round request tuple must be 17 words");
+  return {
+    consumer: wordToAddress(w[0]),
+    callbackGasLimit: wordToSmallNumber(w[1], 32),
+    deadline: wordToSmallNumber(w[3], 64),
+    refundAddress: wordToAddress(w[4]),
+    beaconId: wordToSmallNumber(w[7], 8),
+    round: wordToSmallNumber(w[8], 64),
+    feePaidWei: wordToUint(w[13], 256),
+    fulfilled: wordToBool(w[14]),
+    delivered: wordToBool(w[15]),
+    refunded: wordToBool(w[16]),
+  };
 }

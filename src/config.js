@@ -127,6 +127,118 @@ export const NETWORKS = Object.freeze({
 /** A network's x402 agent API configuration when it is watched, otherwise null. */
 export const watchedAgentApi = (net) => (net?.agentApi?.enabled === true ? net.agentApi : null);
 
+const ETH = 10n ** 18n;
+export const WEI_PER_ETH = ETH;
+
+// Views of the round coordinator (D20VRFCoordinatorRobinhood) the round reader calls. nextRequestId is shared with Arc's.
+export const ROUND_SELECTORS = Object.freeze({
+  nextRequestId: "0x6a84a985",
+  keeper: "0xaced1661",
+  owner: "0x8da5cb5b",
+  pendingOwner: "0xe30c3978",
+  feeRecipient: "0x46904840",
+  pricing: "0x7ce91411", // pricing() -> (uint256 minFee, uint16 feeMultiplier, uint32 fulfillGasOverhead)
+  keeperFeeBps: "0x0eab7d63",
+  refundBps: "0xec8c9a0b",
+  isBackupKeeper: "0x4fc12619", // isBackupKeeper(address)
+  backupKeeperCount: "0x3b9cbca9",
+  beaconSchedule: "0x463116f7", // beaconSchedule() -> (uint8 beaconId, uint64 since, uint8 nextBeaconId, uint64 nextFrom)
+  beaconIdentity: "0x78fdf6f2", // beaconIdentity(uint8) -> bytes32
+  getRoundRequest: "0x46293dec", // getRoundRequest(uint256) -> static RoundRequest tuple of 17 words
+});
+
+/**
+ * Round-native networks: Robinhood Chain's D20VRFCoordinatorRobinhood. No epoch registry: each request binds a future drand
+ * round and the keeper fulfils it before the request's deadline (60 s). Read by src/round.js, checked by
+ * evaluateRoundChainChecks, and alerted in the network's own Telegram group only (`ownTelegramGroup`: never the default chat).
+ *
+ *   enabled          the one switch: a disabled network is not read, not alerted, has no health endpoint and no status section
+ *   statusListed     shown on the public status page and in status.json; alerts work either way
+ *   owners           accepted owner() values (the deployer during launch, the Safe later); anything else alarms
+ *   feeRecipients    accepted feeRecipient() values
+ *   implementations  accepted ERC-1967 implementations, as on Arc: an upgrade's is listed before it executes, the old one after
+ *   codeHashes       keccak256 of the runtime code: the proxy's, and each accepted implementation's (its immutable proof verifier and
+ *                    linked mapping library are part of that code, so this pins them too). Compared once a day.
+ *   beacon           the drand beacon in force (beaconSchedule) and its registration's identity (beaconIdentity), which binds its
+ *                    verifier, chain hash, public key, genesis and period
+ *   pricing          pricing(), keeperFeeBps() and refundBps() as deployed; a change warns
+ */
+export const ROUND_NETWORKS = Object.freeze({
+  "robinhood-testnet": Object.freeze({
+    name: "robinhood-testnet",
+    kind: "round",
+    enabled: true,
+    statusListed: false,
+    ownTelegramGroup: true,
+    chainId: "46630",
+    // deployments/robinhood-testnet.json in the keeper repository.
+    coordinator: "0x2f26513DE4Ed388947f5d22FD395D5E06f472f05",
+    keeper: "0x61659d9A9A85dA07C36e7d1B35CF0d96CF199Cac",
+    backupKeepers: Object.freeze(["0xbb2fdE97a5F4855bEf872C71fbb80Be3170127Ee"]),
+    owners: Object.freeze(["0x7ad78fc8097DFEA5c12DBb503D6EB6E60f34B40B"]),
+    feeRecipients: Object.freeze(["0x7ad78fc8097DFEA5c12DBb503D6EB6E60f34B40B"]),
+    implementations: Object.freeze({ coordinator: Object.freeze(["0xC8Cd79B9092AEA38f3434388F291eb861b148f45"]) }),
+    codeHashes: Object.freeze({
+      proxy: "0x1e98fe55cc7d87073e415635715100988aad79cbb84e39b18f96f3727d1c716f",
+      // Proof verifier 0x1EEBe8B8f7a6A18b966C3fBe3f644B8234f93709 and mapping library 0xA57093a645C1Aed12486da50AfA95F3284826849
+      // are fixed in this code.
+      implementations: Object.freeze({
+        "0xc8cd79b9092aea38f3434388f291eb861b148f45": "0xe692b447c02225cb95c921ed29952edb566f2afdfe28ff929452b4909460e8f6",
+      }),
+    }),
+    // drand evmnet with beacon verifier 0xd20dA01Aa16AeD6b77Cd8DDb869151802599100a.
+    beacon: Object.freeze({ id: 0, identity: "0x65794cca839753a679e6274f47c6ae64359df498b1674f40a28f9500c91054a5" }),
+    pricing: Object.freeze({ minFeeWei: 25_000_000_000_000n, feeMultiplier: 2, fulfillGasOverhead: 405_000, keeperFeeBps: 8000, refundBps: 10000 }),
+    // The keeper's MAX_FEE_PER_GAS_WEI. It pays no priority fee here, so the checked value is 2 x baseFee.
+    feeCapWei: 3n * GWEI,
+    feeHeadroomWei: 0n,
+    // The public endpoint only: it keeps about 6,000 blocks of state, so the reader scans by request id and recent blocks.
+    rpcs: Object.freeze(["https://rpc.testnet.chain.robinhood.com"]),
+    explorer: null,
+    healthKeySecret: "HEALTH_KEY_ROBINHOOD_TESTNET",
+    backupHealthKeySecret: "HEALTH_KEY_ROBINHOOD_TESTNET_BACKUP",
+  }),
+  // Not deployed yet. To enable: fill coordinator, implementations, codeHashes and beacon from deployments/robinhood-mainnet.json,
+  // confirm pricing and feeRecipients, then set `enabled: true`.
+  "robinhood-mainnet": Object.freeze({
+    name: "robinhood-mainnet",
+    kind: "round",
+    enabled: false,
+    statusListed: false,
+    ownTelegramGroup: true,
+    chainId: "4663",
+    coordinator: null,
+    keeper: "0xA5496Bb35905Bfe0Bac7D23Ca18c008F5E6Eb13e",
+    backupKeepers: Object.freeze(["0x75Af60E2165e8E6d2f6cFD5d9dDDa83446044685"]),
+    // The deployer during launch, the Safe after ownership moves to it.
+    owners: Object.freeze(["0x7ad78fc8097DFEA5c12DBb503D6EB6E60f34B40B", "0xE953671bf063CF21F89BbA3bfdB4AFc5FE71078A"]),
+    feeRecipients: Object.freeze(["0x7ad78fc8097DFEA5c12DBb503D6EB6E60f34B40B", "0xE953671bf063CF21F89BbA3bfdB4AFc5FE71078A"]),
+    implementations: Object.freeze({ coordinator: Object.freeze([]) }),
+    codeHashes: null,
+    beacon: null,
+    pricing: Object.freeze({ minFeeWei: 25_000_000_000_000n, feeMultiplier: 2, fulfillGasOverhead: 405_000, keeperFeeBps: 8000, refundBps: 10000 }),
+    feeCapWei: 3n * GWEI,
+    feeHeadroomWei: 0n,
+    rpcs: Object.freeze(["https://rpc.mainnet.chain.robinhood.com"]),
+    explorer: null,
+    healthKeySecret: "HEALTH_KEY_ROBINHOOD_MAINNET",
+    backupHealthKeySecret: "HEALTH_KEY_ROBINHOOD_MAINNET_BACKUP",
+  }),
+});
+
+/** The networks of `nets` that are switched on (`enabled: true`). */
+export const enabledNetworks = (nets) => Object.freeze(Object.fromEntries(Object.entries(nets).filter(([, net]) => net.enabled === true)));
+export const WATCHED_ROUND_NETWORKS = enabledNetworks(ROUND_NETWORKS);
+
+export const isRoundNetwork = (net) => net?.kind === "round";
+
+/** A network's configuration by name, among the Arc networks and the enabled round networks; null when there is none. */
+export function networkByName(name, nets = NETWORKS, roundNets = WATCHED_ROUND_NETWORKS) {
+  if (Object.hasOwn(nets, name)) return nets[name];
+  if (Object.hasOwn(roundNets, name)) return roundNets[name];
+  return null;
+}
+
 export const THRESHOLDS = Object.freeze({
   heartbeatWarnSeconds: 150,
   heartbeatAlarmSeconds: 240,
@@ -178,6 +290,13 @@ export const THRESHOLDS = Object.freeze({
   // Consecutive runs in which beaconOf must revert, after the beacon was seen registered, before "no longer registered"
   // warns: one read from an RPC node that is behind, or a rollback that is quickly undone, is not a lost registration.
   beaconUnregisteredRuns: 2,
+  // Round networks (Robinhood Chain): native ETH. One fulfilment costs about 0.0000056 ETH and a wallet holds about 0.002 ETH.
+  //   keeper:  warn below 0.001 ETH (about 180 fulfilments), alarm below 0.0003 ETH (about 50).
+  //   backup:  spends only while it covers for the primary: warn below 0.0005 ETH, alarm below 0.0002 ETH.
+  roundBalanceWarnWei: ETH / 1000n,
+  roundBalanceAlarmWei: (3n * ETH) / 10000n,
+  roundBackupBalanceWarnWei: (5n * ETH) / 10000n,
+  roundBackupBalanceAlarmWei: (2n * ETH) / 10000n,
 });
 
 export const LIMITS = Object.freeze({
@@ -221,6 +340,15 @@ export const LIMITS = Object.freeze({
   // Agent API /health reads the relayer's Durable Object and the chain before it answers.
   agentApiTimeoutMs: 10_000,
   agentApiMaxResponseBytes: 16 * 1024,
+  // Round networks (src/round.js). Requests are read by id, from the oldest one not yet settled, at most this many a run.
+  roundScanMaxIds: 32,
+  // Logs are scanned from the stored cursor, at most this many blocks a run. The public RPC keeps about 6,000 blocks of state,
+  // so a cursor further behind than roundLogMaxLagBlocks jumps to the recent blocks instead of reading deep history.
+  roundLogScanMaxBlocks: 5000,
+  roundLogMaxLagBlocks: 30_000,
+  // Runtime code hashes are compared once a day, and an hour after a read that failed.
+  roundCodeCheckIntervalSeconds: 24 * 3600,
+  roundCodeRetrySeconds: 3600,
 });
 
 export const DURABLE_OBJECT_NAME = "watchdog";

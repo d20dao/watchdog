@@ -1,4 +1,4 @@
-import { WEI_PER_GWEI, WEI_PER_USDC } from "./config.js";
+import { WEI_PER_ETH, WEI_PER_GWEI, WEI_PER_USDC } from "./config.js";
 
 /** 42 -> "42s", 302 -> "5m 2s", 7260 -> "2h 1m". */
 export function formatDuration(seconds) {
@@ -30,6 +30,9 @@ function formatUnits(value, unit, decimals) {
 
 /** Wei (18 decimals) to a USDC string truncated to 6 decimals. */
 export const formatUsdc = (wei) => formatUnits(wei, WEI_PER_USDC, 6);
+
+/** Wei to an ETH string truncated to 7 decimals (one Robinhood fulfilment is about 0.0000056 ETH). */
+export const formatEth = (wei) => formatUnits(wei, WEI_PER_ETH, 7);
 
 /** Wei to a gwei string truncated to 3 decimals. */
 export const formatGwei = (wei) => formatUnits(wei, WEI_PER_GWEI, 3);

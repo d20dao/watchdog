@@ -23,10 +23,13 @@ import {
   evaluateBeaconChecks,
   evaluateChainChecks,
   evaluateReportChecks,
+  evaluateRoundChainChecks,
   evaluateRpcCheck,
   networkCheckNames,
+  roundCheckNames,
 } from "./checks.js";
-import { BEACON_SCOPE, LIMITS, NETWORKS, watchedAgentApi } from "./config.js";
+import { BEACON_SCOPE, LIMITS, NETWORKS, WATCHED_ROUND_NETWORKS, watchedAgentApi } from "./config.js";
+import { applyRoundRead, readRoundChain } from "./round.js";
 import { readChain } from "./rpc.js";
 import {
   deleteBeaconState,
@@ -43,12 +46,14 @@ import {
   readBeaconStates,
   readChainState,
   readReportState,
+  readRoundState,
   saveAlert,
   writeAgentApiState,
   writeBeaconState,
   writeChainState,
+  writeRoundState,
 } from "./store.js";
-import { chatIdFor, groupMessages, notifierConfigured, sendTelegram } from "./telegram.js";
+import { groupMessages, notifierConfigured, routeFor, sendTelegram } from "./telegram.js";
 
 /**
  * The beacon's plan. A configuration or stored state it cannot plan from leaves the run without the beacon (`failed`), never
@@ -83,9 +88,12 @@ export async function runCron({
   readChainImpl = readChain,
   readAgentApiImpl = readAgentApi,
   runBeaconImpl = runBeacon,
+  readRoundChainImpl = readRoundChain,
   networks: nets = NETWORKS,
+  roundNetworks: roundNets = WATCHED_ROUND_NETWORKS,
 }) {
   const names = Object.keys(nets);
+  const roundNames = Object.keys(roundNets);
   const cursors = names.map((name) => {
     const prev = readChainState(storage, name);
     return prev ? { logCursor: prev.logCursor, logSpan: prev.logSpan } : null;
@@ -106,7 +114,16 @@ export async function runCron({
     return read?.ok && read.block ? read.block.number : null;
   };
 
-  const [reads, polls, beaconRun] = await Promise.all([
+  // Round networks (Robinhood Chain) have their own reader and share nothing with the Arc reads or the beacon.
+  const roundReads = roundNames.map(async (name) => {
+    try {
+      return await readRoundChainImpl(roundNets[name], readRoundState(storage, name), { fetch, nowSec: Math.floor(clock() / 1000) });
+    } catch {
+      return { ok: false, complete: false, error: "internal error", errors: [], subrequests: 0 };
+    }
+  });
+
+  const [reads, polls, beaconRun, roundResults] = await Promise.all([
     Promise.all(chainReads),
     // One /health GET per watched agent API; null for a network whose agent API is not watched.
     Promise.all(
@@ -121,11 +138,13 @@ export async function runCron({
     ),
     // The drand relays and each network's registry: shared work, read once however many networks list the beacon.
     runBeaconChecks(beaconPlan, { fetch, clock, runBeaconImpl, headOf }),
+    Promise.all(roundReads),
   ]);
 
   // Reports may have arrived while the reads were in flight; everything below re-reads current state.
   const now = Math.floor(clock() / 1000);
   const deliverable = notifierConfigured(env);
+  const ownGroups = new Set(roundNames.filter((name) => roundNets[name].ownTelegramGroup));
   const outcome = storage.transactionSync(() => {
     const networks = {};
     let enqueued = 0;
@@ -189,6 +208,11 @@ export async function runCron({
         messages,
       };
     });
+    roundNames.forEach((name, i) => {
+      const summary = commitRoundNetwork(storage, roundNets[name], roundResults[i], now, routeFor(env, name, ownGroups) !== null);
+      networks[name] = summary;
+      enqueued += summary.messages.length;
+    });
     const beacon = commitBeacon(storage, beaconPlan, beaconRun, now, deliverable);
     enqueued += beacon.messages.length;
     pruneReports(storage, now - LIMITS.reportRetentionSeconds);
@@ -200,27 +224,28 @@ export async function runCron({
   let delivered = 0;
   let telegramSubrequests = 0;
   let deliveryError = null;
-  if (deliverable) {
-    // Messages are grouped per destination chat, so a network with its own group never lands in another one.
-    const byChat = new Map();
-    for (const message of pendingMessages(storage)) {
-      const chatId = chatIdFor(env, message.network);
-      if (!byChat.has(chatId)) byChat.set(chatId, []);
-      byChat.get(chatId).push(message);
+  // Messages are grouped per destination (bot and chat), so a network with its own group never lands in another one. A
+  // message without a destination stays pending until one is configured or it expires.
+  const byRoute = new Map();
+  for (const message of pendingMessages(storage)) {
+    const route = routeFor(env, message.network, ownGroups);
+    if (!route) continue;
+    const key = `${route.tokenSecret}\n${route.chatId}`;
+    if (!byRoute.has(key)) byRoute.set(key, { route, messages: [] });
+    byRoute.get(key).messages.push(message);
+  }
+  const groups = [];
+  for (const { route, messages } of byRoute.values()) for (const group of groupMessages(messages)) groups.push({ ...group, ...route });
+  for (const group of groups.slice(0, LIMITS.telegramMaxSendsPerRun)) {
+    telegramSubrequests++;
+    const result = await sendTelegram(env, group.text, { fetch, chatId: group.chatId, tokenSecret: group.tokenSecret });
+    const at = Math.floor(clock() / 1000);
+    storage.transactionSync(() => markMessages(storage, group.ids, at, result.ok));
+    if (!result.ok) {
+      deliveryError = result.error;
+      break;
     }
-    const groups = [];
-    for (const [chatId, messages] of byChat) for (const group of groupMessages(messages)) groups.push({ ...group, chatId });
-    for (const group of groups.slice(0, LIMITS.telegramMaxSendsPerRun)) {
-      telegramSubrequests++;
-      const result = await sendTelegram(env, group.text, { fetch, chatId: group.chatId });
-      const at = Math.floor(clock() / 1000);
-      storage.transactionSync(() => markMessages(storage, group.ids, at, result.ok));
-      if (!result.ok) {
-        deliveryError = result.error;
-        break;
-      }
-      delivered += group.ids.length;
-    }
+    delivered += group.ids.length;
   }
 
   const chainSubrequests = Object.values(outcome.networks).reduce((sum, n) => sum + n.subrequests, 0);
@@ -234,6 +259,74 @@ export async function runCron({
     deliveryError,
     // Each agent API poll is exactly one fetch; the beacon run counts its own.
     subrequests: chainSubrequests + polls.filter(Boolean).length + beaconRun.subrequests + telegramSubrequests,
+  };
+}
+
+/**
+ * Store a round network's read, evaluate its checks and queue its messages, inside the run's transaction. The same alert
+ * lifecycle as an Arc network's; its messages go only to the network's own Telegram group (see routeFor). As with the beacon,
+ * a fault stays in the network: everything is worked out before anything is written, so a fault there writes nothing, and one
+ * while writing never rolls back the rest of the run.
+ */
+function commitRoundNetwork(storage, net, read, now, deliverable) {
+  const name = net.name;
+  let state;
+  let report;
+  let conditions;
+  let existing;
+  let steps;
+  let checks;
+  try {
+    state = applyRoundRead(net, readRoundState(storage, name), read, now);
+    report = readReportState(storage, name);
+    conditions = {
+      ...evaluateReportChecks(net, report, now),
+      ...evaluateBackupReportChecks(net, readBackupReportState(storage, name), now),
+      ...evaluateRoundChainChecks(net, read, state),
+      rpc: evaluateRpcCheck(state.consecutiveFailures, read.error),
+    };
+    existing = new Map(readAlerts(storage, name).map((row) => [row.check, row]));
+    checks = roundCheckNames(net);
+    // A check no longer configured (a backup keeper wallet removed) resolves its alert.
+    for (const check of existing.keys()) {
+      if (!checks.includes(check)) {
+        checks.push(check);
+        conditions[check] = null;
+      }
+    }
+    steps = checks.map((check) => ({ check, step: transition(existing.get(check) ?? null, conditions[check], now, name, check) }));
+  } catch {
+    return { chain: "failed", error: "internal error", rpc: read?.rpc ?? null, subrequests: read?.subrequests ?? 0, activeAlerts: [], messages: [] };
+  }
+  const messages = [];
+  try {
+    writeRoundState(storage, name, now, state);
+    for (const { check, step } of steps) {
+      if (step.write) saveAlert(storage, alertKey(name, check), step.row);
+      if (step.message) {
+        enqueueMessage(storage, now, name, step.message.severity, step.message.text, deliverable);
+        messages.push(step.message.text);
+      }
+    }
+    if (report && conditions.dropped_events) markDroppedAlerted(storage, name, report.droppedTotal);
+  } catch {
+    // A row that could not be written is worked out again next run; nothing else in the run is touched.
+  }
+  return {
+    chain: read.ok ? (read.complete ? "ok" : "partial") : "failed",
+    error: read.error ?? null,
+    rpc: read.rpc ?? null,
+    subrequests: read.subrequests ?? 0,
+    block: read.block?.number ?? null,
+    pending: read.scan?.pending ? read.scan.pending.count : null,
+    oldestPendingAge: read.scan?.pending?.oldest?.ageSeconds ?? null,
+    expired: read.scan ? read.scan.expired.length : null,
+    scanCursor: state.scanCursor,
+    logs: read.logs ? { from: read.logs.fromBlock, to: read.logs.toBlock, refunds: read.logs.refunds.length, foreign: read.logs.foreignFulfillments.length } : null,
+    codeChecked: read.code ? read.code.ok : null,
+    agentApi: null,
+    activeAlerts: checks.filter((check) => conditions[check] || (conditions[check] === undefined && existing.has(check))),
+    messages,
   };
 }
 

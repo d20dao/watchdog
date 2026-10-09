@@ -1,6 +1,6 @@
 // HTTP routing for the Worker. Kept free of runtime-specific imports so it can be unit tested.
 
-import { LIMITS, NETWORKS } from "./config.js";
+import { LIMITS, networkByName } from "./config.js";
 import { ICONS } from "./icons.js";
 import { handleHealthPost } from "./report.js";
 import { renderHtml } from "./status.js";
@@ -25,7 +25,8 @@ export async function handleFetch(request, env, ctx, deps) {
   const url = new URL(request.url);
   const health = /^\/v1\/health\/([^/]+)(\/backup)?$/.exec(url.pathname);
   if (health) {
-    const net = Object.hasOwn(NETWORKS, health[1]) ? NETWORKS[health[1]] : null;
+    // The Arc networks and the enabled round networks; a disabled one (robinhood-mainnet before launch) is unknown.
+    const net = networkByName(health[1]);
     const backup = health[2] !== undefined;
     if (!net || (backup && !net.backupHealthKeySecret)) return text(404, "unknown network\n");
     // The backup (follower) stream has its own key and storage, so it can never touch the primary's state.

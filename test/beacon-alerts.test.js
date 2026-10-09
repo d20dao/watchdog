@@ -76,6 +76,7 @@ function harness({ env = TELEGRAM, networks, catalog = PRE_SWITCH_CATALOG, seedE
       readAgentApiImpl: async (net) => agentApiPoll({}, net),
       runBeaconImpl: state.runBeaconImpl,
       networks: state.networks ?? UNPINNED,
+      roundNetworks: {},
     });
   };
   const texts = () => telegram.flatMap((m) => m.text.split("\n\n"));
