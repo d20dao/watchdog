@@ -12,3 +12,9 @@ HEALTH_KEY_ARC_TESTNET=local-testnet-test-key
 # Bearer keys the backup keepers present on POST /v1/health/<network>/backup.
 HEALTH_KEY_ARC_MAINNET_BACKUP=local-mainnet-backup-test-key
 HEALTH_KEY_ARC_TESTNET_BACKUP=local-testnet-backup-test-key
+
+# Robinhood Chain testnet: alerts go only to its own chat (never TELEGRAM_CHAT_ID); its own bot is optional.
+TELEGRAM_CHAT_ID_ROBINHOOD_TESTNET=
+TELEGRAM_BOT_TOKEN_ROBINHOOD_TESTNET=
+HEALTH_KEY_ROBINHOOD_TESTNET=local-robinhood-testnet-test-key
+HEALTH_KEY_ROBINHOOD_TESTNET_BACKUP=local-robinhood-testnet-backup-test-key

@@ -9,7 +9,9 @@ This Worker runs on Cloudflare instead. It:
 2. reads both chains every minute,
 3. polls the public `/health` of the x402 agent API every minute, on each network where it is enabled,
 4. watches the drand beacon the epoch registry publishes epochs from: its relays every minute, and each registry's registration of it,
-5. posts to the operator Telegram chat with its own bot token.
+5. posts to the operator Telegram chat with its own bot token,
+6. watches D20DAO on Robinhood Chain the same way (see [Robinhood Chain](#robinhood-chain)): keeper reports, one coordinator read
+   a minute, and alerts in the network's own Telegram group.
 
 ```
 keeper (arc-mainnet) ──POST /v1/health/arc-mainnet─────────┐
@@ -68,6 +70,66 @@ Known scan limits:
 
 * `getPendingRequestIds` only sees the last 256 request ids and excludes expired requests, so a request that expired unserved shows up through `refund` (and the keeper's `expired` events) rather than `pending`.
 * Keeper report retries keep their original `observedAt`. `health_age` is measured on the keeper clock, so a delivery gap raises `heartbeat` only, not both.
+
+## Robinhood Chain
+
+Robinhood Chain runs the round coordinator (`D20VRFCoordinatorRobinhood`): no epoch registry, and each request binds a future drand
+round that the keeper fulfils before the request's 60 s deadline. Its networks are `ROUND_NETWORKS` in `src/config.js`, read by
+`src/round.js` and checked by `evaluateRoundChainChecks` in `src/checks.js`. Arc monitoring is unchanged by them.
+
+| Network | Chain | Watched |
+| --- | --- | --- |
+| `robinhood-testnet` | 46630 | yes |
+| `robinhood-mainnet` | 4663 | no: `enabled: false` until it is deployed |
+
+`enabled` is the one switch. A disabled network is not read, raises nothing, has no health endpoint (404) and no status section. To
+enable mainnet, fill `coordinator`, `implementations`, `codeHashes` and `beacon` from the keeper repository's
+`deployments/robinhood-mainnet.json`, confirm `pricing` and `feeRecipients`, then set `enabled: true`.
+
+`statusListed` (default `false`) puts a network on the public page and in `status.json`. Until then nothing of it is public: no
+section, no alerts and no recent messages. Alerts work either way.
+
+Checks, every minute (thresholds in `THRESHOLDS`):
+
+| Check (key) | Warning | Alarm |
+| --- | --- | --- |
+| `heartbeat`, `health_age`, `unhealthy`, `dropped_events`, `backup_heartbeat`, `backup_unhealthy`, `backup_role` | as on Arc | as on Arc |
+| `pending`: age of the oldest open request within its deadline (head timestamp − (deadline − 60)) | ≥ 25 s | ≥ 45 s |
+| `expired`: a request whose deadline passed with neither fulfilment nor refund | — | one-shot, with its id and fee |
+| `refund`: new `RequestRefundedTo` logs | — | one-shot |
+| `foreign_submitter`: `RandomnessFulfilled` by a wallet that is neither keeper | one-shot | — |
+| `balance`: keeper wallet ETH (one fulfilment costs about 0.0000056 ETH) | < 0.001 ETH | < 0.0003 ETH |
+| `backup_balance:<address>`: backup keeper wallet ETH | < 0.0005 ETH | < 0.0002 ETH |
+| `backup_keepers`: a configured backup with `isBackupKeeper` false, or `backupKeeperCount()` above the configured allowed ones | not allowed | unknown backup allowed |
+| `base_fee`: 2 × baseFee against the keeper's 3 gwei cap (no tip is paid there) | > 60 % | > 85 % |
+| `keeper`: `keeper()` ≠ configured primary wallet | — | alarm |
+| `owner`: `owner()` not in `owners`; `pendingOwner()` set | pending to an accepted owner | otherwise |
+| `fee_recipient`: `feeRecipient()` not in `feeRecipients` | — | alarm |
+| `pricing`: `pricing()`, `keeperFeeBps()` or `refundBps()` differ from the deployed values | warning | — |
+| `beacon`: `beaconIdentity(id)` ≠ the pinned registration; another beacon in force, or a change scheduled | in force or scheduled | identity |
+| `coordinator_impl`: ERC-1967 slot not an accepted implementation | — | alarm |
+| `code_hash`: keccak256 of the proxy's or an accepted implementation's runtime code ≠ the pinned hash (the implementation's code fixes its proof verifier and mapping library) | — | alarm |
+| `rpc`: the read failed or was partial for ≥ 3 runs | warning | — |
+
+Chain reading, per run, at most two batches on the public endpoint only:
+
+* **Round A** (`latest`): `eth_chainId`, head block, `nextRequestId`, `keeper`, `owner`, `pendingOwner`, `feeRecipient`, `pricing`,
+  `keeperFeeBps`, `refundBps`, `backupKeeperCount`, `isBackupKeeper` per backup, `beaconSchedule`, `beaconIdentity`, the
+  implementation slot and each wallet's balance. Once a day (an hour after a failed read, at once after the pins change) also
+  `eth_getCode` of the proxy and each accepted implementation (about 25 KB).
+* **Round B** (pinned to the head, only when there is something to read): `eth_getLogs` from the stored cursor (at most 5,000
+  blocks a run) and `getRoundRequest` for the requests from the oldest one not yet settled (at most 32 a run).
+
+The public RPC keeps only about 6,000 blocks of state, so nothing reads deep history. Requests are read by id at the head: a
+fulfilled or refunded one is settled, an open one past its deadline is reported once as `expired`, and the cursor stops at the first
+open one within its deadline. The first run looks back 32 ids and does not report expiries from before it. A log cursor more than
+30,000 blocks behind (the watchdog was down) jumps to the last 5,000 blocks. Contracts see L1 block numbers in `block.number`; the
+reader uses only the RPC's own (L2) block numbers and timestamps.
+
+Alerts go only to the network's own Telegram group, `TELEGRAM_CHAT_ID_ROBINHOOD_TESTNET` (`..._MAINNET`), with the bot
+`TELEGRAM_BOT_TOKEN_ROBINHOOD_TESTNET` (`..._MAINNET`) when set, else `TELEGRAM_BOT_TOKEN`. Without its own chat id a Robinhood alert
+is stored as `not_sent`: it never falls back to the default chat. The drand relays are watched once for all networks by the beacon
+monitor below; its alerts stay in the default chat.
 
 ## x402 agent API
 
@@ -172,7 +234,7 @@ Messages are queued in SQLite in the same transaction as the alert change, then 
 
 ## Endpoints
 
-### `POST /v1/health/<network>` (`arc-mainnet`, `arc-testnet`)
+### `POST /v1/health/<network>` (`arc-mainnet`, `arc-testnet`, `robinhood-testnet`)
 
 This endpoint implements the receiver contract in `d20-keeper-mainnet/docs/keeper-health-receiver.md`.
 
@@ -202,11 +264,11 @@ This endpoint implements the receiver contract in `d20-keeper-mainnet/docs/keepe
 | 422 | `chainId` or `coordinator` does not belong to this network |
 | 503 | receiver key not configured, or storage unavailable |
 
-### `POST /v1/health/<network>/backup` (`arc-mainnet`, `arc-testnet`)
+### `POST /v1/health/<network>/backup` (`arc-mainnet`, `arc-testnet`, `robinhood-testnet`)
 
 The backup (follower) keeper's reports. Same envelope, checks and replies as above, with its own key and storage:
 
-* **Auth:** `HEALTH_KEY_ARC_MAINNET_BACKUP` or `HEALTH_KEY_ARC_TESTNET_BACKUP`. The primary's key is refused here, and this key on the primary route.
+* **Auth:** `HEALTH_KEY_ARC_MAINNET_BACKUP`, `HEALTH_KEY_ARC_TESTNET_BACKUP` or `HEALTH_KEY_ROBINHOOD_TESTNET_BACKUP`. The primary's key is refused here, and this key on the primary route.
 * **Storage:** separate tables (`backup_reports`, `backup_report_state`). Report ids, duplicates and conflicts are counted per stream, so backup reports never touch the keeper's state or alerts.
 * **Role:** `health.role` of the latest report is kept for `backup_role`.
 
@@ -254,7 +316,15 @@ npx wrangler secret put HEALTH_KEY_ARC_MAINNET
 npx wrangler secret put HEALTH_KEY_ARC_TESTNET
 npx wrangler secret put HEALTH_KEY_ARC_MAINNET_BACKUP
 npx wrangler secret put HEALTH_KEY_ARC_TESTNET_BACKUP
+
+# Robinhood Chain testnet: its own Telegram group (and optionally its own bot), and its keepers' report keys
+npx wrangler secret put TELEGRAM_CHAT_ID_ROBINHOOD_TESTNET
+npx wrangler secret put TELEGRAM_BOT_TOKEN_ROBINHOOD_TESTNET   # optional: TELEGRAM_BOT_TOKEN is used without it
+npx wrangler secret put HEALTH_KEY_ROBINHOOD_TESTNET
+npx wrangler secret put HEALTH_KEY_ROBINHOOD_TESTNET_BACKUP
 ```
+
+Robinhood Chain mainnet uses the same names with `_MAINNET`, once it is enabled. The bot must be a member of the group.
 
 Generate each health key as a long random value, for example:
 
@@ -283,6 +353,15 @@ HEALTH_API_KEY=<same value as HEALTH_KEY_ARC_MAINNET_BACKUP>
 
 HEALTH_API_URL=https://watchdog.d20dao.org/v1/health/arc-testnet/backup
 HEALTH_API_KEY=<same value as HEALTH_KEY_ARC_TESTNET_BACKUP>
+
+# robinhood-testnet keepers: 60 s is enough for the 150 s heartbeat and halves their writes (see Free-plan budget)
+HEALTH_API_URL=https://watchdog.d20dao.org/v1/health/robinhood-testnet
+HEALTH_API_KEY=<same value as HEALTH_KEY_ROBINHOOD_TESTNET>
+HEALTH_INTERVAL_SECONDS=60
+
+HEALTH_API_URL=https://watchdog.d20dao.org/v1/health/robinhood-testnet/backup
+HEALTH_API_KEY=<same value as HEALTH_KEY_ROBINHOOD_TESTNET_BACKUP>
+HEALTH_INTERVAL_SECONDS=60
 ```
 
 Then restart the keeper. It posts every 30 s by default (`HEALTH_INTERVAL_SECONDS`). Within a minute, `/status.json` should show `everReported: true` for that network (`backupReport` for a backup).
@@ -320,6 +399,7 @@ Layout:
 | `src/agentapi.js` | x402 agent API `/health` poll, the figures kept from it, poll state |
 | `src/rpc.js`, `src/abi.js`, `src/net.js` | JSON-RPC batches with fallback, hand-rolled ABI, timed fetch |
 | `src/checks.js`, `src/alerts.js` | pure threshold evaluation and alert lifecycle |
+| `src/round.js` | Robinhood Chain round coordinator reader: batches, request scan, code hashes, stored state |
 | `src/beacon.js` | drand beacon monitor: relay reads, registry batch, judgments, state (`fetch` and the RPC session are injected); loads the hash code on first use |
 | `test/fixtures/drand-evmnet-2026-09-29.json` | real drand evmnet chain info and rounds 1, 21056714, 21056750 and 21056968, as the four relays served them on 2026-09-29; a byte for byte copy of the keeper repository's fixture of the same name |
 | `test/beacon-helpers.js` | a fake drand network and fake registries for the beacon tests |
@@ -336,7 +416,7 @@ npx wrangler deploy
 
 The first deploy creates the `Watchdog` SQLite Durable Object class (migration `v1`), the custom domain `watchdog.d20dao.org` and the `* * * * *` cron trigger. `workers_dev` and preview URLs are disabled.
 
-Schema changes are applied in place when the object starts (`migrate` in `src/store.js`). Missing tables are created (for example `agent_api_state` and `beacon_state`), and columns added since the first deploy are added when missing (for example `chain_state.backup_balances_json`, `chain_state.agent_relayer_balance_wei` and `report_state.role`). Stored rows are kept, and no new migration tag is needed. `migrate` also drops a leftover `probe_state` table, with the alerts of its scope, the first time it finds one.
+Schema changes are applied in place when the object starts (`migrate` in `src/store.js`). Missing tables are created (for example `agent_api_state`, `beacon_state` and `round_state`), and columns added since the first deploy are added when missing (for example `chain_state.backup_balances_json`, `chain_state.agent_relayer_balance_wei` and `report_state.role`). Stored rows are kept, and no new migration tag is needed. `migrate` also drops a leftover `probe_state` table, with the alerts of its scope, the first time it finds one.
 
 The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an `exports` field for Durable Object classes. The two are mutually exclusive, and moving a deployed Worker to `exports` cannot be reverted.
 
@@ -346,9 +426,9 @@ The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an 
 | --- | --- |
 | Worker CPU 10 ms per invocation | The Worker only routes: report validation plus hashing measured ~0.1–0.4 ms (up to ~1.7 ms on a cold isolate) for 0.5–61 KB reports. The cron handler just calls the Durable Object. The hash code is never evaluated here. |
 | Durable Object CPU (30 s per request) | A full run for both networks with replayed live RPC responses measured ~0.4 ms warm and ~1.6 ms cold. A worst-case 5,000-block scan returning 1,000 logs measured ~3.5–5 ms. The drand beacon monitor's own work (records, signature comparison, ABI, state) measured ~0.3 ms per run warm before a beacon is registered and ~0.45 ms after (two slot signers included), against local fakes; the first slot signer after the object starts adds ~4 ms of module evaluation. |
-| Subrequests 50 per invocation | 2 batches per network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper and agent API relayer balances are extra calls inside the round A batch, so they add no fetches. Each watched agent API adds 1 `/health` poll, so ≤ 17 in total. The drand beacon adds 10 in the steady state (4 `latest` reads, 4 earlier-round reads and 1 registry batch per network; the networks share the relays, and the batch holds every call the monitor makes, up to 18, so the catalog and the verifier check add no fetch), 11 in a run that reads a relay's `/info` (the first four runs, then four a day), and ≤ 13 at most (both registries on their second endpoint), so ≤ 30 in total. |
-| DO requests 100,000/day | 2 networks × 2 keepers (primary and backup) × 2,880 reports + 1,440 cron runs ≈ 13,000/day, plus status views (edge-cached 15 s). |
-| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. Agent API poll state is 1 row per watched network per run, ≈ 1,440/day each. Alerts and messages only change on transitions. The drand beacon keeps 3 rows a run (its relays, each network), ≈ 4,300/day. Total ≈ 68,000/day with both agent APIs watched. |
+| Subrequests 50 per invocation | Each enabled Robinhood network adds at most 2 RPC fetches (one endpoint). 2 batches per Arc network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper and agent API relayer balances are extra calls inside the round A batch, so they add no fetches. Each watched agent API adds 1 `/health` poll, so ≤ 17 in total. The drand beacon adds 10 in the steady state (4 `latest` reads, 4 earlier-round reads and 1 registry batch per network; the networks share the relays, and the batch holds every call the monitor makes, up to 18, so the catalog and the verifier check add no fetch), 11 in a run that reads a relay's `/info` (the first four runs, then four a day), and ≤ 13 at most (both registries on their second endpoint), so ≤ 30 in total. |
+| DO requests 100,000/day | 2 networks × 2 keepers (primary and backup) × 2,880 reports + 1,440 cron runs ≈ 13,000/day, plus status views (edge-cached 15 s). Robinhood testnet's two keepers at a 60 s interval add 2,880. |
+| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. Agent API poll state is 1 row per watched network per run, ≈ 1,440/day each. Alerts and messages only change on transitions. The drand beacon keeps 3 rows a run (its relays, each network), ≈ 4,300/day. Total ≈ 68,000/day with both agent APIs watched. Robinhood testnet adds ≈ 5 × 2,880 for its two keepers at a 60 s report interval plus 1,440 for its state: ≈ 84,000/day. At the default 30 s interval it would add ≈ 30,000, and mainnet would add as much again, so keep Robinhood keepers at 60 s and check this budget before enabling mainnet. |
 | DO rows read 5,000,000/day | Point lookups plus a few rows per run; the beacon's state adds about 6 (≈ 9,000/day). Well under 100,000/day. |
 | DO duration 13,000 GB-s/day | Billed only while handling a request (RPC wait included): about 1 s × 1,440 runs + ~20 ms × 11,520 reports at 128 MB ≈ 220 GB-s/day. Agent API polls wait alongside the chain reads and are bounded by their 10 s timeout. The beacon's three steps (relays, earlier round, registry) run one after another next to them, the last one after its network's chain read as well: about 0.3 s when everything answers, at most about 40 s with a slow chain read and every fetch at its 5 s timeout, so ≈ 55 GB-s/day typically and ≤ 7,400 GB-s/day at the worst. Timers are cleared so the object can hibernate. |
 | DO storage 5 GB | 3 days of report ids (≈ 35,000 small rows, primary and backup) plus a bounded 100-row message log. |
