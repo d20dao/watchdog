@@ -93,13 +93,17 @@ Checks, every minute (thresholds in `THRESHOLDS`):
 
 | Check (key) | Warning | Alarm |
 | --- | --- | --- |
-| `heartbeat`, `health_age`, `unhealthy`, `dropped_events`, `backup_heartbeat`, `backup_unhealthy`, `backup_role` | as on Arc | as on Arc |
+| `heartbeat`, `backup_heartbeat`: time since the last report, scaled to the keepers' report interval (`reports` in the network's configuration). Testnet (300 s) | ≥ 660 s | ≥ 960 s |
+| the same on mainnet (60 s) | ≥ 150 s | ≥ 240 s |
+| `unhealthy`, `backup_unhealthy`: latest report `healthy: false` | immediately | continuously for ≥ 600 s on testnet, ≥ 300 s on mainnet |
+| `health_age`, `dropped_events`, `backup_role` | as on Arc | as on Arc |
 | `pending`: age of the oldest open request within its deadline (head timestamp − (deadline − 60)) | ≥ 25 s | ≥ 45 s |
 | `expired`: a request whose deadline passed with neither fulfilment nor refund | — | one-shot, with its id and fee |
 | `refund`: new `RequestRefundedTo` logs | — | one-shot |
 | `foreign_submitter`: `RandomnessFulfilled` by a wallet that is neither keeper | one-shot | — |
-| `balance`: keeper wallet ETH (one fulfilment costs about 0.0000056 ETH) | < 0.001 ETH | < 0.0003 ETH |
-| `backup_balance:<address>`: backup keeper wallet ETH | < 0.0005 ETH | < 0.0002 ETH |
+| `balance`: keeper wallet ETH (one fulfilment costs about 0.0000056 ETH). Testnet wallets hold about 0.002 ETH | < 0.001 ETH | < 0.0003 ETH |
+| `backup_balance:<address>`: backup keeper wallet ETH on testnet | < 0.0005 ETH | < 0.0002 ETH |
+| `balance` and `backup_balance:<address>` on mainnet, whose wallets hold about 0.0005 ETH (about 20 requests) | < 0.0002 ETH | < 0.0001 ETH |
 | `backup_keepers`: a configured backup with `isBackupKeeper` false, or `backupKeeperCount()` above the configured allowed ones | not allowed | unknown backup allowed |
 | `base_fee`: 2 × baseFee against the keeper's 3 gwei cap (no tip is paid there) | > 60 % | > 85 % |
 | `keeper`: `keeper()` ≠ configured primary wallet | — | alarm |
@@ -111,7 +115,9 @@ Checks, every minute (thresholds in `THRESHOLDS`):
 | `code_hash`: keccak256 of the proxy's or an accepted implementation's runtime code ≠ the pinned hash (the implementation's code fixes its proof verifier and mapping library) | — | alarm |
 | `rpc`: the read failed or was partial for ≥ 3 runs | warning | — |
 
-Chain reading, per run, at most two batches on the public endpoint only:
+Report checks run every minute. The coordinator is read every `readIntervalSeconds`: every minute on mainnet, every 5 minutes on
+testnet (at once again after a failed or partial read), so on testnet a pending or expired request can be reported up to 5 minutes
+late. Between reads the chain checks keep their state. Each read is at most two batches on the public endpoint only:
 
 * **Round A** (`latest`): `eth_chainId`, head block, `nextRequestId`, `keeper`, `owner`, `pendingOwner`, `feeRecipient`, `pricing`,
   `keeperFeeBps`, `refundBps`, `backupKeeperCount`, `isBackupKeeper` per backup, `beaconSchedule`, `beaconIdentity`, the
@@ -354,13 +360,22 @@ HEALTH_API_KEY=<same value as HEALTH_KEY_ARC_MAINNET_BACKUP>
 HEALTH_API_URL=https://watchdog.d20dao.org/v1/health/arc-testnet/backup
 HEALTH_API_KEY=<same value as HEALTH_KEY_ARC_TESTNET_BACKUP>
 
-# robinhood-testnet keepers: 60 s is enough for the 150 s heartbeat and halves their writes (see Free-plan budget)
+# robinhood-testnet keepers: every 300 s, which the testnet heartbeat thresholds expect (see Free-plan budget)
 HEALTH_API_URL=https://watchdog.d20dao.org/v1/health/robinhood-testnet
 HEALTH_API_KEY=<same value as HEALTH_KEY_ROBINHOOD_TESTNET>
-HEALTH_INTERVAL_SECONDS=60
+HEALTH_INTERVAL_SECONDS=300
 
 HEALTH_API_URL=https://watchdog.d20dao.org/v1/health/robinhood-testnet/backup
 HEALTH_API_KEY=<same value as HEALTH_KEY_ROBINHOOD_TESTNET_BACKUP>
+HEALTH_INTERVAL_SECONDS=300
+
+# robinhood-mainnet keepers, once it is enabled: every 60 s
+HEALTH_API_URL=https://watchdog.d20dao.org/v1/health/robinhood-mainnet
+HEALTH_API_KEY=<same value as HEALTH_KEY_ROBINHOOD_MAINNET>
+HEALTH_INTERVAL_SECONDS=60
+
+HEALTH_API_URL=https://watchdog.d20dao.org/v1/health/robinhood-mainnet/backup
+HEALTH_API_KEY=<same value as HEALTH_KEY_ROBINHOOD_MAINNET_BACKUP>
 HEALTH_INTERVAL_SECONDS=60
 ```
 
@@ -426,9 +441,9 @@ The migration uses `new_sqlite_classes`. Newer Cloudflare docs also describe an 
 | --- | --- |
 | Worker CPU 10 ms per invocation | The Worker only routes: report validation plus hashing measured ~0.1–0.4 ms (up to ~1.7 ms on a cold isolate) for 0.5–61 KB reports. The cron handler just calls the Durable Object. The hash code is never evaluated here. |
 | Durable Object CPU (30 s per request) | A full run for both networks with replayed live RPC responses measured ~0.4 ms warm and ~1.6 ms cold. A worst-case 5,000-block scan returning 1,000 logs measured ~3.5–5 ms. The drand beacon monitor's own work (records, signature comparison, ABI, state) measured ~0.3 ms per run warm before a beacon is registered and ~0.45 ms after (two slot signers included), against local fakes; the first slot signer after the object starts adds ~4 ms of module evaluation. |
-| Subrequests 50 per invocation | Each enabled Robinhood network adds at most 2 RPC fetches (one endpoint). 2 batches per Arc network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper and agent API relayer balances are extra calls inside the round A batch, so they add no fetches. Each watched agent API adds 1 `/health` poll, so ≤ 17 in total. The drand beacon adds 10 in the steady state (4 `latest` reads, 4 earlier-round reads and 1 registry batch per network; the networks share the relays, and the batch holds every call the monitor makes, up to 18, so the catalog and the verifier check add no fetch), 11 in a run that reads a relay's `/info` (the first four runs, then four a day), and ≤ 13 at most (both registries on their second endpoint), so ≤ 30 in total. |
-| DO requests 100,000/day | 2 networks × 2 keepers (primary and backup) × 2,880 reports + 1,440 cron runs ≈ 13,000/day, plus status views (edge-cached 15 s). Robinhood testnet's two keepers at a 60 s interval add 2,880. |
-| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. Agent API poll state is 1 row per watched network per run, ≈ 1,440/day each. Alerts and messages only change on transitions. The drand beacon keeps 3 rows a run (its relays, each network), ≈ 4,300/day. Total ≈ 68,000/day with both agent APIs watched. Robinhood testnet adds ≈ 5 × 2,880 for its two keepers at a 60 s report interval plus 1,440 for its state: ≈ 84,000/day. At the default 30 s interval it would add ≈ 30,000, and mainnet would add as much again, so keep Robinhood keepers at 60 s and check this budget before enabling mainnet. |
+| Subrequests 50 per invocation | Each enabled Robinhood network adds at most 2 RPC fetches (one endpoint) in a run that reads it. 2 batches per Arc network normally (3 with pending requests), at most 6 with fallback, so ≤ 12 RPC fetches plus ≤ 3 Telegram sends per run. Backup keeper and agent API relayer balances are extra calls inside the round A batch, so they add no fetches. Each watched agent API adds 1 `/health` poll, so ≤ 17 in total. The drand beacon adds 10 in the steady state (4 `latest` reads, 4 earlier-round reads and 1 registry batch per network; the networks share the relays, and the batch holds every call the monitor makes, up to 18, so the catalog and the verifier check add no fetch), 11 in a run that reads a relay's `/info` (the first four runs, then four a day), and ≤ 13 at most (both registries on their second endpoint), so ≤ 30 in total. |
+| DO requests 100,000/day | 2 networks × 2 keepers (primary and backup) × 2,880 reports + 1,440 cron runs ≈ 13,000/day, plus status views (edge-cached 15 s). Robinhood testnet's two keepers at 300 s add 576, and mainnet's two at 60 s add 2,880: ≈ 16,500/day. |
+| DO rows written 100,000/day | About 2 per report insert and 2 per prune (the `reports_by_received_at` index), plus 1 state update: ≈ 5 × 11,520 ≈ 58,000 for primary and backup reports. Chain state is 2 × 1,440 ≈ 2,900. Agent API poll state is 1 row per watched network per run, ≈ 1,440/day each. Alerts and messages only change on transitions. The drand beacon keeps 3 rows a run (its relays, each network), ≈ 4,300/day. Arc ≈ 68,000/day with both agent APIs watched. Robinhood testnet, thinned: 5 × 576 reports from its two keepers at 300 s plus 288 state writes (one per 5-minute read) ≈ 3,200. Robinhood mainnet at 60 s: 5 × 2,880 reports plus 1,440 state writes ≈ 15,800. Total ≈ 87,000/day with mainnet enabled. Keepers left at the 30 s default would add ≈ 14,400 more per network, so keep the intervals above. |
 | DO rows read 5,000,000/day | Point lookups plus a few rows per run; the beacon's state adds about 6 (≈ 9,000/day). Well under 100,000/day. |
 | DO duration 13,000 GB-s/day | Billed only while handling a request (RPC wait included): about 1 s × 1,440 runs + ~20 ms × 11,520 reports at 128 MB ≈ 220 GB-s/day. Agent API polls wait alongside the chain reads and are bounded by their 10 s timeout. The beacon's three steps (relays, earlier round, registry) run one after another next to them, the last one after its network's chain read as well: about 0.3 s when everything answers, at most about 40 s with a slow chain read and every fetch at its 5 s timeout, so ≈ 55 GB-s/day typically and ≤ 7,400 GB-s/day at the worst. Timers are cleared so the object can hibernate. |
 | DO storage 5 GB | 3 days of report ids (≈ 35,000 small rows, primary and backup) plus a bounded 100-row message log. |

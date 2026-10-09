@@ -7,7 +7,7 @@
 
 import { storedCalls } from "./agentapi.js";
 import { groupStateKey, networkStateKey } from "./beacon.js";
-import { LIMITS, THRESHOLDS, watchedAgentApi } from "./config.js";
+import { LIMITS, THRESHOLDS, reportThresholds, watchedAgentApi } from "./config.js";
 import { formatDuration, formatEth, formatGwei, formatUsdc, listWithMore, requestLink, shortAddress } from "./format.js";
 import { codePinsKey } from "./round.js";
 
@@ -70,36 +70,36 @@ function balanceCondition(balanceWei, title, detail, alarmWei = THRESHOLDS.balan
 }
 
 /** Time since the last report was received (a duplicate delivery counts). */
-function heartbeatCondition(report, nowSec, title) {
+function heartbeatCondition(report, nowSec, title, limits) {
   const silence = nowSec - report.lastReceivedAt;
   const detail = `last report ${formatDuration(silence)} ago`;
-  return silence >= THRESHOLDS.heartbeatAlarmSeconds
+  return silence >= limits.heartbeatAlarmSeconds
     ? alarm(title, detail)
-    : silence >= THRESHOLDS.heartbeatWarnSeconds
+    : silence >= limits.heartbeatWarnSeconds
       ? warning(title, detail)
       : null;
 }
 
 /** `healthy: false` in the latest report: warning at once, alarm once the streak lasts 5 minutes of keeper time. */
-function unhealthyCondition(report, title) {
+function unhealthyCondition(report, title, limits) {
   if (report.healthy) return null;
   const since = report.unhealthySince ?? report.reportObservedAt;
   const duration = Math.max(0, report.reportObservedAt - since);
   const faults = report.faults.length > 0 ? report.faults.join(", ") : "no fault codes";
   const detail = duration >= 60 ? `faults: ${faults} (for ${formatDuration(duration)})` : `faults: ${faults}`;
-  return duration >= THRESHOLDS.unhealthyAlarmSeconds ? alarm(title, detail) : warning(title, detail);
+  return duration >= limits.unhealthyAlarmSeconds ? alarm(title, detail) : warning(title, detail);
 }
 
 /** Checks driven by the keeper's own reports. `report` is the stored report state or null. */
 export function evaluateReportChecks(net, report, nowSec) {
-  const T = THRESHOLDS;
+  const T = reportThresholds(net);
   if (!report) {
     // Heartbeat only applies once the network has ever reported.
     return { heartbeat: null, health_age: null, unhealthy: null, dropped_events: null };
   }
   const result = {};
 
-  result.heartbeat = heartbeatCondition(report, nowSec, "heartbeat missing");
+  result.heartbeat = heartbeatCondition(report, nowSec, "heartbeat missing", T);
 
   // Staleness of the keeper's health observation when it built its latest report, measured on the
   // keeper clock. Delivery gaps are the heartbeat check's job, so retained retries do not double-alert.
@@ -115,7 +115,7 @@ export function evaluateReportChecks(net, report, nowSec) {
         : null;
   }
 
-  result.unhealthy = unhealthyCondition(report, "keeper unhealthy");
+  result.unhealthy = unhealthyCondition(report, "keeper unhealthy", T);
 
   result.dropped_events = report.droppedTotal > report.droppedAlertedTotal
     ? warning(
@@ -137,8 +137,8 @@ export function evaluateBackupReportChecks(net, backup, nowSec) {
     return { backup_heartbeat: null, backup_unhealthy: null, backup_role: null };
   }
   return {
-    backup_heartbeat: heartbeatCondition(backup, nowSec, "backup keeper heartbeat missing"),
-    backup_unhealthy: unhealthyCondition(backup, "backup keeper unhealthy"),
+    backup_heartbeat: heartbeatCondition(backup, nowSec, "backup keeper heartbeat missing", reportThresholds(net)),
+    backup_unhealthy: unhealthyCondition(backup, "backup keeper unhealthy", reportThresholds(net)),
     // No role in the bootstrap shape: nothing to compare yet.
     backup_role: backup.role == null || backup.role === "follower"
       ? null
@@ -379,9 +379,9 @@ export function evaluateRoundChainChecks(net, chain, state) {
     result.balance = balanceCondition(
       chain.balanceWei,
       "keeper balance low",
-      `keeper ${net.keeper} holds ${formatEth(chain.balanceWei)} ETH (warning below ${formatEth(T.roundBalanceWarnWei)}, alarm below ${formatEth(T.roundBalanceAlarmWei)})`,
-      T.roundBalanceAlarmWei,
-      T.roundBalanceWarnWei,
+      `keeper ${net.keeper} holds ${formatEth(chain.balanceWei)} ETH (warning below ${formatEth(net.balances.warnWei)}, alarm below ${formatEth(net.balances.alarmWei)})`,
+      net.balances.alarmWei,
+      net.balances.warnWei,
     );
   }
   const backupBalances = new Map((chain.backupBalances ?? []).map((b) => [lower(b.address), b.balanceWei]));
@@ -392,8 +392,8 @@ export function evaluateRoundChainChecks(net, chain, state) {
       balanceWei,
       `backup keeper ${shortAddress(wallet)} balance low`,
       `${wallet} holds ${formatEth(balanceWei)} ETH`,
-      T.roundBackupBalanceAlarmWei,
-      T.roundBackupBalanceWarnWei,
+      net.balances.backupAlarmWei,
+      net.balances.backupWarnWei,
     );
   }
 

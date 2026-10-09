@@ -63,6 +63,16 @@ export function codePinsKey(net) {
   return [`proxy=${lower(pins.proxy)}`, ...impls].join(",");
 }
 
+/**
+ * Whether this run reads the coordinator: every run for a network read each minute; for one read less often, once its interval
+ * has passed since the last read (less 30 s, as runs drift), and at once after a read that failed or was partial.
+ */
+export function roundReadDue(net, previous, nowSec) {
+  const interval = net.readIntervalSeconds ?? 60;
+  if (!previous || previous.checkedAt == null || !previous.complete) return true;
+  return nowSec - previous.checkedAt >= Math.max(0, interval - 30);
+}
+
 /** Whether this run reads the runtime code: pins configured, and the last check due or made under other pins. */
 export function codeCheckDue(net, previous, nowSec) {
   const key = codePinsKey(net);

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { decodeBeaconSchedule, decodePricing, decodeRoundRequest, encodeGetRoundRequest, encodeIsBackupKeeper } from "../src/abi.js";
-import { evaluateRoundChainChecks, roundCheckNames } from "../src/checks.js";
+import { evaluateReportChecks, evaluateRoundChainChecks, roundCheckNames } from "../src/checks.js";
 import {
   LIMITS,
   NETWORKS,
@@ -15,10 +15,11 @@ import {
   TOPICS,
   WATCHED_ROUND_NETWORKS,
   networkByName,
+  reportThresholds,
 } from "../src/config.js";
 import { runCron } from "../src/cron.js";
 import { handleFetch } from "../src/http.js";
-import { applyRoundRead, codeCheckDue, codeHash, readRoundChain, walkRequests } from "../src/round.js";
+import { applyRoundRead, codeCheckDue, codeHash, readRoundChain, roundReadDue, walkRequests } from "../src/round.js";
 import { buildStatus, renderHtml } from "../src/status.js";
 import { BACKUP_STREAM, ingestReport, readAlerts, readRoundState, recentMessages } from "../src/store.js";
 import { routeFor } from "../src/telegram.js";
@@ -476,13 +477,13 @@ test("round checks: role, owner, fee recipient, pricing, beacon and implementati
 
 test("round checks: ETH balances, base fee against the 3 gwei cap, and pending age", () => {
   const check = (overrides) => evaluateRoundChainChecks(RH, roundRead(overrides), null);
-  assert.equal(check({ balanceWei: THRESHOLDS.roundBalanceWarnWei }).balance, null);
-  assert.equal(check({ balanceWei: THRESHOLDS.roundBalanceWarnWei - 1n }).balance.severity, "warning");
-  const low = check({ balanceWei: THRESHOLDS.roundBalanceAlarmWei - 1n }).balance;
+  assert.equal(check({ balanceWei: RH.balances.warnWei }).balance, null);
+  assert.equal(check({ balanceWei: RH.balances.warnWei - 1n }).balance.severity, "warning");
+  const low = check({ balanceWei: RH.balances.alarmWei - 1n }).balance;
   assert.equal(low.severity, "alarm");
   assert.match(low.detail, /holds 0\.0002999 ETH \(warning below 0\.001, alarm below 0\.0003\)/);
-  assert.equal(check({ backupBalances: [{ address: BACKUP, balanceWei: THRESHOLDS.roundBackupBalanceWarnWei - 1n }] })[BACKUP_CHECK].severity, "warning");
-  assert.equal(check({ backupBalances: [{ address: BACKUP, balanceWei: THRESHOLDS.roundBackupBalanceAlarmWei - 1n }] })[BACKUP_CHECK].severity, "alarm");
+  assert.equal(check({ backupBalances: [{ address: BACKUP, balanceWei: RH.balances.backupWarnWei - 1n }] })[BACKUP_CHECK].severity, "warning");
+  assert.equal(check({ backupBalances: [{ address: BACKUP, balanceWei: RH.balances.backupAlarmWei - 1n }] })[BACKUP_CHECK].severity, "alarm");
   // 2 x base fee against 3 gwei: no tip is paid on Robinhood Chain.
   assert.equal(check({ block: { number: 1, timestamp: NOW, baseFeeWei: 900_000_000n } }).base_fee, null);
   assert.equal(check({ block: { number: 1, timestamp: NOW, baseFeeWei: 1_000_000_000n } }).base_fee.severity, "warning");
@@ -564,26 +565,77 @@ test("cron: a dead Robinhood keeper alarms in the Robinhood group through its ow
   let summary = await h.run(60);
   assert.equal(summary.messagesQueued, 0);
   assert.equal(summary.networks[RH.name].chain, "ok");
-  summary = await h.run(240);
+  // Testnet keepers report every 300 s: one missed report raises nothing, and nor does the 5-minute gap between chain reads.
+  summary = await h.run(600);
+  assert.equal(summary.messagesQueued, 0);
+  summary = await h.run(660);
   assert.deepEqual(summary.networks[RH.name].activeAlerts, ["heartbeat"]);
-  assert.equal(h.state.telegram.length, 1);
-  assert.equal(h.state.telegram[0].chat_id, "-100222");
-  assert.equal(h.state.telegram[0].token, ROUTED.TELEGRAM_BOT_TOKEN_ROBINHOOD_TESTNET);
-  assert.match(h.state.telegram[0].text, /^\[robinhood-testnet\] ALARM heartbeat missing: last report 4m ago/);
+  assert.match(h.state.telegram[0].text, /WARNING heartbeat missing: last report 11m ago/, "a warning after two missed reports");
+  summary = await h.run(960);
+  assert.equal(h.state.telegram.length, 2);
+  assert.equal(h.state.telegram.at(-1).chat_id, "-100222");
+  assert.equal(h.state.telegram.at(-1).token, ROUTED.TELEGRAM_BOT_TOKEN_ROBINHOOD_TESTNET);
+  assert.match(h.state.telegram.at(-1).text, /^\[robinhood-testnet\] ALARM heartbeat missing: last report 16m ago/);
 
   // The chain shows it too: a request expires unserved (one message), and the stored state follows the read.
   h.state.read = roundRead({ scan: { expired: [{ requestId: 12n, deadline: NOW, feePaidWei: 25_000_000_000_000n }], pending: { count: 0, ids: [], oldest: null, more: false } }, scanCursor: 13n });
-  summary = await h.run(300);
+  summary = await h.run(1020);
+  assert.equal(summary.networks[RH.name].chain, "not due", "read at 960, next at 1260");
+  summary = await h.run(1260);
   assert.match(h.state.telegram.at(-1).text, /ALARM request expired without fulfilment: request 12/);
   assert.equal(readRoundState(h.storage, RH.name).scanCursor, "13");
   h.state.read = roundRead();
-  summary = await h.run(360);
+  summary = await h.run(1320);
+  assert.deepEqual(summary.networks[RH.name].activeAlerts, ["heartbeat", "expired"], "not read: the one-shot stands until the next read");
+  summary = await h.run(1560);
   assert.deepEqual(summary.networks[RH.name].activeAlerts, ["heartbeat"], "the one-shot expiry clears silently");
 
-  ingestReport(h.storage, { network: RH.name, reportId: "r-2", bodySha256: "00".repeat(32), receivedAt: NOW + 400, observedAt: NOW + 400, nodeId: "0x" + "ab".repeat(32), healthy: true, healthObservedAt: NOW + 400, sendEnabled: true, faults: [], droppedTotal: 0, droppedCount: 0, failedCounts: {}, eventCount: 0 });
-  await h.run(420);
-  assert.match(h.state.telegram.at(-1).text, /^\[robinhood-testnet\] RESOLVED heartbeat missing/);
+  ingestReport(h.storage, { network: RH.name, reportId: "r-2", bodySha256: "00".repeat(32), receivedAt: NOW + 1600, observedAt: NOW + 1600, nodeId: "0x" + "ab".repeat(32), healthy: true, healthObservedAt: NOW + 1600, sendEnabled: true, faults: [], droppedTotal: 0, droppedCount: 0, failedCounts: {}, eventCount: 0 });
+  summary = await h.run(1620);
+  assert.equal(summary.networks[RH.name].chain, "not due");
+  assert.match(h.state.telegram.at(-1).text, /^\[robinhood-testnet\] RESOLVED heartbeat missing/, "report checks run every minute");
   assert.ok(h.state.telegram.every((m) => m.chat_id === "-100222"), "nothing reached the Arc chat");
+});
+
+test("report timing per network: testnet at 300 s, mainnet at 60 s, Arc unchanged", () => {
+  const report = { lastReceivedAt: NOW, reportObservedAt: NOW, healthObservedAt: NOW, healthy: true, faults: [], droppedTotal: 0, droppedAlertedTotal: 0 };
+  const heartbeat = (net, silence) => evaluateReportChecks(net, report, NOW + silence).heartbeat?.severity ?? null;
+  const mainnet = ROUND_NETWORKS["robinhood-mainnet"];
+  const arc = NETWORKS["arc-testnet"];
+  assert.deepEqual([599, 660, 960].map((t) => heartbeat(RH, t)), [null, "warning", "alarm"]);
+  assert.deepEqual([149, 150, 240].map((t) => heartbeat(mainnet, t)), [null, "warning", "alarm"]);
+  assert.deepEqual([149, 150, 240].map((t) => heartbeat(arc, t)), [null, "warning", "alarm"]);
+  assert.deepEqual(reportThresholds(arc), {
+    heartbeatWarnSeconds: THRESHOLDS.heartbeatWarnSeconds,
+    heartbeatAlarmSeconds: THRESHOLDS.heartbeatAlarmSeconds,
+    healthAgeWarnSeconds: THRESHOLDS.healthAgeWarnSeconds,
+    healthAgeAlarmSeconds: THRESHOLDS.healthAgeAlarmSeconds,
+    unhealthyAlarmSeconds: THRESHOLDS.unhealthyAlarmSeconds,
+  });
+  // Unhealthy for one report interval only warns on testnet; for two it alarms.
+  const sick = (duration) => evaluateReportChecks(RH, { ...report, healthy: false, faults: ["tick_failed"], unhealthySince: NOW - duration }, NOW).unhealthy.severity;
+  assert.deepEqual([sick(300), sick(600)], ["warning", "alarm"]);
+  assert.equal(RH.reports.intervalSeconds, 300);
+  assert.equal(mainnet.reports.intervalSeconds, 60);
+  assert.deepEqual([RH.readIntervalSeconds, mainnet.readIntervalSeconds], [300, 60]);
+  assert.deepEqual([roundReadDue(RH, { checkedAt: NOW, complete: true }, NOW + 269), roundReadDue(RH, { checkedAt: NOW, complete: true }, NOW + 270)], [false, true]);
+  assert.equal(roundReadDue(RH, { checkedAt: NOW, complete: false }, NOW + 60), true, "a failed read is tried again the next minute");
+  assert.equal(roundReadDue(mainnet, { checkedAt: NOW, complete: true }, NOW + 45), true);
+});
+
+test("mainnet wallets: keeper and follower warn below 0.0002 ETH and alarm below 0.0001 ETH", () => {
+  const mainnet = { ...ROUND_NETWORKS["robinhood-mainnet"], coordinator: RH.coordinator, implementations: RH.implementations };
+  const follower = mainnet.backupKeepers[0];
+  const check = (balanceWei) =>
+    evaluateRoundChainChecks(mainnet, roundRead({ keeper: mainnet.keeper, balanceWei, backupBalances: [{ address: follower, balanceWei }] }), null);
+  const severities = (balanceWei) => {
+    const c = check(balanceWei);
+    return [c.balance?.severity ?? null, c[`backup_balance:${follower.toLowerCase()}`]?.severity ?? null];
+  };
+  assert.deepEqual(severities(2n * ETH / 10000n), [null, null]);
+  assert.deepEqual(severities(2n * ETH / 10000n - 1n), ["warning", "warning"]);
+  assert.deepEqual(severities(ETH / 10000n - 1n), ["alarm", "alarm"]);
+  assert.deepEqual(severities(5n * ETH / 10000n), [null, null], "a full mainnet wallet (about 0.0005 ETH) is fine");
 });
 
 test("cron: without its own chat a round network's alerts are kept, never sent to the default chat", async () => {

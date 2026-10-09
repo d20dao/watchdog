@@ -29,7 +29,7 @@ import {
   roundCheckNames,
 } from "./checks.js";
 import { BEACON_SCOPE, LIMITS, NETWORKS, WATCHED_ROUND_NETWORKS, watchedAgentApi } from "./config.js";
-import { applyRoundRead, readRoundChain } from "./round.js";
+import { applyRoundRead, readRoundChain, roundReadDue } from "./round.js";
 import { readChain } from "./rpc.js";
 import {
   deleteBeaconState,
@@ -114,10 +114,14 @@ export async function runCron({
     return read?.ok && read.block ? read.block.number : null;
   };
 
-  // Round networks (Robinhood Chain) have their own reader and share nothing with the Arc reads or the beacon.
+  // Round networks (Robinhood Chain) have their own reader and share nothing with the Arc reads or the beacon. A network read
+  // less often than every run (readIntervalSeconds) is not read in between: null.
   const roundReads = roundNames.map(async (name) => {
     try {
-      return await readRoundChainImpl(roundNets[name], readRoundState(storage, name), { fetch, nowSec: Math.floor(clock() / 1000) });
+      const previous = readRoundState(storage, name);
+      const nowSec = Math.floor(clock() / 1000);
+      if (!roundReadDue(roundNets[name], previous, nowSec)) return null;
+      return await readRoundChainImpl(roundNets[name], previous, { fetch, nowSec });
     } catch {
       return { ok: false, complete: false, error: "internal error", errors: [], subrequests: 0 };
     }
@@ -277,13 +281,15 @@ function commitRoundNetwork(storage, net, read, now, deliverable) {
   let steps;
   let checks;
   try {
-    state = applyRoundRead(net, readRoundState(storage, name), read, now);
+    // Not read this run: the stored state stands, and every chain check but the stored code verdict is unknown.
+    const previous = readRoundState(storage, name);
+    state = read ? applyRoundRead(net, previous, read, now) : previous;
     report = readReportState(storage, name);
     conditions = {
       ...evaluateReportChecks(net, report, now),
       ...evaluateBackupReportChecks(net, readBackupReportState(storage, name), now),
       ...evaluateRoundChainChecks(net, read, state),
-      rpc: evaluateRpcCheck(state.consecutiveFailures, read.error),
+      rpc: read ? evaluateRpcCheck(state.consecutiveFailures, read.error) : undefined,
     };
     existing = new Map(readAlerts(storage, name).map((row) => [row.check, row]));
     checks = roundCheckNames(net);
@@ -298,9 +304,10 @@ function commitRoundNetwork(storage, net, read, now, deliverable) {
   } catch {
     return { chain: "failed", error: "internal error", rpc: read?.rpc ?? null, subrequests: read?.subrequests ?? 0, activeAlerts: [], messages: [] };
   }
+  read ??= { notRead: true };
   const messages = [];
   try {
-    writeRoundState(storage, name, now, state);
+    if (read) writeRoundState(storage, name, now, state);
     for (const { check, step } of steps) {
       if (step.write) saveAlert(storage, alertKey(name, check), step.row);
       if (step.message) {
@@ -313,7 +320,7 @@ function commitRoundNetwork(storage, net, read, now, deliverable) {
     // A row that could not be written is worked out again next run; nothing else in the run is touched.
   }
   return {
-    chain: read.ok ? (read.complete ? "ok" : "partial") : "failed",
+    chain: read.notRead ? "not due" : read.ok ? (read.complete ? "ok" : "partial") : "failed",
     error: read.error ?? null,
     rpc: read.rpc ?? null,
     subrequests: read.subrequests ?? 0,
@@ -321,7 +328,7 @@ function commitRoundNetwork(storage, net, read, now, deliverable) {
     pending: read.scan?.pending ? read.scan.pending.count : null,
     oldestPendingAge: read.scan?.pending?.oldest?.ageSeconds ?? null,
     expired: read.scan ? read.scan.expired.length : null,
-    scanCursor: state.scanCursor,
+    scanCursor: state?.scanCursor ?? null,
     logs: read.logs ? { from: read.logs.fromBlock, to: read.logs.toBlock, refunds: read.logs.refunds.length, foreign: read.logs.foreignFulfillments.length } : null,
     codeChecked: read.code ? read.code.ok : null,
     agentApi: null,

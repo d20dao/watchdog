@@ -162,6 +162,11 @@ export const ROUND_SELECTORS = Object.freeze({
  *   beacon           the drand beacon in force (beaconSchedule) and its registration's identity (beaconIdentity), which binds its
  *                    verifier, chain hash, public key, genesis and period
  *   pricing          pricing(), keeperFeeBps() and refundBps() as deployed; a change warns
+ *   balances         wallet thresholds in wei (native ETH; one fulfilment costs about 0.0000056 ETH): the keeper's, and each backup's
+ *   reports          the keepers' HEALTH_INTERVAL_SECONDS and the report thresholds scaled to it (see reportThresholds); Arc
+ *                    networks have none and use THRESHOLDS
+ *   readIntervalSeconds  how often the coordinator is read: 60 reads it every run, 300 every fifth minute. Report checks run
+ *                    every minute either way; between reads the chain checks keep their state.
  */
 export const ROUND_NETWORKS = Object.freeze({
   "robinhood-testnet": Object.freeze({
@@ -192,6 +197,20 @@ export const ROUND_NETWORKS = Object.freeze({
     // The keeper's MAX_FEE_PER_GAS_WEI. It pays no priority fee here, so the checked value is 2 x baseFee.
     feeCapWei: 3n * GWEI,
     feeHeadroomWei: 0n,
+    // Wallets hold about 0.002 ETH. Keeper: warn below 0.001 ETH (about 180 fulfilments), alarm below 0.0003 ETH (about 50).
+    // Backup, which spends only while it covers for the primary: warn below 0.0005 ETH, alarm below 0.0002 ETH.
+    balances: Object.freeze({ warnWei: ETH / 1000n, alarmWei: (3n * ETH) / 10000n, backupWarnWei: (5n * ETH) / 10000n, backupAlarmWei: (2n * ETH) / 10000n }),
+    // Testnet is thinned to spare the free plan's writes: keepers report every 300 s and the chain is read every 5 minutes, so
+    // an expired request may be reported up to 5 minutes late. Silence warns after two missed reports and alarms after three.
+    reports: Object.freeze({
+      intervalSeconds: 300,
+      heartbeatWarnSeconds: 660,
+      heartbeatAlarmSeconds: 960,
+      healthAgeWarnSeconds: 120,
+      healthAgeAlarmSeconds: 240,
+      unhealthyAlarmSeconds: 600,
+    }),
+    readIntervalSeconds: 300,
     // The public endpoint only: it keeps about 6,000 blocks of state, so the reader scans by request id and recent blocks.
     rpcs: Object.freeze(["https://rpc.testnet.chain.robinhood.com"]),
     explorer: null,
@@ -219,6 +238,18 @@ export const ROUND_NETWORKS = Object.freeze({
     pricing: Object.freeze({ minFeeWei: 25_000_000_000_000n, feeMultiplier: 2, fulfillGasOverhead: 405_000, keeperFeeBps: 8000, refundBps: 10000 }),
     feeCapWei: 3n * GWEI,
     feeHeadroomWei: 0n,
+    // Wallets hold only about 0.0005 ETH each (about 20 requests): warn below 0.0002 ETH, alarm below 0.0001 ETH, for both.
+    balances: Object.freeze({ warnWei: (2n * ETH) / 10000n, alarmWei: ETH / 10000n, backupWarnWei: (2n * ETH) / 10000n, backupAlarmWei: ETH / 10000n }),
+    // Keepers report every 60 s: silence warns after 150 s and alarms after 240 s, as on Arc.
+    reports: Object.freeze({
+      intervalSeconds: 60,
+      heartbeatWarnSeconds: 150,
+      heartbeatAlarmSeconds: 240,
+      healthAgeWarnSeconds: 120,
+      healthAgeAlarmSeconds: 240,
+      unhealthyAlarmSeconds: 300,
+    }),
+    readIntervalSeconds: 60,
     rpcs: Object.freeze(["https://rpc.mainnet.chain.robinhood.com"]),
     explorer: null,
     healthKeySecret: "HEALTH_KEY_ROBINHOOD_MAINNET",
@@ -231,6 +262,22 @@ export const enabledNetworks = (nets) => Object.freeze(Object.fromEntries(Object
 export const WATCHED_ROUND_NETWORKS = enabledNetworks(ROUND_NETWORKS);
 
 export const isRoundNetwork = (net) => net?.kind === "round";
+
+/**
+ * The report thresholds of a network: its own `reports` when it has them, THRESHOLDS otherwise (Arc). health_age measures the
+ * keeper's health observation against its report, which the keeper refreshes every tick whatever the report interval.
+ */
+export function reportThresholds(net) {
+  const own = net?.reports ?? {};
+  const pick = (key) => own[key] ?? THRESHOLDS[key];
+  return {
+    heartbeatWarnSeconds: pick("heartbeatWarnSeconds"),
+    heartbeatAlarmSeconds: pick("heartbeatAlarmSeconds"),
+    healthAgeWarnSeconds: pick("healthAgeWarnSeconds"),
+    healthAgeAlarmSeconds: pick("healthAgeAlarmSeconds"),
+    unhealthyAlarmSeconds: pick("unhealthyAlarmSeconds"),
+  };
+}
 
 /** A network's configuration by name, among the Arc networks and the enabled round networks; null when there is none. */
 export function networkByName(name, nets = NETWORKS, roundNets = WATCHED_ROUND_NETWORKS) {
@@ -290,13 +337,7 @@ export const THRESHOLDS = Object.freeze({
   // Consecutive runs in which beaconOf must revert, after the beacon was seen registered, before "no longer registered"
   // warns: one read from an RPC node that is behind, or a rollback that is quickly undone, is not a lost registration.
   beaconUnregisteredRuns: 2,
-  // Round networks (Robinhood Chain): native ETH. One fulfilment costs about 0.0000056 ETH and a wallet holds about 0.002 ETH.
-  //   keeper:  warn below 0.001 ETH (about 180 fulfilments), alarm below 0.0003 ETH (about 50).
-  //   backup:  spends only while it covers for the primary: warn below 0.0005 ETH, alarm below 0.0002 ETH.
-  roundBalanceWarnWei: ETH / 1000n,
-  roundBalanceAlarmWei: (3n * ETH) / 10000n,
-  roundBackupBalanceWarnWei: (5n * ETH) / 10000n,
-  roundBackupBalanceAlarmWei: (2n * ETH) / 10000n,
+  // Round networks set their wallet thresholds in `balances` and their report timing in `reports` (ROUND_NETWORKS).
 });
 
 export const LIMITS = Object.freeze({
