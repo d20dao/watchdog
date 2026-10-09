@@ -165,11 +165,13 @@ export const ROUND_SELECTORS = Object.freeze({
  *   balances         wallet thresholds in wei (native ETH; one fulfilment costs about 0.0000056 ETH): the keeper's, and each backup's
  *   reports          the keepers' HEALTH_INTERVAL_SECONDS and the report thresholds scaled to it (see reportThresholds); Arc
  *                    networks have none and use THRESHOLDS
- *   rpcs             keyless endpoints for the state reads, in order. Each must take a batch of about 20 calls. Robinhood's own
- *                    endpoints rate-limit by source IP, and Cloudflare's egress IPs are shared with every other Worker, so they
- *                    answer the watchdog with HTTP 429 at random: they come last, as a fallback only.
- *   logRpcs          endpoints for eth_getLogs, in order, with the range (`maxBlocks`) and batch (`maxBatch`) each accepts
- *   keyedRpcSecret   name of an optional secret holding a keyed endpoint URL, tried first for state and logs; unset by default
+ *   rpcs             keyless endpoints for the state reads, in order. Keyless endpoints limit by source IP, and Cloudflare's egress
+ *                    IPs are shared with every other Worker, so any of them can answer the watchdog with HTTP 429 at random;
+ *                    Robinhood's own come last. A dRPC endpoint gets batches of 3 calls (batchCap).
+ *   logRpcs          endpoints for eth_getLogs, in order; dRPC ones are read 100 blocks a call, 3 calls a fetch
+ *   keyedRpcSecret   name of an optional secret holding a keyed endpoint URL (dRPC: https://lb.drpc.org/<network>/<key>), tried
+ *                    first for state and logs. A keyed endpoint is limited per key, not per source IP. Unset by default.
+ *   slowIntervalSeconds  how often the roles, pricing and beacon are read (the code hashes once a day whatever it is)
  *   readIntervalSeconds  how often the coordinator is read: 60 reads it every run, 300 every fifth minute. Report checks run
  *                    every minute either way; between reads the chain checks keep their state.
  */
@@ -219,11 +221,12 @@ export const ROUND_NETWORKS = Object.freeze({
     // PublicNode keeps about 128 blocks of state and takes large batches; Robinhood's own endpoint keeps about 6,000 blocks. The
     // reader scans requests by id at the head and logs from recent blocks only. dRPC's keyless tier takes at most 3 calls a batch,
     // too few for the state reads, so it serves logs only.
-    rpcs: Object.freeze(["https://robinhood-sepolia-rpc.publicnode.com", "https://rpc.testnet.chain.robinhood.com"]),
+    rpcs: Object.freeze(["https://robinhood-sepolia-rpc.publicnode.com", "https://robinhood-testnet.drpc.org", "https://rpc.testnet.chain.robinhood.com"]),
     logRpcs: Object.freeze([
-      Object.freeze({ url: "https://robinhood-testnet.drpc.org", maxBlocks: 100, maxBatch: 3 }),
-      Object.freeze({ url: "https://rpc.testnet.chain.robinhood.com", maxBlocks: 5000, maxBatch: 1 }),
+      Object.freeze({ url: "https://robinhood-testnet.drpc.org" }),
+      Object.freeze({ url: "https://rpc.testnet.chain.robinhood.com", maxBlocks: 5000 }),
     ]),
+    slowIntervalSeconds: 1800,
     keyedRpcSecret: "RPC_URL_ROBINHOOD_TESTNET",
     explorer: null,
     healthKeySecret: "HEALTH_KEY_ROBINHOOD_TESTNET",
@@ -271,11 +274,12 @@ export const ROUND_NETWORKS = Object.freeze({
     }),
     readIntervalSeconds: 60,
     // As on testnet. PublicNode's mainnet nodes keep only about 80 blocks (8 s), enough for the state reads, not for logs.
-    rpcs: Object.freeze(["https://robinhood-rpc.publicnode.com", "https://rpc.mainnet.chain.robinhood.com"]),
+    rpcs: Object.freeze(["https://robinhood-rpc.publicnode.com", "https://robinhood.drpc.org", "https://rpc.mainnet.chain.robinhood.com"]),
     logRpcs: Object.freeze([
-      Object.freeze({ url: "https://robinhood.drpc.org", maxBlocks: 100, maxBatch: 3 }),
-      Object.freeze({ url: "https://rpc.mainnet.chain.robinhood.com", maxBlocks: 5000, maxBatch: 1 }),
+      Object.freeze({ url: "https://robinhood.drpc.org" }),
+      Object.freeze({ url: "https://rpc.mainnet.chain.robinhood.com", maxBlocks: 5000 }),
     ]),
+    slowIntervalSeconds: 600,
     keyedRpcSecret: "RPC_URL_ROBINHOOD_MAINNET",
     explorer: null,
     healthKeySecret: "HEALTH_KEY_ROBINHOOD_MAINNET",
@@ -412,9 +416,11 @@ export const LIMITS = Object.freeze({
   // Logs are scanned from the stored cursor, at most this many blocks a run. The public RPC keeps about 6,000 blocks of state,
   // so a cursor further behind than roundLogMaxLagBlocks jumps to the recent blocks instead of reading deep history.
   roundLogScanMaxBlocks: 5000,
-  // Fetches one log endpoint may take a run: with dRPC's caps (100 blocks a call, 3 calls a batch) 6 fetches cover 1,800 blocks,
-  // three minutes of mainnet (about 10 blocks a second) or five of testnet (about 5.5).
-  roundLogMaxFetches: 6,
+  // Fetches one round network may make in a run, failed ones included. With Arc's worst case (12 chain fetches, 2 agent API polls,
+  // 13 for the beacon and 3 Telegram sends: 30) two round networks keep a run within the 50 subrequests of the free plan.
+  roundMaxSubrequests: 9,
+  // Blocks in one eth_getLogs call to dRPC, keyless or keyed (its keyless tier refuses about 150).
+  roundDrpcLogBlocks: 100,
   // An endpoint that refused a batch for its rate or plan limits is tried only after the others for this long.
   roundRpcCooldownSeconds: 600,
   roundLogMaxLagBlocks: 30_000,

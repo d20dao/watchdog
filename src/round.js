@@ -1,11 +1,7 @@
-// Chain reader for round networks (Robinhood Chain's D20VRFCoordinatorRobinhood): at most two JSON-RPC batches per run.
-//   Round A (latest): chainId, head block, nextRequestId, keeper, owner, pendingOwner, feeRecipient, pricing, keeperFeeBps,
-//                     refundBps, backupKeeperCount, isBackupKeeper for each configured backup, beaconSchedule, beaconIdentity,
-//                     the implementation slot and every keeper wallet's balance; once a day also the runtime code of the proxy
-//                     and of each accepted implementation, whose keccak256 is compared with the pinned hashes.
-//   Round B (latest, only when there is something to read): getRoundRequest for the requests from the oldest one not yet
-//                     settled, at most LIMITS.roundScanMaxIds.
-//   Logs (alongside round B, on the log endpoints): coordinator logs since the stored cursor, in chunks an endpoint accepts.
+// Chain reader for round networks (Robinhood Chain's D20VRFCoordinatorRobinhood). Each read is a fast part (head, requests,
+// balances), a slow part every slowIntervalSeconds (roles, pricing, beacon; the code hashes once a day) and the logs, within a
+// budget of LIMITS.roundMaxSubrequests fetches (see readRoundChain). Public endpoints that limit by source IP refuse Cloudflare's
+// shared egress at random, so every batch fails over to the next endpoint in the same run, chunked to what each endpoint takes.
 // The public RPC keeps only about 6,000 blocks of state, so nothing reads deep history: requests are read by id at the head,
 // and a log cursor left far behind jumps to the recent blocks. Contracts see L1 block numbers in block.number; everything
 // here uses the RPC's own (L2) block numbers and timestamps.
@@ -164,16 +160,103 @@ export function walkRequests(requests, cursor, nowTs, { quiet = false, more = fa
   };
 }
 
+/** Calls an endpoint takes in one batch: dRPC (keyless or keyed) at most 3, others any number. */
+export function batchCap(url) {
+  try {
+    const host = new URL(url).host.toLowerCase();
+    return host === "drpc.org" || host.endsWith(".drpc.org") ? 3 : Infinity;
+  } catch {
+    return Infinity;
+  }
+}
+
+/** Whether the slow part (roles, pricing, beacon; the code hashes once a day) is read this run. */
+export function slowReadDue(net, previous, nowSec) {
+  if (codeCheckDue(net, previous, nowSec)) return true;
+  const interval = net.slowIntervalSeconds ?? 600;
+  return previous?.slowAt == null || nowSec - previous.slowAt >= Math.max(0, interval - 30);
+}
+
 /**
- * Read one round network. `previous` is the stored round state (see applyRoundRead) or null.
- * Result always has {ok, complete, rpc, error, errors, subrequests}; figures are null when unknown. `scan` is null when the
- * requests were not read; `logs` is null when unknown or not scanned; `code` is null when the code was not read this run.
+ * Batches over an ordered endpoint list, like RpcSession, with two differences: each endpoint's batch is split into chunks it
+ * accepts (batchCap), and every fetch draws on the network's run budget (`budget.left`). An endpoint that fails any chunk, or
+ * whose answers `validate` rejects, is left for the next one for the rest of the run. Running out of budget fails nothing: the
+ * batch returns null with `exhausted` set, and the caller defers that part.
+ */
+export class RoundSession {
+  constructor(urls, { fetch, timeoutMs, budget }) {
+    this.urls = urls;
+    this.fetch = fetch;
+    this.timeoutMs = timeoutMs;
+    this.budget = budget;
+    this.index = 0;
+    this.subrequests = 0;
+    this.failures = [];
+    this.lastError = null;
+    this.exhausted = false;
+  }
+
+  get url() {
+    return this.index < this.urls.length ? this.urls[this.index] : null;
+  }
+
+  async batch(calls, validate) {
+    this.exhausted = false;
+    while (this.index < this.urls.length) {
+      const url = this.urls[this.index];
+      const cap = batchCap(url);
+      const items = [];
+      let problem = null;
+      let rateLimited = false;
+      for (let i = 0; i < calls.length; i += cap) {
+        if (this.budget.left <= 0) {
+          this.exhausted = true;
+          this.lastError = "subrequest budget";
+          return null;
+        }
+        this.budget.left--;
+        this.subrequests++;
+        const one = new RpcSession([url], { fetch: this.fetch, timeoutMs: this.timeoutMs });
+        const part = await one.batch(calls.slice(i, i + cap));
+        if (!part) {
+          problem = one.lastError ?? "failed";
+          rateLimited = one.failures[0]?.rateLimited ?? false;
+          break;
+        }
+        items.push(...part);
+      }
+      if (!problem && validate) {
+        problem = validate(items);
+        rateLimited = problem != null && items.some((item) => item?.rateLimited);
+      }
+      if (!problem) return items;
+      this.failures.push({ url, error: problem, rateLimited });
+      this.lastError = problem;
+      this.index++;
+    }
+    return null;
+  }
+}
+
+/**
+ * Read one round network. `previous` is the stored round state (see applyRoundRead) or null. One run spends at most
+ * LIMITS.roundMaxSubrequests fetches, in this order:
+ *   fast (every read)     chainId, head block, nextRequestId and every keeper wallet's balance
+ *   requests              getRoundRequest from the oldest request not yet settled
+ *   slow (slowReadDue)    keeper, owner, pendingOwner, feeRecipient, pricing, keeperFeeBps, refundBps, backupKeeperCount,
+ *                         isBackupKeeper per backup, beaconSchedule, beaconIdentity and the implementation slot; once a day
+ *                         also the runtime code of the proxy and each accepted implementation
+ *   logs                  with what is left of the budget (readLogs)
+ * A part the budget cannot cover is deferred to a later run, not failed. Result always has {ok, complete, rpc, error, errors,
+ * subrequests}; figures are null when unknown or not read this run. `scan` is null when the requests were not read; `logs` is null
+ * when unknown; `code` is null when the code was not read this run; `slow` says whether the slow part was read.
  */
 export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec = Math.floor(Date.now() / 1000), keyedRpc = null } = {}) {
   const keyed = typeof keyedRpc === "string" && /^https:\/\//.test(keyedRpc.trim()) ? keyedRpc.trim() : null;
   const cooldowns = previous?.cooldowns ?? {};
+  const budget = { left: LIMITS.roundMaxSubrequests };
   const stateUrls = [...(keyed ? [keyed] : []), ...orderEndpoints(net.rpcs, cooldowns, nowSec)];
-  const session = new RpcSession(stateUrls, { fetch, timeoutMs });
+  const session = new RoundSession(stateUrls, { fetch, timeoutMs, budget });
   const backups = net.backupKeepers ?? [];
   const errors = [];
   const out = {
@@ -186,6 +269,8 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
     // Endpoints that refused a batch for their limits this run: [{endpoint, step}] (ids, never URLs).
     rateLimited: [],
     cooldowns,
+    deferred: [],
+    slow: false,
     block: null,
     nextRequestId: null,
     keeper: null,
@@ -208,47 +293,24 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
     scanCursor: previous?.scanCursor == null ? null : BigInt(previous.scanCursor),
     logCursor: previous?.logCursor ?? null,
   };
-  const finish = (logFailures = []) => {
-    out.subrequests = session.subrequests;
-    out.rpc = session.index < stateUrls.length ? endpointId(stateUrls[session.index], keyed) : null;
-    const failures = [...session.failures.map((f) => ({ ...f, step: "state" })), ...logFailures.map((f) => ({ ...f, step: "logs" }))];
+  let logRead = null;
+  const finish = () => {
+    out.subrequests = session.subrequests + (logRead?.subrequests ?? 0);
+    out.rpc = session.url ? endpointId(session.url, keyed) : null;
+    const failures = [
+      ...session.failures.map((f) => ({ ...f, step: "state" })),
+      ...(logRead?.failures ?? []).map((f) => ({ ...f, step: "logs" })),
+    ];
     out.rateLimited = failures.filter((f) => f.rateLimited).map((f) => ({ endpoint: endpointId(f.url, keyed), step: f.step }));
     out.cooldowns = nextCooldowns(cooldowns, failures, nowSec, keyed);
     return out;
   };
-  const call = (data, tag = "latest") => ["eth_call", [{ to: net.coordinator, data }, tag]];
+  const call = (data) => ["eth_call", [{ to: net.coordinator, data }, "latest"]];
 
-  // Round A
-  const S = ROUND_SELECTORS;
-  const roundA = [
-    ["eth_chainId", []],
-    ["eth_getBlockByNumber", ["latest", false]],
-    call(S.nextRequestId),
-    call(S.keeper),
-    call(S.owner),
-    call(S.pendingOwner),
-    call(S.feeRecipient),
-    call(S.pricing),
-    call(S.keeperFeeBps),
-    call(S.refundBps),
-    call(S.backupKeeperCount),
-    call(S.beaconSchedule),
-    // Without a configured beacon the slot holds a call whose answer is not used, so the indexes below stay fixed.
-    net.beacon ? call(encodeBeaconIdentity(net.beacon.id)) : ["eth_chainId", []],
-    ["eth_getStorageAt", [net.coordinator, IMPLEMENTATION_SLOT, "latest"]],
-    ["eth_getBalance", [net.keeper, "latest"]],
-  ];
-  const authorizedIndex = roundA.length;
-  for (const wallet of backups) roundA.push(call(encodeIsBackupKeeper(wallet)));
-  const backupIndex = roundA.length;
-  for (const wallet of backups) roundA.push(["eth_getBalance", [wallet, "latest"]]);
-  const codeIndex = roundA.length;
-  const codeTargets = codeCheckDue(net, previous, nowSec)
-    ? [net.coordinator, ...Object.keys(net.codeHashes.implementations ?? {})]
-    : [];
-  for (const address of codeTargets) roundA.push(["eth_getCode", [address, "latest"]]);
-
-  const a = await session.batch(roundA, (items) => {
+  // Fast
+  const fast = [["eth_chainId", []], ["eth_getBlockByNumber", ["latest", false]], call(ROUND_SELECTORS.nextRequestId), ["eth_getBalance", [net.keeper, "latest"]]];
+  for (const wallet of backups) fast.push(["eth_getBalance", [wallet, "latest"]]);
+  const a = await session.batch(fast, (items) => {
     try {
       if (notRateLimited(items)) return "rate limited";
       if (!("result" in items[0]) || hexToBigInt(items[0].result) !== BigInt(net.chainId)) return "wrong chain id";
@@ -266,54 +328,18 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
   out.ok = true;
   out.block = decodeBlock(a[1].result);
   out.nextRequestId = pick(a[2], decodeUint256, errors, "nextRequestId");
-  out.keeper = pick(a[3], decodeAddress, errors, "keeper");
-  out.owner = pick(a[4], decodeAddress, errors, "owner");
-  out.pendingOwner = pick(a[5], decodeAddress, errors, "pendingOwner");
-  out.feeRecipient = pick(a[6], decodeAddress, errors, "feeRecipient");
-  out.pricing = pick(a[7], decodePricing, errors, "pricing");
-  out.keeperFeeBps = pick(a[8], decodeUint16, errors, "keeperFeeBps");
-  out.refundBps = pick(a[9], decodeUint16, errors, "refundBps");
-  out.backupKeeperCount = pick(a[10], decodeUint256, errors, "backupKeeperCount");
-  out.beaconSchedule = pick(a[11], decodeBeaconSchedule, errors, "beaconSchedule");
-  if (net.beacon) out.beaconIdentity = pick(a[12], decodeBytes32, errors, "beaconIdentity");
-  out.implementation = pick(a[13], decodeAddress, errors, "implementation slot");
-  out.balanceWei = pick(a[14], hexToBigInt, errors, "balance");
-  out.backupAuthorized = backups.map((address, i) => ({
-    address,
-    allowed: pick(a[authorizedIndex + i], decodeBool, errors, `isBackupKeeper ${address}`),
-  }));
-  out.backupBalances = backups.map((address, i) => ({
-    address,
-    balanceWei: pick(a[backupIndex + i], hexToBigInt, errors, `backup balance ${address}`),
-  }));
-  if (codeTargets.length > 0) {
-    const hashes = {};
-    let failed = false;
-    for (const [i, address] of codeTargets.entries()) {
-      const item = a[codeIndex + i];
-      try {
-        if (!item || "error" in item) throw new AbiError(item ? item.error : "missing");
-        hashes[lower(address)] = await codeHash(item.result);
-      } catch (err) {
-        failed = true;
-        errors.push(`code ${address}: ${err instanceof AbiError ? err.message : "invalid result"}`);
-      }
-    }
-    out.code = failed ? { ok: false } : { ok: true, proxy: hashes[lower(net.coordinator)], implementations: hashes };
-  }
+  out.balanceWei = pick(a[3], hexToBigInt, errors, "balance");
+  out.backupBalances = backups.map((address, i) => ({ address, balanceWei: pick(a[4 + i], hexToBigInt, errors, `backup balance ${address}`) }));
   if (out.block.baseFeeWei == null) errors.push("block: no baseFeePerGas");
-
   const head = out.block.number;
 
-  // Round B: the requests, at `latest` (a public node keeps only about a hundred blocks of state, and may be a block behind the
-  // one that answered round A; ids are bounded by round A's nextRequestId and judged at its head time). The logs are read at the
-  // same time from their own endpoints (readLogs).
-  let scanIds = [];
-  let quiet = false;
-  let more = false;
+  // Requests. On an endpoint that takes 3 calls a batch, at most three batches' worth a run; a backlog is read over later runs.
+  let scanFailed = false;
   if (out.nextRequestId != null) {
     const next = out.nextRequestId;
-    const window = BigInt(LIMITS.roundScanMaxIds);
+    const cap = batchCap(session.url);
+    const window = BigInt(Number.isFinite(cap) ? Math.min(LIMITS.roundScanMaxIds, cap * 3) : LIMITS.roundScanMaxIds);
+    let quiet = false;
     if (out.scanCursor == null) {
       // First run: look back one window for pending requests, without reporting the expired ones from before the watchdog.
       out.scanCursor = next > window ? next - window : 1n;
@@ -321,69 +347,127 @@ export async function readRoundChain(net, previous, { fetch, timeoutMs, nowSec =
     }
     if (out.scanCursor > next) out.scanCursor = next; // never ahead of the chain (a redeployed coordinator, a rolled-back head)
     const end = out.scanCursor + window < next ? out.scanCursor + window : next;
-    more = end < next;
+    const scanIds = [];
     for (let id = out.scanCursor; id < end; id++) scanIds.push(id);
+    const b = scanIds.length === 0 ? [] : await session.batch(scanIds.map((id) => call(encodeGetRoundRequest(id))), notRateLimited);
+    if (b === null && session.exhausted) {
+      out.deferred.push("requests");
+    } else if (b === null) {
+      scanFailed = true;
+      errors.push(`getRoundRequest: ${session.lastError ?? "failed"}`);
+    } else {
+      // Ids past the window (or the head of a first scan) are unread: `pending.more`.
+      const requests = scanIds.map((id, i) => ({ id, request: pick(b[i], decodeRoundRequest, errors, `getRoundRequest ${id}`) }));
+      const walk = walkRequests(requests, out.scanCursor, out.block.timestamp, { quiet, more: end < next });
+      out.scan = { fromId: scanIds[0] ?? out.scanCursor, ids: scanIds.length, ...walk };
+      out.scanCursor = walk.cursor;
+    }
   }
 
-  let logRead = null;
-  const readScan = async () => {
-    if (scanIds.length === 0) return [];
-    return session.batch(scanIds.map((id) => call(encodeGetRoundRequest(id))), notRateLimited);
-  };
-  const [b] = await Promise.all([
-    readScan(),
-    (async () => {
-      logRead = await readLogs(net, out.logCursor, head, { fetch, timeoutMs, cooldowns, nowSec, keyed });
-    })(),
-  ]);
-
-  let bFailed = false;
-  if (b === null) {
-    bFailed = true;
-    errors.push(`round B: ${session.lastError ?? "failed"}`);
-  } else if (out.nextRequestId != null) {
-    const requests = scanIds.map((id, i) => ({ id, request: pick(b[i], decodeRoundRequest, errors, `getRoundRequest ${id}`) }));
-    const walk = walkRequests(requests, out.scanCursor, out.block.timestamp, { quiet, more });
-    out.scan = { fromId: scanIds[0] ?? out.scanCursor, ids: scanIds.length, ...walk };
-    out.scanCursor = walk.cursor;
+  // Slow
+  let slowFailed = false;
+  if (slowReadDue(net, previous, nowSec)) {
+    const S = ROUND_SELECTORS;
+    const slow = [
+      call(S.keeper),
+      call(S.owner),
+      call(S.pendingOwner),
+      call(S.feeRecipient),
+      call(S.pricing),
+      call(S.keeperFeeBps),
+      call(S.refundBps),
+      call(S.backupKeeperCount),
+      call(S.beaconSchedule),
+      // Without a configured beacon the slot holds a call whose answer is not used, so the indexes below stay fixed.
+      net.beacon ? call(encodeBeaconIdentity(net.beacon.id)) : ["eth_chainId", []],
+      ["eth_getStorageAt", [net.coordinator, IMPLEMENTATION_SLOT, "latest"]],
+    ];
+    const authorizedIndex = slow.length;
+    for (const wallet of backups) slow.push(call(encodeIsBackupKeeper(wallet)));
+    const codeIndex = slow.length;
+    const codeTargets = codeCheckDue(net, previous, nowSec) ? [net.coordinator, ...Object.keys(net.codeHashes.implementations ?? {})] : [];
+    for (const address of codeTargets) slow.push(["eth_getCode", [address, "latest"]]);
+    const c = await session.batch(slow, notRateLimited);
+    if (c === null && session.exhausted) {
+      out.deferred.push("roles");
+    } else if (c === null) {
+      slowFailed = true;
+      errors.push(`roles: ${session.lastError ?? "failed"}`);
+    } else {
+      out.slow = true;
+      out.keeper = pick(c[0], decodeAddress, errors, "keeper");
+      out.owner = pick(c[1], decodeAddress, errors, "owner");
+      out.pendingOwner = pick(c[2], decodeAddress, errors, "pendingOwner");
+      out.feeRecipient = pick(c[3], decodeAddress, errors, "feeRecipient");
+      out.pricing = pick(c[4], decodePricing, errors, "pricing");
+      out.keeperFeeBps = pick(c[5], decodeUint16, errors, "keeperFeeBps");
+      out.refundBps = pick(c[6], decodeUint16, errors, "refundBps");
+      out.backupKeeperCount = pick(c[7], decodeUint256, errors, "backupKeeperCount");
+      out.beaconSchedule = pick(c[8], decodeBeaconSchedule, errors, "beaconSchedule");
+      if (net.beacon) out.beaconIdentity = pick(c[9], decodeBytes32, errors, "beaconIdentity");
+      out.implementation = pick(c[10], decodeAddress, errors, "implementation slot");
+      out.backupAuthorized = backups.map((address, i) => ({ address, allowed: pick(c[authorizedIndex + i], decodeBool, errors, `isBackupKeeper ${address}`) }));
+      if (codeTargets.length > 0) {
+        const hashes = {};
+        let failed = false;
+        for (const [i, address] of codeTargets.entries()) {
+          const item = c[codeIndex + i];
+          try {
+            if (!item || "error" in item) throw new AbiError(item ? item.error : "missing");
+            hashes[lower(address)] = await codeHash(item.result);
+          } catch (err) {
+            failed = true;
+            errors.push(`code ${address}: ${err instanceof AbiError ? err.message : "invalid result"}`);
+          }
+        }
+        out.code = failed ? { ok: false } : { ok: true, proxy: hashes[lower(net.coordinator)], implementations: hashes };
+      }
+    }
   }
-  out.logSubrequests = logRead.subrequests;
+
+  // Logs, with what is left
+  logRead = await readLogs(net, out.logCursor, head, { fetch, timeoutMs, cooldowns, nowSec, keyed, budget });
   out.logRpc = logRead.rpc;
   if (logRead.logs) {
     out.logs = logRead.logs;
     out.logCursor = logRead.cursor;
+    if (logRead.deferred) out.deferred.push("logs");
   } else {
     errors.push(`logs: ${logRead.error}`);
   }
 
-  // As on Arc, a view that could not be decoded leaves its figure unknown without failing the read; the requests and logs must be read.
-  out.complete = !bFailed && out.logs != null && out.scan?.pending != null;
-  if (!out.complete) out.error = bFailed ? session.lastError ?? "partial read" : errors.find((e) => /^(logs|getRoundRequest)/.test(e)) ?? "partial read";
-  const done = finish(logRead.failures);
-  done.subrequests += logRead.subrequests;
-  return done;
+  // As on Arc, a view that could not be decoded leaves its figure unknown without failing the read; what was due and could be
+  // paid for must be read. A part deferred for the budget is not a failure.
+  const scanKnown = out.scan?.pending != null || out.deferred.includes("requests") || out.nextRequestId == null;
+  out.complete = !scanFailed && !slowFailed && out.logs != null && scanKnown && out.nextRequestId != null;
+  if (!out.complete) {
+    out.error = errors.find((e) => /^(logs|getRoundRequest|roles|nextRequestId)/.test(e)) ?? session.lastError ?? "partial read";
+  }
+  return finish();
 }
 
 /**
- * The endpoints logs are read from: `logRpcs` ([{url, maxBlocks, maxBatch}], in order) when configured, else the state endpoints
- * with the full span in one call. A keyless endpoint may cap a getLogs range (dRPC: about 100 blocks) and a batch (dRPC: 3 calls),
- * and a public node may keep too few blocks to serve them at all.
+ * The endpoints logs are read from: the keyed endpoint when set, then `logRpcs` ([{url, maxBlocks}], in order), or the state
+ * endpoints when none are configured. A dRPC endpoint (keyless or keyed) is read in chunks of at most 100 blocks, 3 to a fetch.
  */
 export function logEndpoints(net, keyed = null) {
-  const list = Array.isArray(net.logRpcs) && net.logRpcs.length > 0
-    ? net.logRpcs
-    : net.rpcs.map((url) => ({ url, maxBlocks: LIMITS.roundLogScanMaxBlocks, maxBatch: 1 }));
-  // A keyed endpoint is a paid tier: a full span in one call.
-  return keyed ? [{ url: keyed, maxBlocks: LIMITS.roundLogScanMaxBlocks, maxBatch: 1 }, ...list] : list;
+  const list = Array.isArray(net.logRpcs) && net.logRpcs.length > 0 ? net.logRpcs : net.rpcs.map((url) => ({ url }));
+  const full = keyed ? [{ url: keyed }, ...list] : list;
+  return full.map((e) => ({
+    url: e.url,
+    maxBlocks: Number.isFinite(batchCap(e.url)) ? Math.min(e.maxBlocks ?? LIMITS.roundDrpcLogBlocks, LIMITS.roundDrpcLogBlocks) : e.maxBlocks ?? LIMITS.roundLogScanMaxBlocks,
+    maxBatch: Math.min(batchCap(e.url), e.maxBatch ?? Infinity),
+  }));
 }
 
 /**
- * Read the coordinator's refund and fulfilment logs from `cursor` + 1 towards `head`, trying each log endpoint in order. On an
- * endpoint the range is split into calls of at most `maxBlocks` blocks, sent `maxBatch` to a fetch, and limited to
- * LIMITS.roundLogMaxFetches fetches a run (a backlog is caught up over later runs). Any failure moves the whole range to the next
- * endpoint. Returns {logs, cursor, rpc, subrequests} or {logs: null, error, subrequests}.
+ * Read the coordinator's refund and fulfilment logs from `cursor` + 1 towards `head`, trying each log endpoint in order (the keyed
+ * one first, then the others with those cooling down after a rate limit last). On an endpoint the range is split into calls of at
+ * most `maxBlocks` blocks, sent `maxBatch` to a fetch. Each fetch draws on `budget`; when it runs out, the blocks read so far are
+ * returned (`deferred`) and the rest waits for the next run. Any failure moves the range to the next endpoint.
+ * Returns {logs, cursor, rpc, deferred, subrequests, failures} or {logs: null, error, subrequests, failures}.
  */
-export async function readLogs(net, cursor, head, { fetch, timeoutMs, cooldowns = {}, nowSec = 0, keyed = null } = {}) {
+export async function readLogs(net, cursor, head, { fetch, timeoutMs, cooldowns = {}, nowSec = 0, keyed = null, budget = { left: Infinity } } = {}) {
   const empty = { fromBlock: null, toBlock: null, skippedBlocks: 0, refunds: [], foreignFulfillments: [] };
   // First run: start watching from the current head, no historical backfill.
   if (cursor == null) return { logs: empty, cursor: head, rpc: null, subrequests: 0, failures: [] };
@@ -402,18 +486,22 @@ export async function readLogs(net, cursor, head, { fetch, timeoutMs, cooldowns 
   const [first, ...rest] = logEndpoints(net, keyed);
   const ordered = keyed ? [first, ...orderEndpoints(rest, cooldowns, nowSec, (e) => e.url)] : orderEndpoints([first, ...rest], cooldowns, nowSec, (e) => e.url);
   for (const endpoint of ordered) {
-    const maxBlocks = Math.max(1, Math.min(endpoint.maxBlocks ?? LIMITS.roundLogScanMaxBlocks, LIMITS.roundLogScanMaxBlocks));
-    const maxBatch = Math.max(1, endpoint.maxBatch ?? 1);
-    const span = Math.min(LIMITS.roundLogScanMaxBlocks, maxBlocks * maxBatch * LIMITS.roundLogMaxFetches);
-    const toBlock = Math.min(head, fromBlock + span - 1);
+    const toBlock = Math.min(head, fromBlock + LIMITS.roundLogScanMaxBlocks - 1);
     const chunks = [];
-    for (let from = fromBlock; from <= toBlock; from += maxBlocks) chunks.push([from, Math.min(toBlock, from + maxBlocks - 1)]);
+    for (let from = fromBlock; from <= toBlock; from += endpoint.maxBlocks) chunks.push([from, Math.min(toBlock, from + endpoint.maxBlocks - 1)]);
     const session = new RpcSession([endpoint.url], { fetch, timeoutMs });
     const refunds = [];
     const foreignFulfillments = [];
+    let readTo = null;
     let failed = null;
-    for (let i = 0; i < chunks.length && !failed; i += maxBatch) {
-      const group = chunks.slice(i, i + maxBatch);
+    let deferred = false;
+    for (let i = 0; i < chunks.length; i += endpoint.maxBatch) {
+      if (budget.left <= 0) {
+        deferred = true;
+        break;
+      }
+      budget.left--;
+      const group = chunks.slice(i, i + endpoint.maxBatch);
       const items = await session.batch(
         group.map(([from, to]) => [
           "eth_getLogs",
@@ -435,11 +523,21 @@ export async function readLogs(net, cursor, head, { fetch, timeoutMs, cooldowns 
         refunds.push(...decoded.refunds);
         foreignFulfillments.push(...decoded.foreignFulfillments);
       }
+      if (failed) break;
+      readTo = group.at(-1)[1];
     }
     subrequests += session.subrequests;
     failures.push(...session.failures);
     if (!failed) {
-      return { logs: { fromBlock, toBlock, skippedBlocks, refunds, foreignFulfillments }, cursor: toBlock, rpc: endpointId(endpoint.url, keyed), subrequests, failures };
+      if (readTo == null) return { logs: empty, cursor, rpc: null, deferred: true, subrequests, failures };
+      return {
+        logs: { fromBlock, toBlock: readTo, skippedBlocks, refunds, foreignFulfillments },
+        cursor: readTo,
+        rpc: endpointId(endpoint.url, keyed),
+        deferred,
+        subrequests,
+        failures,
+      };
     }
     error = `${endpointId(endpoint.url, keyed)}: ${failed}`;
   }
@@ -508,6 +606,8 @@ export function applyRoundRead(net, previous, read, now) {
     oldestPendingAge: read.ok && read.scan?.pending?.oldest ? read.scan.pending.oldest.ageSeconds : null,
     scanCursor: read.ok ? str(read.scanCursor) : prev.scanCursor ?? null,
     logCursor: read.ok ? read.logCursor : prev.logCursor ?? null,
+    // When the slow part (roles, pricing, beacon) was last read: it is read again slowIntervalSeconds later.
+    slowAt: read.ok && read.slow ? now : prev.slowAt ?? null,
     // Endpoints cooling down after a rate limit: {id: until}. Kept from a read that failed too, since that is when they matter.
     cooldowns: read.cooldowns ?? prev.cooldowns ?? {},
     codeCheck: applyCodeRead(net, prev.codeCheck ?? null, read.code, now),

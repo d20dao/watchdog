@@ -20,7 +20,7 @@ import {
 } from "../src/config.js";
 import { runCron } from "../src/cron.js";
 import { handleFetch } from "../src/http.js";
-import { applyRoundRead, codeCheckDue, codeHash, readLogs, readRoundChain, roundReadDue, walkRequests } from "../src/round.js";
+import { applyRoundRead, batchCap, codeCheckDue, codeHash, logEndpoints, readLogs, readRoundChain, roundReadDue, walkRequests } from "../src/round.js";
 import { buildStatus, renderHtml } from "../src/status.js";
 import { BACKUP_STREAM, ingestReport, readAlerts, readRoundState, recentMessages } from "../src/store.js";
 import { routeFor } from "../src/telegram.js";
@@ -280,7 +280,7 @@ test("the request walk settles the leading run, reports expiries once and stops 
   assert.equal(broken.pending, null);
 });
 
-test("round reader: two batches, figures decoded, first run looks back one window without reporting old expiries", async () => {
+test("round reader: fast, requests and slow batches, figures decoded, first run looks back one window without reporting old expiries", async () => {
   const net = await pinnedNet();
   const node = fakeNode(net);
   node.chain.next = 41n; // ids 1..40; the first scan reads 9..40
@@ -289,11 +289,13 @@ test("round reader: two batches, figures decoded, first run looks back one windo
   const read = await readRoundChain(net, null, { fetch: node.fetch, nowSec: NOW });
   assert.equal(read.ok, true);
   assert.equal(read.complete, true);
-  assert.equal(read.subrequests, 2);
-  assert.equal(node.batches.length, 2);
-  assert.ok(node.batches[0].filter((m) => m === "eth_getCode").length === 2, "the code is read on the first run");
-  assert.deepEqual(node.batches[1], Array(32).fill("eth_call"), "no log scan on the first run, 32 requests");
-  assert.deepEqual(node.urls, [net.rpcs[0], net.rpcs[0]], "state reads on the first endpoint");
+  assert.equal(read.subrequests, 3);
+  assert.deepEqual(node.batches[0], ["eth_chainId", "eth_getBlockByNumber", "eth_call", "eth_getBalance", "eth_getBalance"], "the fast part: 5 calls");
+  assert.deepEqual(node.batches[1], Array(32).fill("eth_call"), "32 requests");
+  assert.equal(node.batches[2].length, 11 + 1 + 2, "the slow part: 11 views, isBackupKeeper and, on the first run, the code");
+  assert.equal(node.batches.length, 3, "no log scan on the first run");
+  assert.deepEqual(node.urls, [net.rpcs[0], net.rpcs[0], net.rpcs[0]], "state reads on the first endpoint");
+  assert.equal(read.slow, true);
   assert.equal(read.keeper, net.keeper.toLowerCase());
   assert.equal(read.owner, OWNER.toLowerCase());
   assert.deepEqual(read.pricing, { minFeeWei: 25_000_000_000_000n, feeMultiplier: 2, fulfillGasOverhead: 405000 });
@@ -766,36 +768,44 @@ test("cron: a fault in a round network's evaluation stays there; the Arc network
 test("endpoint order: keyless first and Robinhood's own last; a rate limit fails over in the run and cools the endpoint", async () => {
   for (const net of Object.values(WATCHED_ROUND_NETWORKS)) {
     assert.match(net.rpcs.at(-1), /chain\.robinhood\.com/, `${net.name}: Robinhood's own endpoint is the last state fallback`);
+    assert.match(net.rpcs[1], /drpc\.org/, `${net.name}: keyless dRPC after PublicNode`);
     assert.match(net.logRpcs.at(-1).url, /chain\.robinhood\.com/, `${net.name}: and the last log fallback`);
-    const drpc = net.logRpcs.find((e) => /drpc\.org/.test(e.url));
-    assert.deepEqual([drpc.maxBlocks, drpc.maxBatch], [100, 3], `${net.name}: dRPC's keyless caps`);
     assert.match(net.keyedRpcSecret, /^RPC_URL_ROBINHOOD_(TESTNET|MAINNET)$/);
   }
-  const net = await pinnedNet({ logRpcs: RH.logRpcs });
-  const [drpc, official] = net.logRpcs.map((e) => e.url);
+  assert.equal(batchCap("https://robinhood.drpc.org"), 3);
+  assert.equal(batchCap("https://lb.drpc.org/robinhood/KEY"), 3);
+  assert.equal(batchCap("https://robinhood-rpc.publicnode.com"), Infinity);
+  assert.deepEqual(logEndpoints(RH, "https://lb.drpc.org/robinhood-testnet/KEY").map((e) => [e.maxBlocks, e.maxBatch]), [[100, 3], [100, 3], [5000, Infinity]]);
+
+  const net = await pinnedNet({ logRpcs: RH.logRpcs, slowIntervalSeconds: 600 });
+  const [drpcLogs, official] = net.logRpcs.map((e) => e.url);
   const node = fakeNode(net);
   node.chain.next = 3n;
   const first = applyRoundRead(net, null, await readRoundChain(net, null, { fetch: node.fetch, nowSec: NOW }), NOW);
 
-  // A healthy run: logs from dRPC in chunks of 100 blocks, 3 to a fetch.
+  // A healthy minute: the fast part on PublicNode, logs from dRPC in chunks of 100 blocks, 3 to a fetch; the slow part not due.
   node.chain.head = 1000 + 650;
   node.chain.logs = [refundLog(2, 1640)];
   node.batches.length = 0;
   node.urls.length = 0;
   let read = await readRoundChain(net, first, { fetch: node.fetch, nowSec: NOW + 60 });
   assert.equal(read.complete, true, read.error);
-  assert.deepEqual(node.batches.filter((b, i) => node.urls[i] === drpc).map((b) => b.length), [3, 3, 1], "650 blocks: 7 calls, 3 to a batch");
+  assert.equal(read.slow, false);
+  assert.equal(read.keeper, null, "roles are not read between slow reads");
+  assert.deepEqual(node.batches.filter((b, i) => node.urls[i] === drpcLogs).map((b) => b.length), [3, 3, 1], "650 blocks: 7 calls, 3 to a batch");
+  assert.equal(read.subrequests, 1 + 3);
   assert.deepEqual(read.logs.refunds.map((r) => r.requestId), [2n]);
-  assert.deepEqual(read.rateLimited, []);
   let state = applyRoundRead(net, first, read, NOW + 60);
+  assert.equal(state.keeper, first.keeper, "the last roles read stand");
 
-  // PublicNode answers HTTP 429 and dRPC a batch of rate-limit errors: both fail over to Robinhood's own endpoint in the same run,
-  // the read is complete, and both are cooled.
+  // PublicNode answers HTTP 429 and dRPC a batch of rate-limit errors: state falls over to dRPC (chunked to 3), logs to Robinhood's
+  // own endpoint, all in the same run; the read is complete, and both refusing endpoints are cooled.
   node.setRefuse((url) => (url === net.rpcs[0] ? 429 : null));
   const realFetch = node.fetch;
   const fetchLimited = async (url, init) => {
-    if (url !== drpc) return realFetch(url, init);
+    if (url !== drpcLogs) return realFetch(url, init);
     const calls = JSON.parse(init.body);
+    if (calls[0].method !== "eth_getLogs") return realFetch(url, init);
     return Response.json(calls.map((c) => ({ jsonrpc: "2.0", id: c.id, error: { code: 429, message: "Too many requests" } })));
   };
   node.chain.head = 1700;
@@ -804,40 +814,84 @@ test("endpoint order: keyless first and Robinhood's own last; a rate limit fails
   read = await readRoundChain(net, state, { fetch: fetchLimited, nowSec: NOW + 120 });
   assert.equal(read.complete, true, read.error);
   assert.equal(read.rpc, new URL(net.rpcs[1]).host);
+  assert.deepEqual(node.batches.filter((b, i) => node.urls[i] === net.rpcs[1]).map((b) => b.length), [3, 2], "the fast part in two batches of at most 3");
   assert.equal(read.logRpc, new URL(official).host);
   assert.deepEqual(read.rateLimited, [
     { endpoint: new URL(net.rpcs[0]).host, step: "state" },
-    { endpoint: new URL(drpc).host, step: "logs" },
+    { endpoint: new URL(drpcLogs).host, step: "logs" },
   ]);
   state = applyRoundRead(net, state, read, NOW + 120);
   assert.equal(state.consecutiveFailures, 0, "a rate limit that another endpoint covered is not a failed read");
-  assert.deepEqual(state.cooldowns, {
-    [new URL(net.rpcs[0]).host]: NOW + 120 + LIMITS.roundRpcCooldownSeconds,
-    [new URL(drpc).host]: NOW + 120 + LIMITS.roundRpcCooldownSeconds,
-  });
+  assert.deepEqual(Object.keys(state.cooldowns).sort(), [new URL(net.rpcs[0]).host, new URL(drpcLogs).host].sort());
 
-  // While cooling, the cooled endpoints are not asked first: one fetch each for state and logs, on Robinhood's own endpoint.
+  // While cooling, the cooled endpoints are asked last. A cooldown is per host, so dRPC is cooled for state reads too.
   node.setRefuse(() => null);
   node.chain.head = 1750;
   node.urls.length = 0;
-  node.batches.length = 0;
   read = await readRoundChain(net, state, { fetch: node.fetch, nowSec: NOW + 180 });
   assert.equal(read.complete, true);
-  assert.deepEqual(node.urls, [official, official]);
+  assert.deepEqual([...new Set(node.urls)], [official]);
   // After the cooldown, the configured order again.
   node.chain.head = 1800;
   node.urls.length = 0;
   read = await readRoundChain(net, applyRoundRead(net, state, read, NOW + 180), { fetch: node.fetch, nowSec: NOW + 120 + LIMITS.roundRpcCooldownSeconds + 1 });
-  assert.deepEqual(node.urls, [net.rpcs[0], drpc]);
-  assert.deepEqual(applyRoundRead(net, state, read, NOW + 120 + LIMITS.roundRpcCooldownSeconds + 1).cooldowns, {});
+  assert.deepEqual([...new Set(node.urls)], [net.rpcs[0], drpcLogs]);
 
-  // A long backlog on dRPC is read 1,800 blocks a run, and every log endpoint failing leaves the logs unknown.
-  const behind = await readLogs(net, 10_000, 20_000, { fetch: node.fetch });
-  assert.deepEqual([behind.logs.fromBlock, behind.logs.toBlock], [10_001, 11_800]);
+  // Every log endpoint failing leaves the logs unknown.
   node.setRefuse(() => 429);
   const none = await readLogs(net, 1000, 1100, { fetch: node.fetch });
   assert.equal(none.logs, null);
   assert.match(none.error, /chain\.robinhood\.com: http 429/);
+});
+
+test("budget: a run makes at most roundMaxSubrequests fetches; what it cannot pay for waits, and the slow part comes every 10 minutes", async () => {
+  // State and logs on dRPC only, the costliest endpoint: 3 calls a fetch.
+  const drpc = "https://robinhood-testnet.drpc.org";
+  const net = await pinnedNet({ rpcs: [drpc], logRpcs: [{ url: drpc }], slowIntervalSeconds: 600 });
+  const node = fakeNode(net);
+  node.chain.next = 3n;
+  let read = await readRoundChain(net, null, { fetch: node.fetch, nowSec: NOW });
+  // Fast 5 calls (2 fetches), requests 1 and 2 (1 fetch), slow 14 calls with the code (5 fetches).
+  assert.equal(read.subrequests, 8);
+  assert.equal(read.complete, true);
+  let state = applyRoundRead(net, null, read, NOW);
+  assert.equal(state.slowAt, NOW);
+
+  // A minute with 3,000 new blocks: fast 2 fetches, then logs with the 7 left: 21 calls, 2,100 blocks; the rest next run.
+  node.chain.head = 4000;
+  read = await readRoundChain(net, state, { fetch: node.fetch, nowSec: NOW + 60 });
+  assert.equal(read.subrequests, LIMITS.roundMaxSubrequests);
+  assert.equal(read.complete, true, "a deferred part is not a failure");
+  assert.deepEqual(read.deferred, ["logs"]);
+  assert.deepEqual([read.logs.fromBlock, read.logs.toBlock], [1001, 3100]);
+  state = applyRoundRead(net, state, read, NOW + 60);
+  read = await readRoundChain(net, state, { fetch: node.fetch, nowSec: NOW + 120 });
+  assert.deepEqual([read.logs.fromBlock, read.logs.toBlock], [3101, 4000]);
+  assert.deepEqual(read.deferred, []);
+  state = applyRoundRead(net, state, read, NOW + 120);
+
+  // Ten minutes after the last slow read it is due again; with requests to read too, the logs wait.
+  node.chain.next = 12n;
+  node.chain.head = 4100;
+  node.batches.length = 0;
+  read = await readRoundChain(net, state, { fetch: node.fetch, nowSec: NOW + 600 });
+  assert.equal(read.slow, true);
+  assert.equal(read.scan.ids, 9, "on a 3-call endpoint at most 9 requests a run");
+  assert.equal(read.subrequests, LIMITS.roundMaxSubrequests);
+  assert.deepEqual(read.deferred, ["logs"]);
+  assert.equal(read.complete, true);
+
+  // Every endpoint refusing: each attempt counts against the budget, and the read fails.
+  node.setRefuse(() => 429);
+  read = await readRoundChain(net, state, { fetch: node.fetch, nowSec: NOW + 660 });
+  assert.equal(read.ok, false);
+  assert.ok(read.subrequests <= LIMITS.roundMaxSubrequests);
+});
+
+test("subrequest budget: Arc's worst case plus both round networks' fits the free plan's 50", () => {
+  const arcWorst = Object.keys(NETWORKS).length * (3 * 2 + 1) + LIMITS.telegramMaxSendsPerRun + 13;
+  assert.equal(arcWorst, 30);
+  assert.ok(arcWorst + Object.keys(WATCHED_ROUND_NETWORKS).length * LIMITS.roundMaxSubrequests <= 50);
 });
 
 test("keyed endpoint: an optional secret URL goes first for state and logs, and its URL is never stored or reported", async () => {
